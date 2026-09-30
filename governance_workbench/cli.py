@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,6 +11,11 @@ from .catalog import Catalog
 
 def _print(value: object) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def _fail(message: str) -> int:
+    print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
+    return 2
 
 
 def parser() -> argparse.ArgumentParser:
@@ -33,6 +39,19 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("version", type=int)
     export.add_argument("destination")
 
+    rules = commands.add_parser("rules")
+    rules.add_argument("dataset")
+    rules.add_argument("rules_file")
+
+    validate = commands.add_parser("validate")
+    validate.add_argument("dataset")
+    validate.add_argument("version", type=int)
+    validate.add_argument("--revision", type=int, default=None)
+
+    validations = commands.add_parser("validations")
+    validations.add_argument("dataset")
+    validations.add_argument("version", type=int)
+
     commands.add_parser("demo")
     return root
 
@@ -48,6 +67,25 @@ def main(argv: list[str] | None = None) -> int:
         _print(catalog.compare(args.dataset, args.left, args.right))
     elif args.command == "export":
         _print(catalog.export(args.dataset, args.version, args.destination))
+    elif args.command == "rules":
+        try:
+            with open(args.rules_file, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            _print(catalog.set_rules(args.dataset, payload))
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
+    elif args.command == "validate":
+        try:
+            report = catalog.validate(args.dataset, args.version, args.revision)
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
+        _print(report)
+        return 0 if report["passed"] else 1
+    elif args.command == "validations":
+        try:
+            _print(catalog.validation_history(args.dataset, args.version))
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
     elif args.command == "demo":
         first_version = len(catalog.list_datasets().get("customers", [])) + 1
         with TemporaryDirectory() as directory:

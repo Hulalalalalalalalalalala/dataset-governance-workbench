@@ -52,6 +52,15 @@ def parser() -> argparse.ArgumentParser:
     validations.add_argument("dataset")
     validations.add_argument("version", type=int)
 
+    clean = commands.add_parser("clean")
+    clean.add_argument("dataset")
+    clean.add_argument("version", type=int)
+    clean.add_argument("operations_file")
+
+    lineage = commands.add_parser("lineage")
+    lineage.add_argument("dataset")
+    lineage.add_argument("version", type=int)
+
     commands.add_parser("demo")
     return root
 
@@ -84,6 +93,18 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "validations":
         try:
             _print(catalog.validation_history(args.dataset, args.version))
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
+    elif args.command == "clean":
+        try:
+            with open(args.operations_file, encoding="utf-8") as handle:
+                operations = json.load(handle)
+            _print(catalog.clean(args.dataset, args.version, operations).__dict__)
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
+    elif args.command == "lineage":
+        try:
+            _print(catalog.lineage(args.dataset, args.version))
         except (ValueError, OSError) as error:
             return _fail(str(error))
     elif args.command == "demo":

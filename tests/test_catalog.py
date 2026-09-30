@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -422,6 +423,469 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("compare", "c", "1", "2").returncode, 0)
         export_result = self.run_cli("export", "c", "1", str(self.root / "out"))
         self.assertEqual(export_result.returncode, 0, export_result.stderr)
+
+
+class CleanLineageTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv(self, name: str, contents: str) -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def import_people(self) -> None:
+        self.catalog.import_csv(
+            "people",
+            self.csv(
+                "people.csv",
+                "id,name,city\n"
+                "1, Ada ,EU\n"
+                "2,Lin, APAC\n"
+                "3, Ada ,EU\n"
+                "4,Sam,US\n",
+            ),
+        )
+
+    def test_clean_trim_rename_dedup_semantics(self):
+        self.import_people()
+        record = self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "trim", "column": "city"},
+                {"type": "rename", "column": "name", "to": "full_name"},
+                {"type": "drop_duplicates", "columns": ["full_name", "city"]},
+            ],
+        )
+        self.assertEqual(record.version, 2)
+        self.assertEqual(record.row_count, 3)
+        self.assertEqual(record.schema, {"id": "integer", "full_name": "string", "city": "string"})
+        blob = (self.catalog.workspace / record.blob).read_text(encoding="utf-8")
+        self.assertEqual(blob, "id,full_name,city\n1,Ada,EU\n2,Lin,APAC\n4,Sam,US\n")
+        lineage = record.lineage
+        self.assertEqual(lineage["sourceVersion"], 1)
+        self.assertEqual(lineage["sourceContentSha256"], self.catalog.get("people", 1)["content_sha256"])
+        self.assertEqual(lineage["rowMapping"], [1, 2, 4])
+        self.assertEqual(lineage["fieldMapping"], {"id": "id", "full_name": "name", "city": "city"})
+        steps = lineage["steps"]
+        self.assertEqual([step["type"] for step in steps], ["trim", "trim", "rename", "drop_duplicates"])
+        self.assertEqual(steps[0]["modifiedRows"], [1, 3])
+        self.assertEqual(steps[0]["inputRows"], 4)
+        self.assertEqual(steps[0]["outputRows"], 4)
+        self.assertEqual(steps[1]["modifiedRows"], [2])
+        self.assertEqual(steps[2]["column"], "name")
+        self.assertEqual(steps[2]["to"], "full_name")
+        self.assertEqual(steps[3]["deletedRows"], [3])
+        self.assertEqual(steps[3]["inputRows"], 4)
+        self.assertEqual(steps[3]["outputRows"], 3)
+
+    def test_rename_preserves_column_position(self):
+        self.import_people()
+        record = self.catalog.clean(
+            "people",
+            1,
+            [{"type": "rename", "column": "name", "to": "full_name"}],
+        )
+        blob = (self.catalog.workspace / record.blob).read_text(encoding="utf-8")
+        self.assertEqual(blob.splitlines()[0], "id,full_name,city")
+        self.assertEqual(record.lineage["fieldMapping"], {"id": "id", "full_name": "name", "city": "city"})
+
+    def test_dedup_keeps_first_occurrence_and_original_order(self):
+        self.import_people()
+        record = self.catalog.clean(
+            "people",
+            1,
+            [{"type": "drop_duplicates", "columns": ["name"]}],
+        )
+        # rows 1 and 3 share " Ada " (untrimmed); row 3 is dropped
+        self.assertEqual(record.lineage["steps"][0]["deletedRows"], [3])
+        self.assertEqual(record.lineage["rowMapping"], [1, 2, 4])
+        blob = (self.catalog.workspace / record.blob).read_text(encoding="utf-8")
+        self.assertEqual(
+            blob,
+            "id,name,city\n1, Ada ,EU\n2,Lin, APAC\n4,Sam,US\n",
+        )
+
+    def test_empty_string_participates_and_numeric_text_not_converted(self):
+        self.catalog.import_csv(
+            "ee",
+            self.csv("ee.csv", 'v\n""\n""\n1\n1\n01\n'),
+        )
+        record = self.catalog.clean("ee", 1, [{"type": "drop_duplicates", "columns": ["v"]}])
+        # empty strings dedup as a group; "1" and "01" are distinct raw strings
+        self.assertEqual(record.row_count, 3)
+        self.assertEqual(record.lineage["steps"][0]["deletedRows"], [2, 4])
+        self.assertEqual(record.lineage["rowMapping"], [1, 3, 5])
+        blob = (self.catalog.workspace / record.blob).read_text(encoding="utf-8")
+        self.assertEqual(blob, 'v\n""\n1\n01\n')
+
+    def test_quoted_newline_row_numbering(self):
+        self.catalog.import_csv(
+            "qn",
+            self.csv("qn.csv", 'id,name\n1,"line1\nline2"\n2, x \n'),
+        )
+        record = self.catalog.clean(
+            "qn",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "drop_duplicates", "columns": ["name"]},
+            ],
+        )
+        self.assertEqual(record.row_count, 2)
+        self.assertEqual(record.lineage["steps"][0]["modifiedRows"], [2])
+        self.assertEqual(record.lineage["rowMapping"], [1, 2])
+
+    def test_header_only_result(self):
+        self.catalog.import_csv("ho", self.csv("ho.csv", "a,b\n"))
+        record = self.catalog.clean("ho", 1, [{"type": "trim", "column": "a"}])
+        self.assertEqual(record.row_count, 0)
+        self.assertEqual(record.schema, {"a": "null", "b": "null"})
+        self.assertEqual(record.lineage["rowMapping"], [])
+        blob = (self.catalog.workspace / record.blob).read_text(encoding="utf-8")
+        self.assertEqual(blob, "a,b\n")
+
+    def test_deterministic_bytes_and_mappings(self):
+        self.import_people()
+        first = self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "drop_duplicates", "columns": ["name", "city"]},
+            ],
+        )
+        second = self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "drop_duplicates", "columns": ["name", "city"]},
+            ],
+        )
+        self.assertNotEqual(first.version, second.version)
+        self.assertEqual(first.content_sha256, second.content_sha256)
+        self.assertEqual(
+            (self.catalog.workspace / first.blob).read_bytes(),
+            (self.catalog.workspace / second.blob).read_bytes(),
+        )
+        self.assertEqual(first.lineage["rowMapping"], second.lineage["rowMapping"])
+        self.assertEqual(first.lineage["steps"], second.lineage["steps"])
+        self.assertEqual(first.lineage["fieldMapping"], second.lineage["fieldMapping"])
+
+    def test_appends_version_even_when_unchanged(self):
+        self.import_people()
+        record = self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(record.row_count, 4)
+        self.assertEqual(record.version, 2)
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
+
+    def test_rejects_bad_operations(self):
+        self.import_people()
+
+        def reject(operations):
+            with self.assertRaises(ValueError):
+                self.catalog.clean("people", 1, operations)
+
+        reject([])
+        reject("not-a-list")
+        reject([None])
+        reject(["not-an-object"])
+        reject([{"type": "polish", "column": "name"}])  # unknown type
+        reject([{"column": "name"}])  # missing type
+        reject([{"type": "trim"}])  # missing column
+        reject([{"type": "trim", "column": "name", "extra": 1}])  # extra attr
+        reject([{"type": "trim", "column": ""}])  # empty column
+        reject([{"type": "trim", "column": 5}])  # non-string column
+        reject([{"type": "rename", "column": "name"}])  # missing to
+        reject([{"type": "rename", "to": "x"}])  # missing column
+        reject([{"type": "rename", "column": "name", "to": ""}])  # empty to
+        reject([{"type": "rename", "column": "name", "to": 5}])  # non-string to
+        reject([{"type": "drop_duplicates"}])  # missing columns
+        reject([{"type": "drop_duplicates", "columns": []}])  # empty columns
+        reject([{"type": "drop_duplicates", "columns": [""]}])  # empty column entry
+        reject([{"type": "drop_duplicates", "columns": ["name", "name"]}])  # dup columns
+        reject([{"type": "drop_duplicates", "columns": "name"}])  # non-array columns
+
+    def test_rejects_missing_columns(self):
+        self.import_people()
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "trim", "column": "nope"}])
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "rename", "column": "nope", "to": "x"}])
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "drop_duplicates", "columns": ["nope"]}])
+
+    def test_rejects_rename_conflict(self):
+        self.import_people()
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "rename", "column": "name", "to": "city"}])
+
+    def test_rename_target_available_after_prior_rename(self):
+        self.import_people()
+        # renaming name->full then city->name is allowed because name is free
+        record = self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "rename", "column": "name", "to": "full"},
+                {"type": "rename", "column": "city", "to": "name"},
+            ],
+        )
+        self.assertEqual(record.lineage["fieldMapping"], {"id": "id", "full": "name", "name": "city"})
+
+    def test_rejects_bad_csv_structure(self):
+        # DictReader accepts a short row (fills None); the blob keeps the raw
+        # content, and clean's strict column-count check rejects it.
+        self.catalog.import_csv("bad", self.csv("bad.csv", "id,name\n1,Ada\n2\n"))
+        with self.assertRaises(ValueError):
+            self.catalog.clean("bad", 1, [{"type": "trim", "column": "id"}])
+        # duplicate and empty headers are rejected at import time, so exercise
+        # clean's defensive header check by tampering the blob and re-binding
+        # the recorded hash.
+        self.catalog.import_csv("dup", self.csv("dup.csv", "id\n1\n"))
+        record = self.catalog.get("dup", 1)
+        (self.catalog.workspace / record["blob"]).write_text("id,id\n1,2\n", encoding="utf-8")
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        state["datasets"]["dup"][0]["content_sha256"] = hashlib.sha256(
+            (self.catalog.workspace / record["blob"]).read_bytes()
+        ).hexdigest()
+        self.catalog.state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.clean("dup", 1, [{"type": "trim", "column": "id"}])
+
+    def test_rejects_hash_mismatch(self):
+        self.import_people()
+        record = self.catalog.get("people", 1)
+        (self.catalog.workspace / record["blob"]).write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
+
+    def test_rejects_missing_blob(self):
+        self.import_people()
+        record = self.catalog.get("people", 1)
+        (self.catalog.workspace / record["blob"]).unlink()
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+
+    def test_failed_write_consumes_no_version(self):
+        self.import_people()
+        with mock.patch.object(Catalog, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
+        record = self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(record.version, 2)
+
+    def test_clean_does_not_modify_source(self):
+        self.import_people()
+        source = self.catalog.get("people", 1)
+        source_bytes = (self.catalog.workspace / source["blob"]).read_bytes()
+        self.catalog.clean("people", 1, [{"type": "trim", "column": "name"}])
+        self.assertEqual((self.catalog.workspace / source["blob"]).read_bytes(), source_bytes)
+
+    def test_original_rules_and_validations_unchanged(self):
+        self.import_people()
+        self.catalog.set_rules("people", [{"id": "r", "column": "id", "type": "required"}])
+        self.catalog.validate("people", 1)
+        self.catalog.clean("people", 1, [{"type": "trim", "column": "name"}])
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["rules"]["people"][0]["rules"][0]["id"], "r")
+        self.assertIn("1", state["validations"]["people"])
+        self.assertNotIn("2", state["validations"]["people"])
+
+    def test_cleaned_version_supports_compare_validate_export(self):
+        self.import_people()
+        self.catalog.clean("people", 1, [{"type": "trim", "column": "name"}])
+        comparison = self.catalog.compare("people", 1, 2)
+        self.assertTrue(comparison["contentChanged"])
+        self.catalog.set_rules("people", [{"id": "r", "column": "name", "type": "required"}])
+        report = self.catalog.validate("people", 2)
+        self.assertTrue(report["passed"])
+        destination = self.root / "export"
+        manifest = self.catalog.export("people", 2, destination)
+        self.assertEqual(manifest["record"]["version"], 2)
+
+
+class LineageTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv(self, name: str, contents: str) -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def test_lineage_chain_for_cleaned_version(self):
+        self.catalog.import_csv("d", self.csv("d.csv", "id,v\n1, a \n2,b\n"))
+        self.catalog.clean("d", 1, [{"type": "trim", "column": "v"}])
+        lineage = self.catalog.lineage("d", 2)
+        self.assertEqual(lineage["dataset"], "d")
+        self.assertEqual(lineage["version"], 2)
+        self.assertEqual(len(lineage["chain"]), 1)
+        entry = lineage["chain"][0]
+        self.assertEqual(entry["version"], 2)
+        self.assertEqual(entry["sourceVersion"], 1)
+        self.assertEqual(entry["sourceContentSha256"], self.catalog.get("d", 1)["content_sha256"])
+        self.assertEqual(entry["rowMapping"], [1, 2])
+        self.assertEqual(entry["fieldMapping"], {"id": "id", "v": "v"})
+        self.assertEqual([step["type"] for step in entry["steps"]], ["trim"])
+
+    def test_lineage_chain_for_imported_version_is_empty(self):
+        self.catalog.import_csv("d", self.csv("d.csv", "id\n1\n"))
+        lineage = self.catalog.lineage("d", 1)
+        self.assertEqual(lineage["chain"], [])
+        self.assertEqual(lineage["content_sha256"], self.catalog.get("d", 1)["content_sha256"])
+
+    def test_lineage_chained_cleaning_shows_full_chain(self):
+        self.catalog.import_csv("d", self.csv("d.csv", "id,v\n1, a \n2,b\n3, a \n"))
+        self.catalog.clean("d", 1, [{"type": "trim", "column": "v"}])
+        self.catalog.clean("d", 2, [{"type": "rename", "column": "v", "to": "value"}])
+        lineage = self.catalog.lineage("d", 3)
+        self.assertEqual([entry["version"] for entry in lineage["chain"]], [3, 2])
+        self.assertEqual(lineage["chain"][0]["sourceVersion"], 2)
+        self.assertEqual(lineage["chain"][1]["sourceVersion"], 1)
+        # direct source hash of v3 is v2's hash
+        self.assertEqual(
+            lineage["chain"][0]["sourceContentSha256"],
+            self.catalog.get("d", 2)["content_sha256"],
+        )
+
+    def test_lineage_persists_across_restart(self):
+        self.catalog.import_csv("d", self.csv("d.csv", "id,v\n1, a \n2,b\n"))
+        self.catalog.clean("d", 1, [{"type": "trim", "column": "v"}])
+        reloaded = Catalog(self.catalog.workspace)
+        lineage = reloaded.lineage("d", 2)
+        self.assertEqual(len(lineage["chain"]), 1)
+        self.assertEqual(lineage["chain"][0]["rowMapping"], [1, 2])
+
+    def test_lineage_legacy_workspace_without_lineage_key(self):
+        self.catalog.import_csv("d", self.csv("d.csv", "id\n1\n"))
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        # simulate a legacy record that has no lineage key at all
+        del state["datasets"]["d"][0]["lineage"]
+        self.catalog.state_path.write_text(json.dumps(state), encoding="utf-8")
+        lineage = self.catalog.lineage("d", 1)
+        self.assertEqual(lineage["chain"], [])
+
+    def test_lineage_unknown_dataset_and_version(self):
+        with self.assertRaises(ValueError):
+            self.catalog.lineage("missing", 1)
+        self.catalog.import_csv("d", self.csv("d.csv", "id\n1\n"))
+        with self.assertRaises(ValueError):
+            self.catalog.lineage("d", 2)
+        with self.assertRaises(ValueError):
+            self.catalog.lineage("d", 0)
+
+
+class CleanCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "ws"
+        (self.root / "people.csv").write_text(
+            "id,name,city\n1, Ada ,EU\n2,Lin, APAC\n3, Ada ,EU\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments):
+        return subprocess.run(
+            [sys.executable, "-m", "governance_workbench", "--workspace", str(self.workspace), *arguments],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_clean_success_exit_0(self):
+        result = self.run_cli("import", "people", str(self.root / "people.csv"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ops = self.root / "ops.json"
+        ops.write_text(json.dumps([
+            {"type": "trim", "column": "name"},
+            {"type": "drop_duplicates", "columns": ["name", "city"]},
+        ]), encoding="utf-8")
+        result = self.run_cli("clean", "people", "1", str(ops))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["version"], 2)
+        self.assertEqual(record["row_count"], 2)
+        self.assertEqual(record["lineage"]["sourceVersion"], 1)
+        self.assertEqual(record["lineage"]["steps"][1]["deletedRows"], [3])
+
+    def test_clean_error_exit_2_stderr_only(self):
+        self.run_cli("import", "people", str(self.root / "people.csv"))
+        ops = self.root / "bad.json"
+        ops.write_text(json.dumps([{"type": "trim", "column": "nope"}]), encoding="utf-8")
+        result = self.run_cli("clean", "people", "1", str(ops))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        payload = json.loads(result.stderr)
+        self.assertEqual(set(payload), {"error"})
+        self.assertTrue(payload["error"])
+        # no version consumed
+        self.assertEqual(len(json.loads(Path(self.workspace, ".dgw", "catalog.json").read_text())["datasets"]["people"]), 1)
+
+    def test_clean_missing_ops_file_exit_2(self):
+        self.run_cli("import", "people", str(self.root / "people.csv"))
+        result = self.run_cli("clean", "people", "1", str(self.root / "missing.json"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+    def test_clean_invalid_json_exit_2(self):
+        self.run_cli("import", "people", str(self.root / "people.csv"))
+        ops = self.root / "bad.json"
+        ops.write_text("{not json", encoding="utf-8")
+        result = self.run_cli("clean", "people", "1", str(ops))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+    def test_lineage_cli_success(self):
+        self.run_cli("import", "people", str(self.root / "people.csv"))
+        ops = self.root / "ops.json"
+        ops.write_text(json.dumps([{"type": "trim", "column": "name"}]), encoding="utf-8")
+        self.run_cli("clean", "people", "1", str(ops))
+        result = self.run_cli("lineage", "people", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lineage = json.loads(result.stdout)
+        self.assertEqual(lineage["version"], 2)
+        self.assertEqual(len(lineage["chain"]), 1)
+
+    def test_lineage_cli_error_exit_2(self):
+        result = self.run_cli("lineage", "people", "1")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+    def test_export_cleaned_version_includes_lineage(self):
+        self.run_cli("import", "people", str(self.root / "people.csv"))
+        ops = self.root / "ops.json"
+        ops.write_text(json.dumps([{"type": "trim", "column": "name"}]), encoding="utf-8")
+        self.run_cli("clean", "people", "1", str(ops))
+        destination = self.root / "export"
+        result = self.run_cli("export", "people", "2", str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("lineage", manifest)
+        self.assertEqual(manifest["lineage"]["chain"][0]["sourceVersion"], 1)
+        self.assertEqual(manifest["record"]["version"], 2)
 
 
 if __name__ == "__main__":

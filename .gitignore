@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.demo-workspace/
+.dgw/
+dist/
+build/
+*.egg-info/

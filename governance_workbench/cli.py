@@ -33,6 +33,7 @@ def parser() -> argparse.ArgumentParser:
     compare.add_argument("dataset")
     compare.add_argument("left", type=int)
     compare.add_argument("right", type=int)
+    compare.add_argument("--keys", nargs="+", default=None)
 
     export = commands.add_parser("export")
     export.add_argument("dataset")
@@ -73,7 +74,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "list":
         _print(catalog.list_datasets())
     elif args.command == "compare":
-        _print(catalog.compare(args.dataset, args.left, args.right))
+        try:
+            _print(catalog.compare(args.dataset, args.left, args.right, args.keys))
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
     elif args.command == "export":
         _print(catalog.export(args.dataset, args.version, args.destination))
     elif args.command == "rules":

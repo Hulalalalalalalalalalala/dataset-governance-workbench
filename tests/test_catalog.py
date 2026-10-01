@@ -559,6 +559,213 @@ class CleanTest(unittest.TestCase):
         self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
 
 
+class KeyedCompareTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv_file(self, contents: str, name: str = "data.csv") -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def import_pair(self, left: str, right: str, dataset: str = "d"):
+        self.catalog.import_csv(dataset, self.csv_file(left, "left.csv"))
+        self.catalog.import_csv(dataset, self.csv_file(right, "right.csv"))
+
+    def test_without_keys_keeps_original_shape(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,b\n")
+        result = self.catalog.compare("d", 1, 2)
+        self.assertNotIn("rowDiff", result)
+        self.assertIn("addedFields", result)
+
+    def test_added_removed_modified_and_unchanged(self):
+        self.import_pair(
+            "id,name,v\n1,Ada,1\n2,Lin,2\n4,Max,4\n",
+            "id,name,v\n1,Ada,1\n2,Lin,9\n3,Sam,3\n",
+        )
+        diff = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual([(r["key"], r["row"], r["values"]) for r in diff["removed"]],
+                         [(["4"], 3, {"id": "4", "name": "Max", "v": "4"})])
+        self.assertEqual([(r["key"], r["row"], r["values"]) for r in diff["added"]],
+                         [(["3"], 3, {"id": "3", "name": "Sam", "v": "3"})])
+        self.assertEqual(diff["modified"], [{
+            "key": ["2"], "leftRow": 2, "rightRow": 2,
+            "changes": {"v": {"from": "2", "to": "9"}},
+        }])
+        self.assertEqual(diff["unchangedCount"], 1)
+        # changes only include changed fields
+        self.assertEqual(set(diff["modified"][0]["changes"]), {"v"})
+
+    def test_keys_use_raw_strings_in_given_order(self):
+        self.import_pair("id,v\n1,a\n01,b\n", "id,v\n1,a\n01,c\n")
+        diff = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual(diff["unchangedCount"], 1)
+        self.assertEqual(diff["modified"][0]["key"], ["01"])
+        self.assertEqual(diff["modified"][0]["changes"], {"v": {"from": "b", "to": "c"}})
+        # whitespace and separators inside key values are literal
+        self.import_pair(
+            "a,b,v\nx|y,1,p\n , ,q\n",
+            "a,b,v\nx|y,1,p\n , ,r\n",
+            dataset="m",
+        )
+        diff = self.catalog.compare("m", 1, 2, keys=["a", "b"])["rowDiff"]
+        self.assertEqual(diff["unchangedCount"], 1)
+        self.assertEqual(diff["modified"][0]["key"], [" ", " "])
+
+    def test_composite_key(self):
+        self.import_pair(
+            "g,i,v\nA,1,x\nB,2,y\n",
+            "g,i,v\nA,1,x\nB,2,z\n",
+        )
+        diff = self.catalog.compare("d", 1, 2, keys=["g", "i"])["rowDiff"]
+        self.assertEqual(diff["modified"][0]["key"], ["B", "2"])
+        self.assertEqual(diff["unchangedCount"], 1)
+
+    def test_row_reorder_is_not_modification(self):
+        self.import_pair("id,v\n1,a\n2,b\n", "id,v\n2,b\n1,a\n")
+        diff = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["modified"], [])
+        self.assertEqual(diff["unchangedCount"], 2)
+
+    def test_added_modified_sorted_right_rows_removed_left_rows(self):
+        self.import_pair(
+            "id,v\n1,a\n8,x\n7,u\n",
+            "id,v\n2,b\n1,c\n7,u\n3,d\n",
+        )
+        diff = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual([r["row"] for r in diff["added"]], [1, 4])
+        self.assertEqual([r["rightRow"] for r in diff["modified"]], [2])
+        self.assertEqual([r["row"] for r in diff["removed"]], [2])
+        self.assertEqual(diff["unchangedCount"], 1)
+
+    def test_same_version_compare(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,a\n")
+        diff = self.catalog.compare("d", 1, 1, keys=["id"])["rowDiff"]
+        self.assertEqual(diff["unchangedCount"], 1)
+        self.assertFalse(self.catalog.compare("d", 1, 1, keys=["id"])["contentChanged"])
+
+    def test_header_only_sides_are_empty_data(self):
+        self.import_pair("a,b\n", "a,b\n")
+        diff = self.catalog.compare("d", 1, 2, keys=["a"])["rowDiff"]
+        self.assertEqual(diff, {"added": [], "removed": [], "modified": [], "unchangedCount": 0})
+
+    def test_missing_column_on_one_side_is_null_and_distinct_from_empty(self):
+        self.import_pair("id,v\n1,\n", "id,w\n1,x\n")
+        changes = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]["modified"][0]["changes"]
+        self.assertEqual(changes, {
+            "v": {"from": "", "to": None},
+            "w": {"from": None, "to": "x"},
+        })
+
+    def test_added_and_removed_fields_in_values(self):
+        self.import_pair("id,v\n1,a\n", "id,v,w\n1,a,z\n")
+        added = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]["added"]
+        self.assertEqual(added, [])
+        # values objects span the union of fields with stable key order
+        self.catalog.import_csv("d", self.csv_file("id,v,w\n9,a,z\n", "third.csv"))
+        entry = self.catalog.compare("d", 1, 3, keys=["id"])["rowDiff"]["added"][0]
+        self.assertEqual(list(entry["values"]), ["id", "v", "w"])
+        self.assertEqual(entry["values"], {"id": "9", "v": "a", "w": "z"})
+
+    def test_quoted_newline_does_not_advance_row_numbers(self):
+        self.import_pair(
+            'id,name\n1,"line one\nline two"\n2,x\n',
+            'id,name\n1,"line one\nline two"\n2,y\n',
+        )
+        modified = self.catalog.compare("d", 1, 2, keys=["id"])["rowDiff"]["modified"]
+        self.assertEqual([(m["leftRow"], m["rightRow"]) for m in modified], [(2, 2)])
+
+    def test_cleaned_versions_compare_by_keys(self):
+        self.catalog.import_csv("p", self.csv_file("id,name,city\n1, Ada ,x\n2,Bob,y\n"))
+        self.catalog.clean("p", 1, [
+            {"type": "trim", "column": "name"},
+            {"type": "rename", "column": "city", "to": "region"},
+        ])
+        diff = self.catalog.compare("p", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual(diff["unchangedCount"], 0)
+        by_row = {m["leftRow"]: m["changes"] for m in diff["modified"]}
+        self.assertEqual(set(by_row[1]), {"city", "region", "name"})
+        self.assertEqual(by_row[1]["name"], {"from": " Ada ", "to": "Ada"})
+        self.assertEqual(set(by_row[2]), {"city", "region"})
+
+    def test_invalid_keys_arguments(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,a\n")
+        for bad in ([], "id", [""], ["a", ""], [1], [None], ["id", "id"], [["id"]]):
+            with self.assertRaises(ValueError):
+                self.catalog.compare("d", 1, 2, keys=bad)
+
+    def test_key_column_missing_on_either_side(self):
+        self.import_pair("id,v\n1,a\n", "id,w\n1,a\n")
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["v"])  # missing on right
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["w"])  # missing on left
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["nope"])
+
+    def test_empty_key_cell_rejects_whole_compare(self):
+        self.import_pair("id,v\n,a\n1,b\n", "id,v\n,c\n1,b\n")
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["id"])
+        # whitespace-only key cells are allowed
+        self.import_pair("id,v\n ,a\n", "id,v\n ,a\n", dataset="ws")
+        self.assertEqual(
+            self.catalog.compare("ws", 1, 2, keys=["id"])["rowDiff"]["unchangedCount"], 1
+        )
+
+    def test_duplicate_full_key_rejects_whole_compare(self):
+        self.import_pair("id,v\n1,a\n1,b\n", "id,v\n1,a\n")
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["id"])
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 2, 1, keys=["id"])
+        # duplicates only over the *full* composite key are rejected
+        self.import_pair("g,i,v\nA,1,x\nA,2,y\n", "g,i,v\nA,1,x\nA,2,y\n", dataset="c")
+        self.assertEqual(
+            self.catalog.compare("c", 1, 2, keys=["g", "i"])["rowDiff"]["unchangedCount"], 2
+        )
+
+    def test_unknown_dataset_and_version(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,b\n")
+        with self.assertRaises(ValueError):
+            self.catalog.compare("missing", 1, 2, keys=["id"])
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 9, 2, keys=["id"])
+
+    def test_stored_hashes_verified_every_time(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,b\n")
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        # tamper: even same-version keyed comparison must detect it
+        blob.write_text("id,v\n1,z\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 1, keys=["id"])
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["id"])
+        # missing blob
+        blob.unlink()
+        with self.assertRaises(ValueError):
+            self.catalog.compare("d", 1, 2, keys=["id"])
+
+    def test_ragged_stored_csv_rejected(self):
+        self.catalog.import_csv("r", self.csv_file("a,b\n1,2,3\n"))
+        with self.assertRaises(ValueError):
+            self.catalog.compare("r", 1, 1, keys=["a"])
+
+    def test_compare_does_not_modify_state(self):
+        self.import_pair("id,v\n1,a\n", "id,v\n1,b\n")
+        before = self.catalog.state_path.read_bytes()
+        self.catalog.compare("d", 1, 2, keys=["id"])
+        self.assertEqual(self.catalog.state_path.read_bytes(), before)
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -715,6 +922,46 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("compare", "c", "1", "2").returncode, 0)
         export_result = self.run_cli("export", "c", "1", str(self.root / "out"))
         self.assertEqual(export_result.returncode, 0, export_result.stderr)
+
+    def test_compare_keys_option(self):
+        left = self.root / "left.csv"
+        right = self.root / "right.csv"
+        left.write_text("id,v\n1,a\n2,b\n", encoding="utf-8")
+        right.write_text("id,v\n1,a\n2,c\n3,d\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("import", "k", str(left)).returncode, 0)
+        self.assertEqual(self.run_cli("import", "k", str(right)).returncode, 0)
+
+        # without --keys the response has no rowDiff
+        result = self.run_cli("compare", "k", "1", "2")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("rowDiff", json.loads(result.stdout))
+
+        # single and multiple keys
+        result = self.run_cli("compare", "k", "1", "2", "--keys", "id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        diff = json.loads(result.stdout)["rowDiff"]
+        self.assertEqual(diff["added"], [{"key": ["3"], "row": 3, "values": {"id": "3", "v": "d"}}])
+        self.assertEqual(diff["modified"][0]["key"], ["2"])
+        self.assertEqual(diff["unchangedCount"], 1)
+        result = self.run_cli("compare", "k", "1", "2", "--keys", "id", "v")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["rowDiff"]["unchangedCount"], 1)
+
+        # invalid key and tampered blob fail with the stderr envelope, exit 2
+        result = self.run_cli("compare", "k", "1", "2", "--keys", "missing")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+        # hash verification on a same-version keyed comparison
+        result = self.run_cli("compare", "k", "1", "1", "--keys", "id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(self.run_cli("list").stdout)["k"][0]
+        (self.workspace / record["blob"]).write_text("id,v\n9,z\n", encoding="utf-8")
+        result = self.run_cli("compare", "k", "1", "1", "--keys", "id")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
 
 
 if __name__ == "__main__":

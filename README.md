@@ -14,7 +14,7 @@ python3 -m unittest discover -s tests -v
 
 - `import`: add a CSV file as the next immutable version of a dataset.
 - `list`: print the catalog as JSON.
-- `compare`: compare the schema and content identity of two versions.
+- `compare`: compare the schema and content identity of two versions. Add `--keys 列 [列 ...]` to additionally report row-level changes (`rowDiff`) matched by the given key columns.
 - `export`: copy one stored version and write a checksum-bound manifest.
 - `rules 数据集 JSON文件`: configure a non-empty array of quality rules, returning the dataset's next immutable rule revision (1-based, contiguous).
 - `validate 数据集 版本号 [--revision 修订号]`: validate a stored data version against a rule revision (latest if omitted); exit 0 when the report passes, 1 when violations are found, 2 on error.
@@ -53,3 +53,15 @@ Before cleaning, the stored blob is re-hashed against the version record. On any
 ### Lineage
 
 Each cleaned version records its direct source version, the source content hash, the full operation sequence, per-step input/output row counts, and the mapping from current columns back to source columns. `trim` steps record the modified source row numbers, `drop_duplicates` steps the deleted ones, and `rename` steps the before/after names. Every result row maps to a source data-record number counting from 1; a quoted newline inside a field does not count as a new record. Cleaning a cleaned version extends the chain, and `lineage` shows the whole chain source-first; the records persist across restarts and legacy workspaces work without re-importing. Exporting a cleaned version keeps the original manifest fields and adds the full chain under `lineage`.
+
+### Keyed comparison
+
+Without `--keys`, `compare` keeps its original schema/content output unchanged. With `--keys` (or the optional `keys` argument to `Catalog.compare`, a non-empty list of non-empty, unique column names present on both sides), the result gains a `rowDiff` object:
+
+- `added` / `removed`: rows keyed only on the right / left, each with `key` (raw cell values in the specified column order), `row` (that side's 1-based data-record number), and `values` (every field on the union of the two headers, `null` for fields absent on that side).
+- `modified`: matched keys with at least one changed field, with `key`, `leftRow`, `rightRow`, and `changes` mapping each changed field to `{"from": ..., "to": ...}`.
+- `unchangedCount`: matched keys with no field changes. Reordering rows alone is not a modification.
+
+Keys are matched on raw strings — no trimming, no numeric conversion (`"1"` ≠ `"01"`), and separators inside key values have no special meaning. Whitespace-only strings are valid keys, but an empty-string key cell rejects the whole comparison, as does a duplicated complete key on either side. A field existing only on one side compares as `null` versus the raw value, which is distinct from an empty string; a rename therefore appears as a removed field plus an added field at the schema level and as per-row `null`/value changes. Two header-only sides are a valid empty result. `added` and `modified` are ordered by right record number, `removed` by left record number, and field objects use stable name order.
+
+Every keyed comparison re-verifies the SHA-256 of both stored files against the version records, including same-version comparisons. Unknown dataset/version, missing or unreadable file, hash mismatch, unparseable CSV, empty or duplicate headers, records with the wrong column count, or invalid key parameters fail the whole comparison with no partial diff. On the command line, failures print only `{"error": "原因"}` to stderr and exit 2; in Python, parameter or data errors raise `ValueError` and read failures may raise `OSError`. Comparison never modifies persisted state.

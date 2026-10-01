@@ -26,6 +26,20 @@ python3 -m unittest discover -s tests -v
 
 All catalog state lives below the selected workspace. Source CSV files are copied into a content-addressed blob directory, so later source-file changes do not alter recorded versions.
 
+### Importing
+
+A successful import guarantees the stored version is readable by cleaning, keyed comparison, export, and offline verification, so import applies the same structural rules those stages do. A file is accepted only when it:
+
+- decodes as UTF-8;
+- has a header row whose field names are all non-empty and unique; and
+- has exactly as many fields in every data record as the header.
+
+No header row, an empty field name, a duplicate field name, a missing or extra column, an unterminated quoted field, or any other parse error rejects the whole import. Error reasons distinguish these cases; a field-count error reports the 1-based data record number and the actual and expected column counts. Blank physical lines are not records and a newline inside a quoted field does not advance the record number, so a header-only file imports with zero rows and every field inferring as `null`. The empty string stays distinct from whitespace-only strings, the existing type inference rules are unchanged, text immediately following a closing quote remains legal, and values are never trimmed, padded, or rewritten.
+
+The source is read once as raw bytes; the content hash, row count, schema, and stored blob all describe that exact snapshot, with newlines and quoting preserved byte-for-byte. Replacing or rewriting the source file during the import therefore cannot publish a version whose record disagrees with its stored bytes, and changing the source afterward has no effect on the version. Identical content shares one blob, but an existing content-addressed file is reused only after re-hashing confirms it matches; a damaged blob is reported as an error and is never overwritten or repaired on behalf of older versions. Re-importing the same valid content still appends a new version every time.
+
+A missing or unreadable source, invalid data, or a failure while writing the blob or catalog state adds no dataset or version and consumes no version number: rules, validation reports, lineage, and existing data are untouched, no half-finished import is visible after a restart, and retrying once writes succeed uses the original next version number. Blob writes land via an atomic rename in the blob directory and catalog state is saved atomically. These strict checks apply only to new imports; existing workspaces keep their historical versions without re-importing. On the command line, import failures print only `{"error": "原因"}` to stderr and exit 2 (no success record, no traceback); in Python, parameter and data problems raise `ValueError` and read/write failures raise `OSError`.
+
 ### Rule configuration
 
 Each rule object contains a unique non-empty string `id`, a non-empty `column`, and a `type` of `required`, `unique`, or `range`. Range rules require `min` or `max`, each a finite number (never a boolean), endpoints included, with `min <= max`; non-range rules reject bounds. Unknown types, duplicate ids, missing required attributes, and extra attributes are all rejected.

@@ -73,7 +73,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     catalog = Catalog(args.workspace)
     if args.command == "import":
-        _print(catalog.import_csv(args.dataset, args.source).__dict__)
+        try:
+            _print(catalog.import_csv(args.dataset, args.source).__dict__)
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
     elif args.command == "list":
         _print(catalog.list_datasets())
     elif args.command == "compare":

@@ -1787,5 +1787,466 @@ class CliVerifyExportTest(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stderr)), {"error"})
 
 
+class ReferenceRuleTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv_file(self, contents: str, name: str = "data.csv") -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def import_customers(self, contents="编号,地区\n1,EU\n2,APAC\n"):
+        return self.catalog.import_csv("客户", self.csv_file(contents, "customers.csv"))
+
+    def import_orders(
+        self,
+        contents="客户号,地区,金额\n1,EU,10\n2,APAC,20\n3,US,30\n,EU,40\n1,US,50\n3,US,60\n",
+    ):
+        return self.catalog.import_csv("订单", self.csv_file(contents, "orders.csv"))
+
+    def reference_rule(
+        self,
+        identifier="客户引用",
+        columns=("客户号", "地区"),
+        dataset="客户",
+        version=1,
+        ref_columns=("编号", "地区"),
+    ):
+        return {
+            "id": identifier,
+            "type": "reference",
+            "columns": list(columns),
+            "reference": {
+                "dataset": dataset,
+                "version": version,
+                "columns": list(ref_columns),
+            },
+        }
+
+    def test_reference_validation_reports_missing_and_empty_combinations(self):
+        customers = self.import_customers()
+        self.import_orders()
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        report = self.catalog.validate("订单", 1)
+        self.assertFalse(report["passed"])
+        result = report["results"][0]
+        self.assertEqual(result["id"], "客户引用")
+        self.assertEqual(result["type"], "reference")
+        self.assertEqual(result["columns"], ["客户号", "地区"])
+        self.assertEqual(
+            result["reference"],
+            {
+                "dataset": "客户",
+                "version": 1,
+                "columns": ["编号", "地区"],
+                "content_sha256": customers.content_sha256,
+            },
+        )
+        # rows 3 (3,US), 4 (empty 客户号), 5 (1,US), 6 (3,US, repeated)
+        self.assertEqual(result["violations"], [3, 4, 5, 6])
+        self.assertEqual(result["violationCount"], 4)
+        self.assertNotIn("column", result)
+        self.assertRegex(result["reference"]["content_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_raw_string_matching_positional_composite_columns(self):
+        # no trimming, no numeric conversion, separators inside values literal
+        self.import_customers('编号,地区\n1,EU\n"01",APAC\n" 1",EU\n1,"EU,APAC"\n')
+        self.import_orders(
+            '客户号,地区,金额\n'
+            '1,EU,10\n'          # row 1: exact match
+            '01,APAC,20\n'       # row 2: "01" != "01"? here it matches the quoted ref
+            '1,APAC,30\n'        # row 3: "1" != " 1" and region differs
+            '1,"EU,APAC",40\n'   # row 4: separator inside value is literal
+        )
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        report = self.catalog.validate("订单", 1)
+        self.assertEqual(report["results"][0]["violations"], [3])
+
+    def test_header_only_reference_makes_every_validated_row_violate(self):
+        self.import_customers("编号,地区\n")
+        self.import_orders()
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        report = self.catalog.validate("订单", 1)
+        self.assertEqual(report["results"][0]["violations"], [1, 2, 3, 4, 5, 6])
+        self.assertFalse(report["passed"])
+
+    def test_two_record_less_sides_pass(self):
+        self.import_customers("编号,地区\n")
+        self.import_orders("客户号,地区,金额\n")
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        report = self.catalog.validate("订单", 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["results"][0]["violations"], [])
+        self.assertEqual(report["rowCount"], 0)
+
+    def test_empty_reference_value_fails_whole_validation_even_without_rows(self):
+        self.import_customers("编号,地区\n1,EU\n,APAC\n")
+        self.import_orders("客户号,地区,金额\n")  # header-only validated side
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        with self.assertRaises(ValueError):
+            self.catalog.validate("订单", 1)
+
+    def test_duplicate_reference_combination_fails_whole_validation(self):
+        self.import_customers("编号,地区\n1,EU\n1,EU\n")
+        self.import_orders("客户号,地区,金额\n")
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        with self.assertRaises(ValueError):
+            self.catalog.validate("订单", 1)
+
+    def test_configuration_checks_reference_dataset_version_and_columns(self):
+        self.import_customers()
+        # missing dataset
+        with self.assertRaises(ValueError):
+            self.catalog.set_rules("订单", [self.reference_rule(dataset="不存在")])
+        # missing version
+        with self.assertRaises(ValueError):
+            self.catalog.set_rules("订单", [self.reference_rule(version=9)])
+        # missing reference column
+        with self.assertRaises(ValueError):
+            self.catalog.set_rules(
+                "订单", [self.reference_rule(ref_columns=("编号", "不存在"))]
+            )
+        # no revision was consumed
+        self.assertEqual(self.catalog.list_datasets().get("订单"), None)
+
+    def test_configuration_accepts_cleaned_version_and_self_reference(self):
+        self.import_customers()
+        # a cleaned version of the reference dataset is a valid reference side
+        self.catalog.clean("客户", 1, [{"type": "rename", "column": "编号", "to": "客户编号"}])
+        self.import_orders()
+        rule = self.reference_rule(version=2, ref_columns=("客户编号", "地区"))
+        result = self.catalog.set_rules("订单", [rule])
+        self.assertEqual(result["revision"], 1)
+        # a dataset may reference one of its own versions
+        self.catalog.set_rules(
+            "客户",
+            [self.reference_rule(columns=("编号",), ref_columns=("编号",))],
+        )
+        report = self.catalog.validate("客户", 1)
+        self.assertTrue(report["passed"])
+
+    def test_configuration_shape_rejected(self):
+        self.import_customers()
+
+        def reject(rule):
+            with self.assertRaises(ValueError):
+                self.catalog.set_rules("订单", [rule])
+
+        base = self.reference_rule()
+        reject({k: v for k, v in base.items() if k != "columns"})  # missing columns
+        reject({k: v for k, v in base.items() if k != "reference"})  # missing reference
+        reject({**base, "extra": 1})  # extra attribute
+        reject({**base, "columns": []})  # empty columns
+        reject({**base, "columns": [""]})  # empty column name
+        reject({**base, "columns": [1]})  # non-string column
+        reject({**base, "columns": ["客户号", "客户号"]})  # duplicate columns
+        reject({**base, "reference": "客户"})  # reference not an object
+        ref = dict(base["reference"])
+        del ref["dataset"]
+        reject({**base, "reference": ref})  # missing dataset
+        ref = dict(base["reference"])
+        ref["extra"] = 1
+        reject({**base, "reference": ref})  # extra reference attribute
+        ref = dict(base["reference"])
+        ref["dataset"] = ""
+        reject({**base, "reference": ref})  # empty dataset name
+        ref = dict(base["reference"])
+        ref["version"] = 0
+        reject({**base, "reference": ref})  # non-positive version
+        ref = dict(base["reference"])
+        ref["version"] = True
+        reject({**base, "reference": ref})  # boolean version
+        ref = dict(base["reference"])
+        ref["version"] = 1.5
+        reject({**base, "reference": ref})  # non-integer version
+        ref = dict(base["reference"])
+        ref["columns"] = []
+        reject({**base, "reference": ref})  # empty reference columns
+        ref = dict(base["reference"])
+        ref["columns"] = ["编号", "编号"]
+        reject({**base, "reference": ref})  # duplicate reference columns
+        ref = dict(base["reference"])
+        ref["columns"] = ["编号"]
+        reject({**base, "reference": ref})  # length mismatch
+        # no revision consumed by any failed configuration
+        self.assertEqual(self.catalog.list_datasets().get("订单"), None)
+
+    def test_left_side_columns_checked_at_validation(self):
+        self.import_customers()
+        self.import_orders("客户号,金额\n1,10\n")  # no 地区 column
+        # configuration succeeds (reference side exists)
+        result = self.catalog.set_rules("订单", [self.reference_rule()])
+        self.assertEqual(result["revision"], 1)
+        # validation fails because the validated side lacks a column
+        with self.assertRaises(ValueError):
+            self.catalog.validate("订单", 1)
+
+    def test_report_persists_identically_and_survives_restart(self):
+        customers = self.import_customers()
+        self.import_orders()
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        first = self.catalog.validate("订单", 1)
+        second = self.catalog.validate("订单", 1)
+        self.assertEqual(first, second)
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(state["validations"]["订单"]["1"]), {"1"})
+        reloaded = Catalog(self.catalog.workspace)
+        self.assertEqual(reloaded.validation_history("订单", 1), [first])
+        self.assertEqual(reloaded.validate("订单", 1), first)
+        self.assertEqual(
+            first["results"][0]["reference"]["content_sha256"],
+            customers.content_sha256,
+        )
+
+    def test_revalidation_reverifies_every_side_and_keeps_report_on_failure(self):
+        self.import_customers()
+        self.import_orders()
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        first = self.catalog.validate("订单", 1)
+        record = self.catalog.get("订单", 1)
+        ref_record = self.catalog.get("客户", 1)
+        blob = self.catalog.workspace / record["blob"]
+        ref_blob = self.catalog.workspace / ref_record["blob"]
+        original = blob.read_bytes()
+        ref_original = ref_blob.read_bytes()
+
+        for tampered, target in (
+            ("客户号,地区,金额\n9,EU,10\n".encode("utf-8"), blob),
+            ("编号,地区\n9,EU\n".encode("utf-8"), ref_blob),
+        ):
+            target.write_bytes(tampered)
+            with self.assertRaises(ValueError):
+                self.catalog.validate("订单", 1)
+            # the stored report was not overwritten
+            self.assertEqual(self.catalog.validation_history("订单", 1), [first])
+            target.write_bytes(original if target is blob else ref_original)
+
+        # missing files on either side also fail without touching the report
+        for target in (blob, ref_blob):
+            target.unlink()
+            with self.assertRaises(ValueError):
+                self.catalog.validate("订单", 1)
+            self.assertEqual(self.catalog.validation_history("订单", 1), [first])
+            target.write_bytes(original if target is blob else ref_original)
+
+        # once repaired, validation returns the identical stored report
+        self.assertEqual(self.catalog.validate("订单", 1), first)
+
+    def test_reference_version_is_pinned_across_revisions(self):
+        self.import_customers("编号,地区\n1,EU\n")
+        self.import_orders("客户号,地区,金额\n1,EU,10\n")
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        first = self.catalog.validate("订单", 1)
+        self.assertTrue(first["passed"])
+        # a new reference version with a different combination does not change
+        # the meaning of the existing rule revision
+        self.import_customers("编号,地区\n9,US\n")
+        reloaded = Catalog(self.catalog.workspace)
+        second = reloaded.validate("订单", 1)
+        self.assertEqual(second, first)
+        self.assertEqual(second["results"][0]["reference"]["version"], 1)
+
+    def test_mixed_rules_keep_configuration_order_and_shapes(self):
+        self.import_customers()
+        self.import_orders("客户号,地区,金额\n1,EU,10\n1,APAC,20\n3,US,30\n,EU,40\n")
+        rules = [
+            {"id": "金额必填", "column": "金额", "type": "required"},
+            self.reference_rule("客户引用"),
+            {"id": "客户号唯一", "column": "客户号", "type": "unique"},
+            self.reference_rule("地区引用", columns=("地区",), ref_columns=("地区",)),
+        ]
+        self.catalog.set_rules("订单", rules)
+        report = self.catalog.validate("订单", 1)
+        self.assertEqual(
+            [item["id"] for item in report["results"]],
+            ["金额必填", "客户引用", "客户号唯一", "地区引用"],
+        )
+        by_id = {item["id"]: item for item in report["results"]}
+        self.assertEqual(by_id["金额必填"]["column"], "金额")
+        self.assertEqual(by_id["金额必填"]["violations"], [])
+        self.assertEqual(by_id["客户号唯一"]["violations"], [1, 2])
+        self.assertEqual(by_id["客户引用"]["violations"], [2, 3, 4])
+        self.assertEqual(by_id["地区引用"]["violations"], [3])
+        for item in report["results"]:
+            if item["type"] == "reference":
+                self.assertEqual(item["columns"], ["客户号", "地区"] if item["id"] == "客户引用" else ["地区"])
+                self.assertIn("content_sha256", item["reference"])
+            else:
+                self.assertIn("column", item)
+
+    def test_cleaned_versions_work_as_both_sides(self):
+        self.import_customers()
+        self.import_orders("客户号,地区,金额\n1,EU,10\n3,US,30\n")
+        # clean the reference side (rename 编号 -> 客户编号) and the validated side
+        self.catalog.clean("客户", 1, [{"type": "rename", "column": "编号", "to": "客户编号"}])
+        self.catalog.clean("订单", 1, [{"type": "trim", "column": "地区"}])
+        rule = self.reference_rule(
+            columns=("客户号", "地区"),
+            version=2,
+            ref_columns=("客户编号", "地区"),
+        )
+        self.catalog.set_rules("订单", [rule])
+        report = self.catalog.validate("订单", 2)
+        self.assertEqual(report["results"][0]["violations"], [2])
+        self.assertEqual(report["results"][0]["reference"]["version"], 2)
+
+    def test_failed_report_write_leaves_no_partial_result(self):
+        self.import_customers()
+        self.import_orders()
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        with mock.patch.object(Catalog, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.catalog.validate("订单", 1)
+        self.assertEqual(self.catalog.validation_history("订单", 1), [])
+        report = self.catalog.validate("订单", 1)
+        self.assertEqual(len(self.catalog.validation_history("订单", 1)), 1)
+        self.assertFalse(report["passed"])
+
+    def test_reference_rule_does_not_modify_data_or_consume_versions(self):
+        self.import_customers()
+        source = self.csv_file("客户号,地区,金额\n1,EU,10\n", "orders.csv")
+        before = source.read_bytes()
+        self.catalog.import_csv("订单", source)
+        self.catalog.set_rules("订单", [self.reference_rule()])
+        self.catalog.validate("订单", 1)
+        self.assertEqual(source.read_bytes(), before)
+        self.assertEqual(len(self.catalog.list_datasets()["订单"]), 1)
+        self.assertEqual(len(self.catalog.list_datasets()["客户"]), 1)
+
+
+class ReferenceRuleCliTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "ws"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "governance_workbench",
+                "--workspace",
+                str(self.workspace),
+                *arguments,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_rules_validate_validations_with_reference_rule(self):
+        customers = self.root / "customers.csv"
+        customers.write_text("编号,地区\n1,EU\n2,APAC\n", encoding="utf-8")
+        orders = self.root / "orders.csv"
+        orders.write_text("客户号,地区,金额\n1,EU,10\n3,US,30\n,EU,40\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("import", "客户", str(customers)).returncode, 0)
+        self.assertEqual(self.run_cli("import", "订单", str(orders)).returncode, 0)
+
+        rules_path = self.root / "rules.json"
+        rules_path.write_text(
+            json.dumps([
+                {"id": "金额必填", "column": "金额", "type": "required"},
+                {
+                    "id": "客户引用",
+                    "type": "reference",
+                    "columns": ["客户号", "地区"],
+                    "reference": {"dataset": "客户", "version": 1, "columns": ["编号", "地区"]},
+                },
+            ]),
+            encoding="utf-8",
+        )
+        result = self.run_cli("rules", "订单", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["revision"], 1)
+
+        result = self.run_cli("validate", "订单", "1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["passed"])
+        by_id = {item["id"]: item for item in report["results"]}
+        self.assertEqual(by_id["客户引用"]["violations"], [2, 3])
+        self.assertEqual(by_id["客户引用"]["reference"]["dataset"], "客户")
+        self.assertEqual(by_id["客户引用"]["reference"]["version"], 1)
+        self.assertRegex(by_id["客户引用"]["reference"]["content_sha256"], r"^[0-9a-f]{64}$")
+
+        result = self.run_cli("validations", "订单", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        history = json.loads(result.stdout)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["results"][1]["reference"]["dataset"], "客户")
+
+    def test_reference_configuration_failure_envelope_and_exit_2(self):
+        customers = self.root / "customers.csv"
+        customers.write_text("编号,地区\n1,EU\n", encoding="utf-8")
+        self.run_cli("import", "客户", str(customers))
+        orders = self.root / "orders.csv"
+        orders.write_text("客户号,地区\n1,EU\n", encoding="utf-8")
+        self.run_cli("import", "订单", str(orders))
+
+        rules_path = self.root / "rules.json"
+        rules_path.write_text(
+            json.dumps([{
+                "id": "客户引用",
+                "type": "reference",
+                "columns": ["客户号", "地区"],
+                "reference": {"dataset": "客户", "version": 9, "columns": ["编号", "地区"]},
+            }]),
+            encoding="utf-8",
+        )
+        result = self.run_cli("rules", "订单", str(rules_path))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+        # no revision was consumed: a valid configuration starts at revision 1
+        rules_path.write_text(
+            json.dumps([{
+                "id": "客户引用",
+                "type": "reference",
+                "columns": ["客户号", "地区"],
+                "reference": {"dataset": "客户", "version": 1, "columns": ["编号", "地区"]},
+            }]),
+            encoding="utf-8",
+        )
+        result = self.run_cli("rules", "订单", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["revision"], 1)
+
+    def test_reference_validation_failure_envelope_and_exit_2(self):
+        customers = self.root / "customers.csv"
+        customers.write_text("编号,地区\n1,EU\n", encoding="utf-8")
+        self.run_cli("import", "客户", str(customers))
+        orders = self.root / "orders.csv"
+        orders.write_text("客户号,地区\n1,EU\n", encoding="utf-8")
+        self.run_cli("import", "订单", str(orders))
+        rules_path = self.root / "rules.json"
+        rules_path.write_text(
+            json.dumps([{
+                "id": "客户引用",
+                "type": "reference",
+                "columns": ["客户号", "地区"],
+                "reference": {"dataset": "客户", "version": 1, "columns": ["编号", "地区"]},
+            }]),
+            encoding="utf-8",
+        )
+        self.run_cli("rules", "订单", str(rules_path))
+        # tamper with the reference blob after configuration
+        ref_record = json.loads(self.run_cli("list").stdout)["客户"][0]
+        (self.workspace / ref_record["blob"]).write_text("编号,地区\n9,US\n", encoding="utf-8")
+        result = self.run_cli("validate", "订单", "1")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+
 if __name__ == "__main__":
     unittest.main()

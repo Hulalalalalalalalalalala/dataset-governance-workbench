@@ -42,15 +42,30 @@ A missing or unreadable source, invalid data, or a failure while writing the blo
 
 ### Rule configuration
 
-Each rule object contains a unique non-empty string `id`, a non-empty `column`, and a `type` of `required`, `unique`, or `range`. Range rules require `min` or `max`, each a finite number (never a boolean), endpoints included, with `min <= max`; non-range rules reject bounds. Unknown types, duplicate ids, missing required attributes, and extra attributes are all rejected.
+Each rule object contains a unique non-empty string `id` and a `type` of `required`, `unique`, `range`, or `reference`. The standard rules use a non-empty `column`:
+
+- `required`, `unique`: no further attributes.
+- `range`: requires `min` or `max`, each a finite number (never a boolean), endpoints included, with `min <= max`; non-range rules reject bounds.
+- `reference`: a cross-dataset reference rule with `columns` and a `reference` object:
+
+  ```json
+  {"id": "客户引用", "type": "reference", "columns": ["客户号", "地区"],
+   "reference": {"dataset": "客户", "version": 2, "columns": ["编号", "地区"]}}
+  ```
+
+  `columns` names the validated side's fields and `reference.columns` the fixed reference version's fields; the two arrays correspond positionally, must be equally long, non-empty, free of duplicates, and contain only non-empty strings. `reference.dataset` is a non-empty string, `reference.version` a positive integer (never a boolean). No attributes may be missing or extra. Saving rules checks that the reference dataset, version, and reference columns exist; the validated side's columns are checked when the selected data version is validated. Imported and cleaned versions can serve as either side, and a reference to a dataset's own version is allowed. A failed configuration appends no revision and consumes no revision number, and later versions of the referenced dataset do not change the meaning of an existing rule revision.
+
+Unknown types, duplicate ids, missing required attributes, and extra attributes are all rejected.
 
 ### Validation semantics
 
 - Row numbers count CSV data records starting at 1; a quoted newline inside a field does not advance the row number.
 - An empty string is a missing value and surrounding whitespace is never stripped.
 - `required` reports rows with missing values; `unique` compares non-empty raw strings and reports every row of each duplicated group; `range` skips missing values and flags non-numeric, non-finite, or out-of-bounds values.
+- `reference` checks that the validated side's column combination exists in the pinned reference version: values are matched as raw strings with no trimming or numeric conversion (`"1"` != `"01"`), and separators inside a value have no special meaning. A row is reported when any of its reference values is the empty string or when the complete combination is absent; every offending row is reported, including repeated occurrences. A header-only reference version is legal and makes every validated row violate; two record-less sides pass. The reference side must itself contain no empty reference value and no duplicated complete combination — either fails the whole validation even when the validated side has no records. A reference result carries the validated-side `columns` and a `reference` object with the dataset, version, reference columns, and the reference version's `content_sha256`; counts and `passed` keep their usual meaning.
 - Column names match verbatim.
-- Reports persist across restarts. Re-validating the same data version and rule revision returns the identical stored report (the stored blob hash is still re-verified each time). Validation never modifies CSVs, infers structure, or creates data versions.
+- Reports persist across restarts. Re-validating the same data version and rule revision returns the identical stored report. Validation never modifies CSVs, infers structure, or creates data versions.
+- Every validation re-verifies the stored blob hash of the validated side; validations containing reference rules additionally re-verify the hash of every referenced version against both the version record and the stored report, re-parse every side's CSV structure, and re-check all columns. A missing file, hash mismatch, missing column, structurally invalid CSV, or an empty/duplicated reference combination fails the whole run: no partial report is returned and no existing report is overwritten. A read or write failure leaves no new report; retrying after the failure is repaired saves the complete result. Data versions, rule revisions, and lineage are unaffected.
 - Errors (invalid configuration, unknown dataset/version/revision, no rules, missing columns, missing stored data or hash mismatch) produce a stderr-only `{"error": "原因"}` envelope and exit code 2 for the new commands.
 
 ### Cleaning operations

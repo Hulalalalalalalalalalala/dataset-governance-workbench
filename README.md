@@ -16,6 +16,7 @@ python3 -m unittest discover -s tests -v
 - `list`: print the catalog as JSON.
 - `compare`: compare the schema and content identity of two versions. Add `--keys 列 [列 ...]` to additionally report row-level changes (`rowDiff`) matched by the given key columns.
 - `export`: copy one stored version and write a checksum-bound manifest.
+- `verify-export 目录`: offline-check an exported directory against its manifest without the workspace; exits 0 when the data matches, 1 when issues are found, 2 on manifest errors.
 - `rules 数据集 JSON文件`: configure a non-empty array of quality rules, returning the dataset's next immutable rule revision (1-based, contiguous).
 - `validate 数据集 版本号 [--revision 修订号]`: validate a stored data version against a rule revision (latest if omitted); exit 0 when the report passes, 1 when violations are found, 2 on error.
 - `validations 数据集 版本号`: list persisted validation reports for a data version, ascending by rule revision (empty array when none).
@@ -53,6 +54,21 @@ Before cleaning, the stored blob is re-hashed against the version record. On any
 ### Lineage
 
 Each cleaned version records its direct source version, the source content hash, the full operation sequence, per-step input/output row counts, and the mapping from current columns back to source columns. `trim` steps record the modified source row numbers, `drop_duplicates` steps the deleted ones, and `rename` steps the before/after names. Every result row maps to a source data-record number counting from 1; a quoted newline inside a field does not count as a new record. Cleaning a cleaned version extends the chain, and `lineage` shows the whole chain source-first; the records persist across restarts and legacy workspaces work without re-importing. Exporting a cleaned version keeps the original manifest fields and adds the full chain under `lineage`.
+
+### Verify export
+
+`verify-export 目录` (or `Catalog.verify_export(目录)`) re-checks an exported directory offline: it reads only `manifest.json` and the CSV file it names, never the workspace. Manifests without `lineage` (plain versions and legacy exports) are accepted and unknown extra fields are ignored.
+
+The command prints a JSON report `{"dataset", "version", "passed", "issues"}`, where each issue is `{"code", "message"}`; the issue codes are reported in this order:
+
+- `missing`: the data file named by the manifest is absent.
+- `hash`: the SHA-256 of the raw CSV bytes differs from the record.
+- `csv`: the CSV structure is invalid — invalid UTF-8, an unclosed quote, an empty or duplicate header field name, or a record whose column count differs from the header. Blank physical lines are not records and a quoted newline inside a field does not advance the record count.
+- `rows`: the data record count differs from the record.
+- `schema`: a header field is missing or extra, or a field's type inferred with the import semantics differs from the record.
+- `lineage`: the accompanying chain (when non-empty) is inconsistent — entries belong to different datasets, a source version is not smaller than its result version, adjacent entries' versions and hashes do not link, or the last entry's version, hash, and record count do not match the record. No ancestor data is needed; a missing or empty `lineage` means no chain.
+
+Manifest errors — missing or unreadable manifest, invalid JSON, `schemaVersion` other than integer 1, missing or mistyped required fields, a non-positive version, a negative record count, a malformed hash, or a `file` that is empty, `.`, `..`, contains a path separator, or resolves outside the directory through a symlink — fail with a stderr-only `{"error": "原因"}` envelope and exit 2; in Python they raise `ValueError` (read failures raise `OSError`). When issues are found the report is still printed to stdout and the command exits 1; it exits 0 only when verification passes. Verification writes no files and the report contains no timestamps or machine paths.
 
 ### Keyed comparison
 

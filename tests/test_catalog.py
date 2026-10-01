@@ -964,5 +964,294 @@ class CliTest(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stderr)), {"error"})
 
 
+class VerifyExportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv_file(self, contents: str, name: str = "data.csv") -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def export(self, dataset: str = "d", version: int = 1) -> Path:
+        destination = self.root / "export"
+        self.catalog.export(dataset, version, destination)
+        return destination
+
+    def manifest(self, directory: Path) -> dict:
+        return json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+
+    def write_manifest(self, directory: Path, manifest: dict) -> None:
+        (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_verify_passes_for_exported_directory(self):
+        self.catalog.import_csv("d", self.csv_file("id,name\n1,Ada\n2,Lin\n"))
+        directory = self.export()
+        report = self.catalog.verify_export(directory)
+        self.assertEqual(report, {
+            "dataset": "d",
+            "version": 1,
+            "passed": True,
+            "issues": [],
+        })
+
+    def test_verify_passes_for_cleaned_export_with_lineage(self):
+        self.catalog.import_csv("p", self.csv_file("id,name\n1, Ada \n2,Bob\n"))
+        self.catalog.clean("p", 1, [{"type": "trim", "column": "name"}])
+        directory = self.export("p", 2)
+        report = self.catalog.verify_export(directory)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["dataset"], "p")
+        self.assertEqual(report["version"], 2)
+
+    def test_legacy_manifest_without_lineage_is_accepted(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        manifest = self.manifest(directory)
+        manifest.pop("lineage", None)
+        self.write_manifest(directory, manifest)
+        self.assertTrue(self.catalog.verify_export(directory)["passed"])
+
+    def test_unknown_extra_fields_are_ignored(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        manifest = self.manifest(directory)
+        manifest["extra"] = "whatever"
+        manifest["record"]["alsoExtra"] = 42
+        self.write_manifest(directory, manifest)
+        self.assertTrue(self.catalog.verify_export(directory)["passed"])
+
+    def test_tampered_data_reports_hash_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        data.write_bytes(b"id\n2\n")
+        report = self.catalog.verify_export(directory)
+        self.assertFalse(report["passed"])
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["hash"])
+
+    def test_missing_data_file_reports_missing_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        (directory / self.manifest(directory)["file"]).unlink()
+        report = self.catalog.verify_export(directory)
+        self.assertFalse(report["passed"])
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["missing"])
+
+    def test_row_count_mismatch_reports_rows_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        # Appending a record changes the hash too; both are reported in order.
+        data.write_bytes(b"id\n1\n2\n")
+        report = self.catalog.verify_export(directory)
+        codes = [issue["code"] for issue in report["issues"]]
+        self.assertEqual(codes, ["hash", "rows"])
+
+    def test_schema_mismatch_reports_schema_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id,name\n1,Ada\n"))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        # Rename a column: missing field, extra field, and a type change.
+        data.write_bytes(b"id,label\n1,2\n")
+        report = self.catalog.verify_export(directory)
+        codes = [issue["code"] for issue in report["issues"]]
+        self.assertEqual(codes, ["hash", "schema"])
+        message = report["issues"][-1]["message"]
+        self.assertIn("missing", message)
+        self.assertIn("extra", message)
+
+    def test_type_mismatch_reports_schema_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n2\n"))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        data.write_bytes(b"id\n1\nx\n")
+        report = self.catalog.verify_export(directory)
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["hash", "schema"])
+        self.assertIn("integer", report["issues"][-1]["message"])
+
+    def test_invalid_utf8_reports_csv_issue(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        data.write_bytes(b"id\n\xff\n")
+        report = self.catalog.verify_export(directory)
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["hash", "csv"])
+
+    def test_unclosed_quote_reports_csv_issue(self):
+        self.catalog.import_csv("d", self.csv_file('id,name\n1,"ok"\n'))
+        directory = self.export()
+        data = directory / self.manifest(directory)["file"]
+        data.write_bytes(b'id,name\n1,"broken\n')
+        report = self.catalog.verify_export(directory)
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["hash", "csv"])
+
+    def test_invalid_headers_and_ragged_records_report_csv_issue(self):
+        cases = [
+            b"\n",                    # no header
+            b"id,\n1,\n",             # empty header field
+            b"id,id\n1,2\n",          # duplicate header field
+            b"id\n1,2\n",             # ragged record
+        ]
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        for contents in cases:
+            directory = self.export()
+            data = directory / self.manifest(directory)["file"]
+            data.write_bytes(contents)
+            report = self.catalog.verify_export(directory)
+            self.assertIn("csv", [issue["code"] for issue in report["issues"]], contents)
+
+    def test_blank_lines_and_quoted_newlines_are_not_records(self):
+        self.catalog.import_csv("d", self.csv_file('id,name\n1,"line\nbreak"\n\n2,x\n\n'))
+        directory = self.export()
+        self.assertTrue(self.catalog.verify_export(directory)["passed"])
+
+    def test_header_only_export_passes(self):
+        self.catalog.import_csv("d", self.csv_file("a,b\n"))
+        directory = self.export()
+        self.assertTrue(self.catalog.verify_export(directory)["passed"])
+
+    def test_lineage_mismatches_report_lineage_issue(self):
+        self.catalog.import_csv("p", self.csv_file("id\n1\n2\n"))
+        self.catalog.clean("p", 1, [{"type": "trim", "column": "id"}])
+        directory = self.export("p", 2)
+
+        def verify_with(mutate):
+            manifest = self.manifest(directory)
+            mutate(manifest["lineage"])
+            self.write_manifest(directory, manifest)
+            return self.catalog.verify_export(directory)
+
+        report = verify_with(lambda chain: chain[0].__setitem__("dataset", "other"))
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["lineage"])
+
+        report = verify_with(lambda chain: chain[0].__setitem__("sourceVersion", 3))
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["lineage"])
+
+        report = verify_with(lambda chain: chain[0].__setitem__("contentSha256", "0" * 64))
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["lineage"])
+
+        report = verify_with(lambda chain: chain[0].__setitem__("rowCount", 99))
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["lineage"])
+
+    def test_broken_chain_link_reports_lineage_issue(self):
+        self.catalog.import_csv("p", self.csv_file("id\n1\n2\n"))
+        self.catalog.clean("p", 1, [{"type": "trim", "column": "id"}])
+        self.catalog.clean("p", 2, [{"type": "rename", "column": "id", "to": "code"}])
+        directory = self.export("p", 3)
+        manifest = self.manifest(directory)
+        # Break the link between the two chain entries.
+        manifest["lineage"][1]["sourceSha256"] = "0" * 64
+        self.write_manifest(directory, manifest)
+        report = self.catalog.verify_export(directory)
+        self.assertEqual([issue["code"] for issue in report["issues"]], ["lineage"])
+
+    def test_missing_manifest_is_value_error(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        with self.assertRaises(ValueError):
+            self.catalog.verify_export(empty)
+
+    def test_invalid_manifest_json_is_value_error(self):
+        directory = self.root / "bad"
+        directory.mkdir()
+        (directory / "manifest.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.verify_export(directory)
+
+    def test_invalid_manifest_fields_are_value_errors(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+
+        def reject(mutate):
+            manifest = self.manifest(directory)
+            original = json.loads(json.dumps(manifest))
+            mutate(manifest)
+            self.write_manifest(directory, manifest)
+            with self.assertRaises(ValueError):
+                self.catalog.verify_export(directory)
+            # Restore the pristine manifest for the next mutation.
+            self.write_manifest(directory, original)
+
+        reject(lambda m: m.__setitem__("schemaVersion", 2))
+        reject(lambda m: m.__setitem__("schemaVersion", "1"))
+        reject(lambda m: m.__setitem__("schemaVersion", True))
+        reject(lambda m: m.__setitem__("record", None))
+        reject(lambda m: m["record"].__setitem__("version", 0))
+        reject(lambda m: m["record"].__setitem__("version", -1))
+        reject(lambda m: m["record"].__setitem__("version", "1"))
+        reject(lambda m: m["record"].__setitem__("version", True))
+        reject(lambda m: m["record"].__setitem__("row_count", -1))
+        reject(lambda m: m["record"].__setitem__("row_count", True))
+        reject(lambda m: m["record"].__setitem__("row_count", "2"))
+        reject(lambda m: m["record"].__setitem__("content_sha256", "abc"))
+        reject(lambda m: m["record"].__setitem__("content_sha256", "A" * 64))
+        reject(lambda m: m["record"].__setitem__("content_sha256", "g" * 64))
+        reject(lambda m: m["record"].__setitem__("dataset", ""))
+        reject(lambda m: m["record"].__setitem__("schema", []))
+        reject(lambda m: m.__setitem__("file", ""))
+        reject(lambda m: m.__setitem__("file", "."))
+        reject(lambda m: m.__setitem__("file", ".."))
+        reject(lambda m: m.__setitem__("file", "sub/x.csv"))
+        reject(lambda m: m.__setitem__("file", "sub\\x.csv"))
+
+    def test_symlink_pointing_outside_is_value_error(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        outside = self.root / "outside.csv"
+        outside.write_bytes(b"id\n999\n")
+        manifest = self.manifest(directory)
+        (directory / manifest["file"]).unlink()
+        (directory / manifest["file"]).symlink_to(outside)
+        with self.assertRaises(ValueError):
+            self.catalog.verify_export(directory)
+
+    def test_verify_does_not_write_and_report_has_no_paths_or_timestamps(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+        before = sorted(p.name for p in directory.iterdir())
+        report = self.catalog.verify_export(directory)
+        after = sorted(p.name for p in directory.iterdir())
+        self.assertEqual(before, after)
+        serialized = json.dumps(report)
+        self.assertNotIn(str(self.root), serialized)
+        self.assertNotIn("imported_at", serialized)
+
+    def test_cli_exit_codes(self):
+        self.catalog.import_csv("d", self.csv_file("id\n1\n"))
+        directory = self.export()
+
+        def run(*arguments):
+            return subprocess.run(
+                [sys.executable, "-m", "governance_workbench", "--workspace",
+                 str(self.catalog.workspace), *arguments],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+
+        result = run("verify-export", str(directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["issues"], [])
+        self.assertEqual(result.stderr, "")
+
+        data = directory / self.manifest(directory)["file"]
+        data.write_bytes(b"id\n2\n")
+        result = run("verify-export", str(directory))
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(json.loads(result.stdout)["passed"])
+        self.assertEqual(result.stderr, "")
+
+        result = run("verify-export", str(self.root / "missing"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+
 if __name__ == "__main__":
     unittest.main()

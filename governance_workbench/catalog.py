@@ -743,3 +743,265 @@ class Catalog:
             current = entry["sourceVersion"]
         chain.reverse()
         return {"dataset": dataset, "version": version, "chain": chain}
+
+    @staticmethod
+    def _is_positive_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _is_non_negative_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    @staticmethod
+    def _is_sha256_hex(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    @staticmethod
+    def _parse_export_csv(
+        data: bytes,
+    ) -> tuple[tuple[list[str], list[list[str]]] | None, str | None]:
+        """Parse exported CSV bytes with import-time semantics.
+
+        Blank physical lines are not records and a quoted newline inside a
+        field does not advance the record count. Returns ``(None, reason)``
+        for structural problems (invalid UTF-8, unclosed quotes, empty or
+        duplicate headers, ragged records).
+        """
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            return None, f"file is not valid UTF-8: {error}"
+        try:
+            reader = csv.reader(io.StringIO(text), strict=True)
+            parsed = [row for row in reader if row != []]
+        except csv.Error as error:
+            return None, str(error)
+        if not parsed:
+            return None, "no header row"
+        header = parsed[0]
+        if any(name == "" for name in header):
+            return None, "header contains an empty field name"
+        if len(set(header)) != len(header):
+            return None, "header contains duplicate field names"
+        rows: list[list[str]] = []
+        for record in parsed[1:]:
+            if len(record) != len(header):
+                return None, (
+                    f"record has {len(record)} fields, expected {len(header)}"
+                )
+            rows.append(list(record))
+        return (header, rows), None
+
+    @staticmethod
+    def _schema_mismatch(
+        header: list[str], rows: list[list[str]], record_schema: Any
+    ) -> str | None:
+        record_fields = [name for name in record_schema if isinstance(name, str)]
+        missing = [name for name in record_fields if name not in header]
+        extra = [name for name in header if name not in record_schema]
+        observed = {name: set() for name in header}
+        for row in rows:
+            for index, name in enumerate(header):
+                observed[name].add(_kind(row[index]))
+        inferred = {name: _merge_kinds(kinds) for name, kinds in observed.items()}
+        type_mismatches = [
+            f"{name!r}: expected {record_schema[name]!r}, inferred {inferred[name]!r}"
+            for name in header
+            if name in record_schema
+            and (not isinstance(record_schema[name], str) or inferred[name] != record_schema[name])
+        ]
+        parts = []
+        if missing:
+            parts.append(f"fields {missing} missing from the CSV")
+        if extra:
+            parts.append(
+                f"extra fields {extra} present in the CSV but not in the record"
+            )
+        if type_mismatches:
+            parts.append("type mismatch for " + "; ".join(type_mismatches))
+        return "; ".join(parts) if parts else None
+
+    @classmethod
+    def _lineage_mismatch(
+        cls,
+        lineage: Any,
+        dataset: str,
+        version: int,
+        content_hash: str,
+        row_count: int,
+    ) -> str | None:
+        if lineage is None or lineage == []:
+            return None
+        if not isinstance(lineage, list):
+            return "lineage must be an array of records"
+        previous: dict[str, Any] | None = None
+        for index, entry in enumerate(lineage):
+            where = f"lineage[{index}]"
+            if not isinstance(entry, dict):
+                return f"{where} must be an object"
+            if entry.get("dataset") != dataset:
+                return (
+                    f"{where} belongs to dataset {entry.get('dataset')!r}, "
+                    f"expected {dataset!r}"
+                )
+            entry_version = entry.get("version")
+            source_version = entry.get("sourceVersion")
+            if not cls._is_positive_int(entry_version):
+                return f"{where}.version must be a positive integer"
+            if not cls._is_positive_int(source_version):
+                return f"{where}.sourceVersion must be a positive integer"
+            if source_version >= entry_version:
+                return (
+                    f"{where} source version {source_version} must be smaller "
+                    f"than result version {entry_version}"
+                )
+            if not cls._is_sha256_hex(entry.get("contentSha256")):
+                return f"{where}.contentSha256 must be a 64-character lowercase hexadecimal string"
+            if not cls._is_sha256_hex(entry.get("sourceSha256")):
+                return f"{where}.sourceSha256 must be a 64-character lowercase hexadecimal string"
+            if not cls._is_non_negative_int(entry.get("rowCount")):
+                return f"{where}.rowCount must be a non-negative integer"
+            if previous is not None:
+                if source_version != previous["version"]:
+                    return (
+                        f"{where} source version {source_version} does not match "
+                        f"the previous result version {previous['version']}"
+                    )
+                if entry["sourceSha256"] != previous["contentSha256"]:
+                    return f"{where} source hash does not match the previous result hash"
+            previous = entry
+        last = lineage[-1]
+        if last["version"] != version:
+            return (
+                f"last lineage entry version {last['version']} does not match "
+                f"record version {version}"
+            )
+        if last["contentSha256"] != content_hash:
+            return "last lineage entry hash does not match the record hash"
+        if last["rowCount"] != row_count:
+            return (
+                f"last lineage entry row count {last['rowCount']} does not match "
+                f"record row count {row_count}"
+            )
+        return None
+
+    def verify_export(self, directory: str | Path) -> dict[str, Any]:
+        """Verify an exported directory against its manifest.
+
+        Reads only ``manifest.json`` and the CSV file it names; the workspace
+        catalog is never consulted. Returns a report with ``dataset``,
+        ``version``, ``passed``, and ``issues`` (an ordered list of
+        ``{code, message}`` objects, empty when verification passes).
+
+        Manifest or parameter errors raise ``ValueError``; read failures
+        raise ``OSError``. Data-file problems are reported as issues instead.
+        """
+        directory_path = Path(directory)
+        manifest_path = directory_path / "manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError("manifest.json is missing from the export directory")
+        manifest_bytes = manifest_path.read_bytes()
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"manifest is not valid JSON: {error}") from error
+
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must be a JSON object")
+        schema_version = manifest.get("schemaVersion")
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
+            raise ValueError("schemaVersion must be integer 1")
+        record = manifest.get("record")
+        if not isinstance(record, dict):
+            raise ValueError("manifest record must be an object")
+        dataset = record.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            raise ValueError("record.dataset must be a non-empty string")
+        version = record.get("version")
+        if not self._is_positive_int(version):
+            raise ValueError("record.version must be a positive integer")
+        row_count = record.get("row_count")
+        if not self._is_non_negative_int(row_count):
+            raise ValueError("record.row_count must be a non-negative integer")
+        content_hash = record.get("content_sha256")
+        if not self._is_sha256_hex(content_hash):
+            raise ValueError(
+                "record.content_sha256 must be a 64-character lowercase hexadecimal string"
+            )
+        record_schema = record.get("schema")
+        if (
+            not isinstance(record_schema, dict)
+            or any(not isinstance(name, str) or not name for name in record_schema)
+            or any(not isinstance(kind, str) for kind in record_schema.values())
+        ):
+            raise ValueError(
+                "record.schema must be an object mapping non-empty field names to type strings"
+            )
+
+        file_name = manifest.get("file")
+        if not isinstance(file_name, str) or not file_name:
+            raise ValueError("file must be a non-empty string")
+        if file_name in (".", "..") or "/" in file_name or "\\" in file_name:
+            raise ValueError("file must be a plain file name without path separators")
+        resolved_directory = directory_path.resolve()
+        data_path = resolved_directory / file_name
+        # Resolve before reading: a symlinked file must never escape the
+        # export directory.
+        try:
+            data_path.resolve().relative_to(resolved_directory)
+        except ValueError:
+            raise ValueError("file must not point outside the export directory") from None
+
+        issues: list[dict[str, str]] = []
+        if not data_path.exists():
+            issues.append({
+                "code": "missing",
+                "message": f"data file {file_name!r} is missing from the export directory",
+            })
+        else:
+            data = data_path.read_bytes()
+            actual_hash = hashlib.sha256(data).hexdigest()
+            if actual_hash != content_hash:
+                issues.append({
+                    "code": "hash",
+                    "message": (
+                        f"checksum mismatch: record reports {content_hash}, "
+                        f"CSV bytes hash to {actual_hash}"
+                    ),
+                })
+            parsed, structure_error = self._parse_export_csv(data)
+            if structure_error is not None:
+                issues.append({
+                    "code": "csv",
+                    "message": f"CSV structure is invalid: {structure_error}",
+                })
+            else:
+                header, rows = parsed
+                if len(rows) != row_count:
+                    issues.append({
+                        "code": "rows",
+                        "message": (
+                            f"row count mismatch: record reports {row_count}, "
+                            f"CSV contains {len(rows)} data records"
+                        ),
+                    })
+                schema_error = self._schema_mismatch(header, rows, record_schema)
+                if schema_error is not None:
+                    issues.append({"code": "schema", "message": schema_error})
+
+        lineage_error = self._lineage_mismatch(
+            manifest.get("lineage"), dataset, version, content_hash, row_count
+        )
+        if lineage_error is not None:
+            issues.append({"code": "lineage", "message": lineage_error})
+
+        return {
+            "dataset": dataset,
+            "version": version,
+            "passed": not issues,
+            "issues": issues,
+        }

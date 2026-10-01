@@ -328,6 +328,237 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(len(self.catalog.list_datasets()["d"]), 1)
 
 
+class CleanTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+        self.catalog.import_csv(
+            "people",
+            self.csv_file(
+                "id,name,city\n"
+                "1, Ada ,x\n"
+                "2,Bob,y\n"
+                "1, Ada ,x\n"
+                "3,Ada,z\n"
+            ),
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv_file(self, contents: str, name: str = "data.csv") -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def ops_file(self, operations, name: str = "ops.json") -> Path:
+        path = self.root / name
+        path.write_text(json.dumps(operations), encoding="utf-8")
+        return path
+
+    def clean_people(self):
+        return self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "rename", "column": "city", "to": "region"},
+                {"type": "drop_duplicates", "columns": ["id", "name"]},
+            ],
+        )
+
+    def test_clean_appends_version_with_result_shape(self):
+        result = self.clean_people()
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["row_count"], 3)
+        self.assertEqual(result["schema"], {"id": "integer", "name": "string", "region": "string"})
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(stored, b"id,name,region\n1,Ada,x\n2,Bob,y\n3,Ada,z\n")
+        # the source version is untouched
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
+        original = self.catalog.get("people", 1)
+        self.assertEqual(original["row_count"], 4)
+
+    def test_cleaned_version_supports_compare_validate_export(self):
+        self.clean_people()
+        comparison = self.catalog.compare("people", 1, 2)
+        self.assertEqual(comparison["addedFields"], ["region"])
+        self.assertEqual(comparison["removedFields"], ["city"])
+        self.assertEqual(comparison["rowDelta"], -1)
+        self.catalog.set_rules("people", [{"id": "r", "column": "name", "type": "required"}])
+        report = self.catalog.validate("people", 2)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["rowCount"], 3)
+        manifest = self.catalog.export("people", 2, self.root / "out")
+        self.assertEqual(manifest["record"]["version"], 2)
+        self.assertEqual(manifest["file"], "people-v2.csv")
+        self.assertEqual(len(manifest["lineage"]), 1)
+
+    def test_lineage_records_steps_rows_and_columns(self):
+        self.clean_people()
+        lineage = self.catalog.lineage("people", 2)
+        self.assertEqual(lineage["dataset"], "people")
+        self.assertEqual(lineage["version"], 2)
+        self.assertEqual(len(lineage["chain"]), 1)
+        entry = lineage["chain"][0]
+        self.assertEqual(entry["sourceVersion"], 1)
+        self.assertEqual(entry["sourceSha256"], self.catalog.get("people", 1)["content_sha256"])
+        self.assertEqual(
+            entry["operations"],
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "rename", "column": "city", "to": "region"},
+                {"type": "drop_duplicates", "columns": ["id", "name"]},
+            ],
+        )
+        steps = entry["steps"]
+        self.assertEqual([(s["inputRows"], s["outputRows"]) for s in steps], [(4, 4), (4, 4), (4, 3)])
+        self.assertEqual(steps[0]["modifiedRows"], [1, 3])
+        self.assertEqual((steps[1]["from"], steps[1]["to"]), ("city", "region"))
+        self.assertEqual(steps[2]["deletedRows"], [3])
+        self.assertEqual(entry["columnMapping"], {"id": "id", "name": "name", "region": "city"})
+        self.assertEqual(entry["rowMapping"], [1, 2, 4])
+
+    def test_quoted_newline_does_not_count_as_record(self):
+        self.catalog.import_csv("notes", self.csv_file("id,name\n1,\"line one\nline two\"\n2, x \n", "notes.csv"))
+        result = self.catalog.clean("notes", 1, [{"type": "trim", "column": "name"}])
+        entry = result["lineage"]
+        self.assertEqual(entry["steps"][0]["modifiedRows"], [2])
+        self.assertEqual(entry["rowMapping"], [1, 2])
+
+    def test_dedup_uses_raw_strings_and_empty_strings_participate(self):
+        self.catalog.import_csv("raw", self.csv_file("a,b\n1,\n01,\n1,\n", "raw.csv"))
+        result = self.catalog.clean("raw", 1, [{"type": "drop_duplicates", "columns": ["a", "b"]}])
+        # "1" and "01" are distinct strings; the second ("1", "") is dropped
+        self.assertEqual(result["lineage"]["steps"][0]["deletedRows"], [3])
+        self.assertEqual(result["lineage"]["rowMapping"], [1, 2])
+
+    def test_repeat_clean_is_deterministic_but_appends(self):
+        first = self.clean_people()
+        second = self.clean_people()
+        self.assertEqual((first["version"], second["version"]), (2, 3))
+        self.assertEqual(first["content_sha256"], second["content_sha256"])
+        self.assertEqual(first["blob"], second["blob"])
+        self.assertEqual(first["lineage"]["rowMapping"], second["lineage"]["rowMapping"])
+        self.assertEqual(first["lineage"]["steps"], second["lineage"]["steps"])
+
+    def test_noop_and_header_only_cleans_still_append(self):
+        noop = self.catalog.clean("people", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(noop["row_count"], 4)
+        self.assertEqual(noop["lineage"]["steps"][0]["modifiedRows"], [])
+        self.catalog.import_csv("empty", self.csv_file("a,b\n", "empty.csv"))
+        header_only = self.catalog.clean("empty", 1, [{"type": "trim", "column": "a"}])
+        self.assertEqual(header_only["row_count"], 0)
+        self.assertEqual(header_only["lineage"]["rowMapping"], [])
+
+    def test_chain_extends_across_cleans_and_survives_restart(self):
+        self.clean_people()
+        self.catalog.clean("people", 2, [{"type": "rename", "column": "region", "to": "area"}])
+        reloaded = Catalog(self.catalog.workspace)
+        lineage = reloaded.lineage("people", 3)
+        self.assertEqual([entry["version"] for entry in lineage["chain"]], [2, 3])
+        self.assertEqual(lineage["chain"][0]["sourceVersion"], 1)
+        self.assertEqual(lineage["chain"][1]["sourceVersion"], 2)
+        self.assertEqual(lineage["chain"][1]["columnMapping"]["area"], "region")
+        # an imported version is the chain start
+        self.assertEqual(reloaded.lineage("people", 1)["chain"], [])
+
+    def test_export_of_imported_version_has_no_lineage(self):
+        manifest = self.catalog.export("people", 1, self.root / "plain")
+        self.assertNotIn("lineage", manifest)
+
+    def test_invalid_operations_rejected_without_version(self):
+        def reject(operations):
+            with self.assertRaises(ValueError):
+                self.catalog.clean("people", 1, operations)
+
+        reject([])
+        reject(42)
+        reject({"type": "trim", "column": "name"})  # payload must be an array
+        reject([None])
+        reject([{"column": "name"}])  # missing type
+        reject([{"type": "sort", "column": "name"}])  # unknown operation
+        reject([{"type": "trim"}])  # missing column
+        reject([{"type": "trim", "column": "name", "extra": 1}])  # extra attribute
+        reject([{"type": "trim", "column": ""}])
+        reject([{"type": "trim", "column": 3}])
+        reject([{"type": "trim", "column": "missing"}])  # unknown column
+        reject([{"type": "rename", "column": "name"}])  # missing to
+        reject([{"type": "rename", "column": "name", "to": ""}])
+        reject([{"type": "rename", "column": "name", "to": "id"}])  # conflicts
+        reject([{"type": "rename", "column": "name", "to": "name"}])  # self-conflict
+        reject([{"type": "rename", "column": "missing", "to": "x"}])
+        reject([{"type": "drop_duplicates", "columns": []}])
+        reject([{"type": "drop_duplicates", "columns": "id"}])
+        reject([{"type": "drop_duplicates", "columns": ["id", "id"]}])
+        reject([{"type": "drop_duplicates", "columns": ["id", ""]}])
+        reject([{"type": "drop_duplicates", "columns": ["missing"]}])
+        # later operations see renamed columns
+        reject([
+            {"type": "rename", "column": "name", "to": "label"},
+            {"type": "trim", "column": "name"},
+        ])
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
+
+    def test_rename_then_use_new_name(self):
+        result = self.catalog.clean(
+            "people",
+            1,
+            [
+                {"type": "rename", "column": "name", "to": "label"},
+                {"type": "trim", "column": "label"},
+            ],
+        )
+        self.assertEqual(result["schema"]["label"], "string")
+        self.assertEqual(result["lineage"]["steps"][1]["modifiedRows"], [1, 3])
+
+    def test_missing_dataset_version_file_and_hash_failures(self):
+        with self.assertRaises(ValueError):
+            self.catalog.clean("missing", 1, [{"type": "trim", "column": "name"}])
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 9, [{"type": "trim", "column": "name"}])
+        record = self.catalog.get("people", 1)
+        blob = self.catalog.workspace / record["blob"]
+        original = blob.read_bytes()
+        blob.unlink()
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "trim", "column": "name"}])
+        blob.write_bytes(b"tampered\n")
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, [{"type": "trim", "column": "name"}])
+        blob.write_bytes(original)
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
+
+    def test_ragged_stored_csv_rejected(self):
+        self.catalog.import_csv("ragged", self.csv_file("a,b\n1,2,3\n", "ragged.csv"))
+        with self.assertRaises(ValueError):
+            self.catalog.clean("ragged", 1, [{"type": "trim", "column": "a"}])
+        self.assertEqual(len(self.catalog.list_datasets()["ragged"]), 1)
+
+    def test_failed_write_consumes_no_version_or_lineage(self):
+        with mock.patch.object(Catalog, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.clean_people()
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["datasets"]["people"]), 1)
+        self.assertEqual(state.get("lineage", {}).get("people", {}), {})
+        result = self.clean_people()
+        self.assertEqual(result["version"], 2)
+
+    def test_operations_file_path_accepted(self):
+        path = self.ops_file([{"type": "trim", "column": "name"}])
+        result = self.catalog.clean("people", 1, path)
+        self.assertEqual(result["version"], 2)
+        with self.assertRaises(OSError):
+            self.catalog.clean("people", 1, self.root / "missing.json")
+        bad = self.root / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.clean("people", 1, bad)
+        self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -410,6 +641,68 @@ class CliTest(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stderr)), {"error"})
         # missing rules file
         result = self.run_cli("rules", "d", str(self.root / "missing.json"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+    def test_clean_and_lineage_commands(self):
+        result = self.run_cli("import", "d", str(self.root / "good.csv"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        ops_path = self.root / "ops.json"
+        ops_path.write_text(json.dumps([
+            {"type": "trim", "column": "v"},
+            {"type": "rename", "column": "v", "to": "value"},
+        ]), encoding="utf-8")
+        result = self.run_cli("clean", "d", "1", str(ops_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cleaned = json.loads(result.stdout)
+        self.assertEqual(cleaned["version"], 2)
+        self.assertEqual(cleaned["row_count"], 1)
+        self.assertEqual(cleaned["schema"], {"id": "integer", "value": "integer"})
+
+        result = self.run_cli("lineage", "d", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lineage = json.loads(result.stdout)
+        self.assertEqual(len(lineage["chain"]), 1)
+        self.assertEqual(lineage["chain"][0]["sourceVersion"], 1)
+        self.assertEqual(lineage["chain"][0]["columnMapping"], {"id": "id", "value": "v"})
+
+        # imported version is the chain start
+        result = self.run_cli("lineage", "d", "1")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["chain"], [])
+
+        # exported manifest of a cleaned version carries the full chain
+        result = self.run_cli("export", "d", "2", str(self.root / "cleaned-out"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads(result.stdout)
+        self.assertEqual(manifest["schemaVersion"], 1)
+        self.assertIn("record", manifest)
+        self.assertIn("file", manifest)
+        self.assertEqual(len(manifest["lineage"]), 1)
+
+    def test_clean_and_lineage_error_envelope(self):
+        self.run_cli("import", "d", str(self.root / "good.csv"))
+        ops_path = self.root / "ops.json"
+        ops_path.write_text(json.dumps([{"type": "trim", "column": "missing"}]), encoding="utf-8")
+        for arguments in (
+            ["clean", "d", "1", str(ops_path)],           # unknown column
+            ["clean", "d", "9", str(ops_path)],           # unknown version
+            ["clean", "missing", "1", str(ops_path)],     # unknown dataset
+            ["clean", "d", "1", str(self.root / "no.json")],  # unreadable file
+            ["lineage", "d", "9"],                        # unknown version
+            ["lineage", "missing", "1"],                  # unknown dataset
+        ):
+            result = self.run_cli(*arguments)
+            self.assertEqual(result.returncode, 2, arguments)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(set(json.loads(result.stderr)), {"error"})
+        # failed cleans did not append versions
+        self.assertEqual(len(json.loads(self.run_cli("list").stdout)["d"]), 1)
+        # invalid JSON operations file
+        ops_path.write_text("[{not json", encoding="utf-8")
+        result = self.run_cli("clean", "d", "1", str(ops_path))
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertEqual(set(json.loads(result.stderr)), {"error"})

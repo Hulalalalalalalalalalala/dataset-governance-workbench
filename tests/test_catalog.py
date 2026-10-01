@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -9,6 +10,40 @@ from unittest import mock
 from governance_workbench import Catalog
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def plant_legacy_version(catalog, dataset: str, contents, name: str = "legacy.csv") -> dict:
+    """Write a version directly into a workspace, bypassing import.
+
+    Pre-strict workspaces may contain blobs that the new importer would
+    reject; later functions must still refuse them.
+    """
+    data = contents.encode("utf-8") if isinstance(contents, str) else contents
+    content_hash = hashlib.sha256(data).hexdigest()
+    catalog.blobs.mkdir(parents=True, exist_ok=True)
+    blob = catalog.blobs / f"{content_hash}.csv"
+    blob.write_bytes(data)
+    if catalog.state_path.exists():
+        state = json.loads(catalog.state_path.read_text(encoding="utf-8"))
+    else:
+        state = {"schemaVersion": 1, "datasets": {}, "rules": {}, "validations": {}, "lineage": {}}
+    versions = state["datasets"].setdefault(dataset, [])
+    record = {
+        "dataset": dataset,
+        "version": len(versions) + 1,
+        "source_name": name,
+        "content_sha256": content_hash,
+        "row_count": 0,
+        "schema": {},
+        "imported_at": "2020-01-01T00:00:00+00:00",
+        "blob": str(blob.relative_to(catalog.workspace)),
+    }
+    versions.append(record)
+    catalog.state_path.write_text(
+        json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return record
 
 
 class CatalogTest(unittest.TestCase):
@@ -48,6 +83,236 @@ class CatalogTest(unittest.TestCase):
         on_disk = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
         self.assertEqual(manifest["record"]["content_sha256"], record.content_sha256)
+
+
+class StrictImportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv(self, name: str, contents) -> Path:
+        path = self.root / name
+        if isinstance(contents, str):
+            path.write_text(contents, encoding="utf-8")
+        else:
+            path.write_bytes(contents)
+        return path
+
+    def reject(self, contents, name="bad.csv"):
+        path = self.csv(name, contents)
+        with self.assertRaises(ValueError):
+            self.catalog.import_csv("d", path)
+        # a rejected import adds no dataset or version
+        self.assertEqual(self.catalog.list_datasets(), {})
+        return path
+
+    def test_invalid_utf8_rejected(self):
+        self.reject(b"id,v\n1,\xff\n")
+
+    def test_no_header_rejected(self):
+        self.reject("")
+        self.reject("\n")
+        self.reject("\n\n\n")
+
+    def test_empty_header_names_rejected(self):
+        self.reject("id,\n1,2\n")
+        self.reject(",\n1,2\n")
+
+    def test_duplicate_header_names_rejected(self):
+        self.reject("id,id\n1,2\n")
+        self.reject("a,b,a\n1,2,3\n")
+
+    def test_unterminated_quote_rejected(self):
+        self.reject('id,v\n1,"unclosed\n')
+        self.reject('id,v\n"unclosed')
+
+    def test_ragged_records_rejected_with_record_number_and_counts(self):
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_csv("d", self.csv("short.csv", "a,b\n1,2\n3\n"))
+        message = str(caught.exception)
+        self.assertIn("record 2", message)
+        self.assertIn("1", message)
+        self.assertIn("2", message)
+        self.assertEqual(self.catalog.list_datasets(), {})
+
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_csv("d", self.csv("long.csv", "a,b\n1,2,3\n"))
+        message = str(caught.exception)
+        self.assertIn("record 1", message)
+        self.assertIn("3", message)
+        self.assertIn("2", message)
+        self.assertEqual(self.catalog.list_datasets(), {})
+
+    def test_record_numbers_skip_blank_lines(self):
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_csv("d", self.csv("blank.csv", "a,b\n1,2\n\n3,4,5\n"))
+        # the ragged record is the second data record, not physical line 4
+        self.assertIn("record 2", str(caught.exception))
+
+    def test_distinct_error_reasons(self):
+        cases = {
+            "no header": "",
+            "empty header": "id,\n1,2\n",
+            "duplicate header": "id,id\n1,2\n",
+            "unterminated quote": 'id,v\n1,"x\n',
+            "ragged": "a,b\n1\n",
+        }
+        messages = []
+        for label, contents in cases.items():
+            try:
+                self.catalog.import_csv("d", self.csv(f"{label}.csv", contents))
+            except ValueError as error:
+                messages.append((label, str(error)))
+        self.assertEqual(len(messages), len(cases))
+        reasons = [message for _, message in messages]
+        self.assertEqual(len(set(reasons)), len(reasons))
+
+    def test_header_only_import_is_zero_rows_null_types(self):
+        record = self.catalog.import_csv("empty", self.csv("empty.csv", "a,b,c\n"))
+        self.assertEqual(record.row_count, 0)
+        self.assertEqual(record.schema, {"a": "null", "b": "null", "c": "null"})
+        # and it flows through export and offline verification
+        destination = self.root / "export"
+        self.catalog.export("empty", 1, destination)
+        report = Catalog(self.root / "offline").verify_export(destination)
+        self.assertTrue(report["passed"], report["issues"])
+
+    def test_blank_lines_and_quoted_newlines_do_not_advance_records(self):
+        record = self.catalog.import_csv(
+            "notes", self.csv("notes.csv", 'id,name\n\n1,"line one\nline two"\n\n2,Bob\n')
+        )
+        self.assertEqual(record.row_count, 2)
+
+    def test_empty_string_and_whitespace_stay_distinct(self):
+        # A quoted empty field is a record with an empty string; a blank
+        # physical line is not a record. Whitespace-only cells are strings.
+        record = self.catalog.import_csv("ws", self.csv("ws.csv", 'v\n""\n \n  \n'))
+        self.assertEqual(record.schema, {"v": "string"})
+        self.assertEqual(record.row_count, 3)
+
+    def test_blob_bytes_match_source_and_later_source_changes_are_irrelevant(self):
+        source = self.csv("input.csv", "id,name\n1,Ada\n2,Lin\n")
+        original = source.read_bytes()
+        record = self.catalog.import_csv("people", source)
+        blob_path = self.catalog.workspace / record.blob
+        self.assertEqual(blob_path.read_bytes(), original)
+        self.assertEqual(record.content_sha256, hashlib.sha256(original).hexdigest())
+        # mutating the source after import leaves the published version intact
+        source.write_text("id,name\n9,Nobody\n", encoding="utf-8")
+        self.assertEqual(blob_path.read_bytes(), original)
+        self.assertEqual(self.catalog.get("people", 1)["content_sha256"], record.content_sha256)
+
+    def test_repeated_import_appends_versions_with_shared_blob(self):
+        source = self.csv("same.csv", "a,b\n1,2\n")
+        first = self.catalog.import_csv("d", source)
+        second = self.catalog.import_csv("d", source)
+        self.assertEqual((first.version, second.version), (1, 2))
+        self.assertEqual(first.content_sha256, second.content_sha256)
+        self.assertEqual(first.blob, second.blob)
+        self.assertEqual(len(self.catalog.list_datasets()["d"]), 2)
+
+    def test_corrupted_existing_blob_is_rejected_not_overwritten(self):
+        source = self.csv("data.csv", "a,b\n1,2\n")
+        record = self.catalog.import_csv("d", source)
+        blob_path = self.catalog.workspace / record.blob
+        blob_path.write_bytes(b"garbage")
+        with self.assertRaises(ValueError):
+            self.catalog.import_csv("d", source)
+        # the corrupted blob is untouched and no version was added
+        self.assertEqual(blob_path.read_bytes(), b"garbage")
+        self.assertEqual(len(self.catalog.list_datasets()["d"]), 1)
+
+    def test_failed_import_consumes_no_version_number(self):
+        self.catalog.import_csv("d", self.csv("good.csv", "a,b\n1,2\n"))
+        with self.assertRaises(ValueError):
+            self.catalog.import_csv("d", self.csv("bad.csv", "a,b\n1\n"))
+        retry = self.catalog.import_csv("d", self.csv("retry.csv", "a,b\n3,4\n"))
+        self.assertEqual(retry.version, 2)
+        self.assertEqual(len(self.catalog.list_datasets()["d"]), 2)
+
+    def test_failed_import_leaves_existing_state_untouched(self):
+        self.catalog.import_csv("d", self.csv("good.csv", "a,b\n1,2\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "a", "type": "required"}])
+        state_before = self.catalog.state_path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.catalog.import_csv("d", self.csv("bad.csv", "a,b\n1\n"))
+        self.assertEqual(self.catalog.state_path.read_bytes(), state_before)
+        self.assertEqual(self.catalog.validate("d", 1)["passed"], True)
+
+    def test_unreadable_source_raises_os_error(self):
+        with self.assertRaises(OSError):
+            self.catalog.import_csv("d", self.root / "missing.csv")
+        self.assertEqual(self.catalog.list_datasets(), {})
+
+    def test_text_after_closing_quote_keeps_existing_behavior(self):
+        # Non-strict parsing accepts characters immediately after a closing
+        # quote, exactly as before; this is not a structural failure.
+        record = self.catalog.import_csv("q", self.csv("q.csv", 'id,n\n1,"x"y\n'))
+        self.assertEqual(record.row_count, 1)
+        destination = self.root / "export"
+        self.catalog.export("q", 1, destination)
+        self.assertTrue(Catalog(self.root / "offline").verify_export(destination)["passed"])
+
+    def test_quoted_newline_inside_field_is_preserved_in_blob(self):
+        contents = 'id,name\n1,"line one\nline two"\n'
+        record = self.catalog.import_csv("notes", self.csv("notes.csv", contents))
+        self.assertEqual((self.catalog.workspace / record.blob).read_text(encoding="utf-8"), contents)
+        self.assertEqual(record.row_count, 1)
+
+
+class CliStrictImportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "ws"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments):
+        return subprocess.run(
+            [sys.executable, "-m", "governance_workbench", "--workspace", str(self.workspace), *arguments],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_import_failure_is_stderr_only_envelope_exit_2(self):
+        bad = self.root / "bad.csv"
+        bad.write_text("a,b\n1\n", encoding="utf-8")
+        result = self.run_cli("import", "d", str(bad))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        payload = json.loads(result.stderr)
+        self.assertEqual(set(payload), {"error"})
+        self.assertTrue(payload["error"])
+        # no dataset or version was created
+        self.assertEqual(json.loads(self.run_cli("list").stdout), {})
+
+    def test_import_success_still_prints_record_exit_0(self):
+        good = self.root / "good.csv"
+        good.write_text("a,b\n1,2\n", encoding="utf-8")
+        result = self.run_cli("import", "d", str(good))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record["row_count"], 1)
+        self.assertEqual(record["version"], 1)
+        self.assertEqual(result.stderr, "")
+
+    def test_retry_after_failure_uses_next_version_number(self):
+        good = self.root / "good.csv"
+        bad = self.root / "bad.csv"
+        good.write_text("a,b\n1,2\n", encoding="utf-8")
+        bad.write_text("a,b\n1\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("import", "d", str(good)).returncode, 0)
+        self.assertEqual(self.run_cli("import", "d", str(bad)).returncode, 2)
+        retry = self.run_cli("import", "d", str(good))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["version"], 2)
 
 
 class RulesConfigurationTest(unittest.TestCase):
@@ -531,7 +796,9 @@ class CleanTest(unittest.TestCase):
         self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
 
     def test_ragged_stored_csv_rejected(self):
-        self.catalog.import_csv("ragged", self.csv_file("a,b\n1,2,3\n", "ragged.csv"))
+        # A legacy workspace may hold a ragged blob that the strict importer
+        # would now refuse; cleaning must still reject it.
+        plant_legacy_version(self.catalog, "ragged", "a,b\n1,2,3\n")
         with self.assertRaises(ValueError):
             self.catalog.clean("ragged", 1, [{"type": "trim", "column": "a"}])
         self.assertEqual(len(self.catalog.list_datasets()["ragged"]), 1)
@@ -755,7 +1022,9 @@ class KeyedCompareTest(unittest.TestCase):
             self.catalog.compare("d", 1, 2, keys=["id"])
 
     def test_ragged_stored_csv_rejected(self):
-        self.catalog.import_csv("r", self.csv_file("a,b\n1,2,3\n"))
+        # A legacy workspace may hold a ragged blob that the strict importer
+        # would now refuse; keyed comparison must still reject it.
+        plant_legacy_version(self.catalog, "r", "a,b\n1,2,3\n")
         with self.assertRaises(ValueError):
             self.catalog.compare("r", 1, 1, keys=["a"])
 

@@ -119,6 +119,62 @@ def _ends_inside_quote(text: str) -> bool:
     return state == in_quoted
 
 
+def _parse_csv_records(text: str) -> tuple[list[str], list[list[str]]]:
+    """Parse CSV text with import-time structural strictness.
+
+    The header must exist and have non-empty, non-duplicate field names,
+    and every data record must have the same field count as the header.
+    Blank physical lines are not records and a newline inside a quoted
+    field does not start a new record. Structural problems raise
+    ValueError with a distinct message; nothing is trimmed, padded, or
+    rewritten, and text immediately after a closing quote keeps the
+    non-strict reader's existing behavior.
+    """
+    if _ends_inside_quote(text):
+        raise ValueError("CSV has a quoted field that is never closed")
+    try:
+        # Non-strict parsing matches import semantics: only the explicitly
+        # enumerated structural problems are failures.
+        parsed = [
+            row
+            for row in csv.reader(io.StringIO(text, newline=""))
+            if row != []
+        ]
+    except csv.Error as error:
+        raise ValueError(f"CSV structure is invalid: {error}") from error
+    if not parsed:
+        raise ValueError("CSV has no header row")
+    header = parsed[0]
+    empty_positions = [
+        position + 1 for position, name in enumerate(header) if name == ""
+    ]
+    if empty_positions:
+        raise ValueError(
+            "CSV header has empty field name(s) at position(s) "
+            f"{empty_positions}"
+        )
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for name in header:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise ValueError(
+            "CSV header has duplicate field name(s): "
+            + ", ".join(repr(name) for name in duplicates)
+        )
+    expected = len(header)
+    for record_number, row in enumerate(parsed[1:], start=1):
+        actual = len(row)
+        if actual != expected:
+            raise ValueError(
+                f"CSV record {record_number} has {actual} field(s), "
+                f"expected {expected}"
+            )
+    return header, parsed[1:]
+
+
 @dataclass(frozen=True)
 class DatasetVersion:
     dataset: str
@@ -160,31 +216,45 @@ class Catalog:
         if not dataset or any(character in dataset for character in "/\\\0"):
             raise ValueError("dataset must be a non-empty portable name")
         source_path = Path(source).resolve(strict=True)
-        with source_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames or len(set(reader.fieldnames)) != len(reader.fieldnames):
-                raise ValueError("CSV requires unique, non-empty headers")
-            observed = {name: set() for name in reader.fieldnames}
-            row_count = 0
-            for row in reader:
-                row_count += 1
-                for name in reader.fieldnames:
-                    observed[name].add(_kind(row[name] or ""))
+        # Read the raw bytes once and parse, hash, and store that exact same
+        # content: a source file that is replaced or rewritten during import
+        # can never produce a record whose description disagrees with the
+        # bytes actually saved, and later source changes cannot affect the
+        # published version.
+        data = source_path.read_bytes()
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"CSV is not valid UTF-8: {error}") from error
+        header, rows = _parse_csv_records(text)
 
-        content_hash = _sha256(source_path)
+        content_hash = hashlib.sha256(data).hexdigest()
         self.blobs.mkdir(parents=True, exist_ok=True)
         blob = self.blobs / f"{content_hash}.csv"
-        if not blob.exists():
-            shutil.copyfile(source_path, blob)
+        if blob.exists():
+            # Reuse only after confirming the existing file matches its
+            # content-addressed name; a corrupted blob is reported, never
+            # overwritten or silently repaired.
+            if _sha256(blob) != content_hash:
+                raise ValueError(f"stored data hash mismatch for {content_hash}")
+        else:
+            # Atomic publish so a write failure leaves no half-written blob.
+            temporary = blob.with_suffix(".tmp")
+            temporary.write_bytes(data)
+            temporary.replace(blob)
 
         state = self._load()
         versions = state["datasets"].setdefault(dataset, [])
+        observed = {name: set() for name in header}
+        for row in rows:
+            for position, name in enumerate(header):
+                observed[name].add(_kind(row[position]))
         record = DatasetVersion(
             dataset=dataset,
             version=len(versions) + 1,
             source_name=source_path.name,
             content_sha256=content_hash,
-            row_count=row_count,
+            row_count=len(rows),
             schema={name: _merge_kinds(kinds) for name, kinds in observed.items()},
             imported_at=datetime.now(timezone.utc).isoformat(),
             blob=str(blob.relative_to(self.workspace)),

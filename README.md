@@ -16,6 +16,7 @@ python3 -m unittest discover -s tests -v
 - `list`: print the catalog as JSON.
 - `compare`: compare the schema and content identity of two versions. Add `--keys 列 [列 ...]` to additionally report row-level changes (`rowDiff`) matched by the given key columns.
 - `export`: copy one stored version and write a checksum-bound manifest.
+- `verify-export 导出目录`: offline-verify that an export directory still matches its manifest. Reads only `manifest.json` and the CSV it names — never the workspace — and writes nothing.
 - `rules 数据集 JSON文件`: configure a non-empty array of quality rules, returning the dataset's next immutable rule revision (1-based, contiguous).
 - `validate 数据集 版本号 [--revision 修订号]`: validate a stored data version against a rule revision (latest if omitted); exit 0 when the report passes, 1 when violations are found, 2 on error.
 - `validations 数据集 版本号`: list persisted validation reports for a data version, ascending by rule revision (empty array when none).
@@ -65,3 +66,17 @@ Without `--keys`, `compare` keeps its original schema/content output unchanged. 
 Keys are matched on raw strings — no trimming, no numeric conversion (`"1"` ≠ `"01"`), and separators inside key values have no special meaning. Whitespace-only strings are valid keys, but an empty-string key cell rejects the whole comparison, as does a duplicated complete key on either side. A field existing only on one side compares as `null` versus the raw value, which is distinct from an empty string; a rename therefore appears as a removed field plus an added field at the schema level and as per-row `null`/value changes. Two header-only sides are a valid empty result. `added` and `modified` are ordered by right record number, `removed` by left record number, and field objects use stable name order.
 
 Every keyed comparison re-verifies the SHA-256 of both stored files against the version records, including same-version comparisons. Unknown dataset/version, missing or unreadable file, hash mismatch, unparseable CSV, empty or duplicate headers, records with the wrong column count, or invalid key parameters fail the whole comparison with no partial diff. On the command line, failures print only `{"error": "原因"}` to stderr and exit 2; in Python, parameter or data errors raise `ValueError` and read failures may raise `OSError`. Comparison never modifies persisted state.
+
+### Offline export verification
+
+`verify-export 导出目录` (or `Catalog.verify_export(directory)`) checks that an exported directory still agrees with its manifest without touching the workspace: only `manifest.json` and the CSV it names are read, and no file is written or cached, so every invocation re-checks from scratch. The export command and manifest shape are unchanged, and verification tolerates older manifests that ship no `lineage` as well as unknown extra fields.
+
+The report is a JSON object `{"dataset", "version", "passed", "issues"}`, where `issues` is an array of `{"code", "message"}` objects (empty on success). Every independently determinable problem is returned, ordered by category: `missing` → `hash` → `csv` → `rows` → `schema` → `lineage`.
+
+- **hash**: the CSV's raw bytes hashed with SHA-256 must equal `record.content_sha256`.
+- **csv**: structural validity — decodes as UTF-8, has a header row with non-empty, non-duplicate field names, every data record has the same column count as the header, and no quoted field is left unterminated. A missing data file is reported separately as **missing**.
+- **rows**: the number of data records must equal `record.row_count`. Blank physical lines are not records, a quoted newline does not advance the record number, and a header-only file has zero records.
+- **schema**: the header field set must equal the record's, and each field's type inferred with the existing import semantics must match the declared type.
+- **lineage**: with a non-empty `lineage` array, every entry must belong to the same dataset, each source version must be below its result version, adjacent entries must connect by version and hash, and the last entry's version, content hash, and row count must equal the record. No ancestor data is required. A missing field or an empty array means no chain was shipped.
+
+Manifest problems are hard errors rather than report entries: a missing or unreadable manifest, invalid JSON or UTF-8, a `schemaVersion` that is not the integer `1`, a missing or mistyped required field, a non-positive-integer version, a negative row count, a non-64-character-lowercase-hex hash (booleans never count as integers), or an invalid `file` name. `file` must be a non-empty plain name (not `.` or `..`, no path separators, no NUL) that stays inside the export directory, including when it reaches outside through a symbolic link; such references are refused before the target is read. On the command line these errors print only `{"error": "原因"}` to stderr and exit 2, data discrepancies print the report to stdout with exit 1, and a clean verification exits 0. In Python, manifest and parameter problems raise `ValueError` and read failures raise `OSError`.

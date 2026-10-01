@@ -40,6 +40,9 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("version", type=int)
     export.add_argument("destination")
 
+    verify_export = commands.add_parser("verify-export")
+    verify_export.add_argument("directory")
+
     rules = commands.add_parser("rules")
     rules.add_argument("dataset")
     rules.add_argument("rules_file")
@@ -80,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
             return _fail(str(error))
     elif args.command == "export":
         _print(catalog.export(args.dataset, args.version, args.destination))
+    elif args.command == "verify-export":
+        try:
+            report = catalog.verify_export(args.directory)
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
+        _print(report)
+        return 0 if report["passed"] else 1
     elif args.command == "rules":
         try:
             with open(args.rules_file, encoding="utf-8") as handle:

@@ -14,12 +14,23 @@ from typing import Any
 
 _RULE_TYPES = {"required", "unique", "range"}
 _RULE_KEYS = {"id", "column", "type", "min", "max"}
+_TYPE_NAMES = {"null", "boolean", "integer", "number", "string"}
 _OPERATION_KEYS = {
     "trim": {"type", "column"},
     "rename": {"type", "column", "to"},
     "drop_duplicates": {"type", "columns"},
 }
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?\Z")
+_HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _is_int(value: Any) -> bool:
+    # bool is a subclass of int and is not accepted anywhere integers are.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_hash(value: Any) -> bool:
+    return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
 
 
 def _finite_number(value: str) -> float | None:
@@ -71,6 +82,41 @@ def _merge_kinds(values: set[str]) -> str:
     if len(values) == 1:
         return next(iter(values))
     return "string"
+
+
+def _ends_inside_quote(text: str) -> bool:
+    """Return whether the text ends inside an unterminated quoted field.
+
+    This is a faithful transcription of the non-strict csv reader's
+    per-character field state (START_FIELD / IN_FIELD / IN_QUOTED_FIELD /
+    AFTER_QUOTE), so it agrees with import parsing: text immediately after
+    a closing quote is legal and does not reopen a field, while a quote
+    opened at the start of a field and never closed runs to the end.
+    """
+    start_field, in_field, in_quoted, after_quote = 0, 1, 2, 3
+    state = start_field
+    for char in text:
+        if state == start_field:
+            if char == '"':
+                state = in_quoted
+            elif char in (",", "\r", "\n"):
+                state = start_field
+            else:
+                state = in_field
+        elif state == in_field:
+            if char in (",", "\r", "\n"):
+                state = start_field
+        elif state == in_quoted:
+            if char == '"':
+                state = after_quote
+        else:  # after_quote
+            if char == '"':
+                state = in_quoted
+            elif char in (",", "\r", "\n"):
+                state = start_field
+            else:
+                state = in_field
+    return state == in_quoted
 
 
 @dataclass(frozen=True)
@@ -330,6 +376,388 @@ class Catalog:
             encoding="utf-8",
         )
         return manifest
+
+    # ------------------------------------------------------------------
+    # Offline export verification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _verified_manifest_record(record: Any) -> dict[str, Any]:
+        """Validate the ``record`` object embedded in an export manifest."""
+        if not isinstance(record, dict):
+            raise ValueError("manifest record must be an object")
+        dataset = record.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            raise ValueError("manifest record.dataset must be a non-empty string")
+        version = record.get("version")
+        if not _is_int(version) or version < 1:
+            raise ValueError("manifest record.version must be a positive integer")
+        content_hash = record.get("content_sha256")
+        if not _is_hash(content_hash):
+            raise ValueError(
+                "manifest record.content_sha256 must be 64 lowercase hexadecimal characters"
+            )
+        row_count = record.get("row_count")
+        if not _is_int(row_count) or row_count < 0:
+            raise ValueError("manifest record.row_count must be a non-negative integer")
+        schema = record.get("schema")
+        if not isinstance(schema, dict) or not schema:
+            raise ValueError("manifest record.schema must be a non-empty object")
+        for name, kind in schema.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("manifest record.schema field names must be non-empty strings")
+            if not isinstance(kind, str) or kind not in _TYPE_NAMES:
+                raise ValueError(
+                    f"manifest record.schema declares an invalid type for field {name!r}"
+                )
+        return record
+
+    @staticmethod
+    def _verified_lineage_entry(entry: Any) -> dict[str, Any] | None:
+        """Validate the linkage fields of one lineage chain entry."""
+        if not isinstance(entry, dict):
+            return None
+        dataset = entry.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            return None
+        version = entry.get("version")
+        if not _is_int(version) or version < 1:
+            return None
+        source_version = entry.get("sourceVersion")
+        if not _is_int(source_version) or source_version < 1:
+            return None
+        if not _is_hash(entry.get("sourceSha256")) or not _is_hash(entry.get("contentSha256")):
+            return None
+        row_count = entry.get("rowCount")
+        if not _is_int(row_count) or row_count < 0:
+            return None
+        return entry
+
+    def _lineage_issues(
+        self, chain: Any, record: dict[str, Any], issues: list[dict[str, str]]
+    ) -> None:
+        if not isinstance(chain, list):
+            issues.append({"code": "lineage", "message": "lineage must be an array"})
+            return
+        entries: list[dict[str, Any] | None] = []
+        for index, raw_entry in enumerate(chain):
+            entry = self._verified_lineage_entry(raw_entry)
+            if entry is None:
+                issues.append(
+                    {
+                        "code": "lineage",
+                        "message": f"lineage entry {index + 1} is missing required fields "
+                        "or uses invalid field types",
+                    }
+                )
+            entries.append(entry)
+
+        for index, entry in enumerate(entries):
+            if entry is None:
+                continue
+            if entry["dataset"] != record["dataset"]:
+                issues.append(
+                    {
+                        "code": "lineage",
+                        "message": f"lineage entry {index + 1} belongs to dataset "
+                        f"{entry['dataset']!r}, expected {record['dataset']!r}",
+                    }
+                )
+            if entry["sourceVersion"] >= entry["version"]:
+                issues.append(
+                    {
+                        "code": "lineage",
+                        "message": f"lineage entry {index + 1} has source version "
+                        f"{entry['sourceVersion']} that is not below version {entry['version']}",
+                    }
+                )
+
+        for index in range(1, len(entries)):
+            previous, current = entries[index - 1], entries[index]
+            if previous is None or current is None:
+                continue
+            if current["sourceVersion"] != previous["version"]:
+                issues.append(
+                    {
+                        "code": "lineage",
+                        "message": f"lineage entry {index + 1} continues version "
+                        f"{current['sourceVersion']} but the previous entry is version "
+                        f"{previous['version']}",
+                    }
+                )
+            elif current["sourceSha256"] != previous["contentSha256"]:
+                issues.append(
+                    {
+                        "code": "lineage",
+                        "message": f"lineage entry {index + 1} source hash does not match "
+                        "the content hash of the previous entry",
+                    }
+                )
+
+        if entries:
+            last = entries[-1]
+            if last is not None:
+                if last["version"] != record["version"]:
+                    issues.append(
+                        {
+                            "code": "lineage",
+                            "message": f"last lineage entry is version {last['version']} but "
+                            f"the record is version {record['version']}",
+                        }
+                    )
+                if last["contentSha256"] != record["content_sha256"]:
+                    issues.append(
+                        {
+                            "code": "lineage",
+                            "message": "last lineage entry content hash does not match the "
+                            "record hash",
+                        }
+                    )
+                if last["rowCount"] != record["row_count"]:
+                    issues.append(
+                        {
+                            "code": "lineage",
+                            "message": f"last lineage entry reports {last['rowCount']} records "
+                            f"but the record reports {record['row_count']}",
+                        }
+                    )
+
+    def verify_export(self, directory: str | Path) -> dict[str, Any]:
+        """Verify an exported directory offline against its manifest.
+
+        Only ``manifest.json`` and the CSV it names inside *directory* are
+        read; no workspace state is consulted and nothing is written.
+        Manifest or parameter problems raise ValueError, read failures
+        OSError. Data discrepancies are returned as issue objects grouped
+        by code: missing, hash, csv, rows, schema, lineage.
+        """
+        manifest_path = Path(directory) / "manifest.json"
+        try:
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"manifest is not valid UTF-8: {error}") from error
+        try:
+            manifest = json.loads(manifest_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"manifest is not valid JSON: {error}") from error
+
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must be a JSON object")
+        schema_version = manifest.get("schemaVersion")
+        if not _is_int(schema_version) or schema_version != 1:
+            raise ValueError("manifest schemaVersion must be the integer 1")
+        if "record" not in manifest:
+            raise ValueError("manifest is missing required field: record")
+        if "file" not in manifest:
+            raise ValueError("manifest is missing required field: file")
+        record = self._verified_manifest_record(manifest["record"])
+        file_name = manifest["file"]
+        if (
+            not isinstance(file_name, str)
+            or not file_name
+            or file_name in (".", "..")
+            or "/" in file_name
+            or "\\" in file_name
+            or "\0" in file_name
+        ):
+            raise ValueError(
+                "manifest file must be a non-empty file name without path separators"
+            )
+
+        # Resolve purely lexically (no target content is read) and refuse
+        # anything that escapes the export directory, including via links.
+        base = Path(directory).resolve()
+        try:
+            resolved = (base / file_name).resolve(strict=False)
+        except (OSError, RuntimeError):
+            # Python 3.12 reports a symlink loop as RuntimeError. The
+            # underlying message embeds a machine path and is intentionally
+            # not surfaced.
+            raise ValueError(
+                f"manifest file {file_name!r} could not be safely resolved "
+                "(broken or looping reference)"
+            )
+        if resolved != base and base not in resolved.parents:
+            raise ValueError(
+                f"manifest file {file_name!r} resolves outside the export directory"
+            )
+
+        issues: list[dict[str, str]] = []
+        lineage = manifest.get("lineage")
+        if lineage is not None:
+            # Missing or null lineage means no chain was shipped; an empty
+            # array is likewise a chain-free (legacy) export.
+            self._lineage_issues(lineage, record, issues)
+
+        if not resolved.exists():
+            issues.append(
+                {
+                    "code": "missing",
+                    "message": f"data file {file_name!r} listed in the manifest is missing",
+                }
+            )
+        else:
+            data = resolved.read_bytes()
+            content_hash = hashlib.sha256(data).hexdigest()
+            if content_hash != record["content_sha256"]:
+                issues.append(
+                    {
+                        "code": "hash",
+                        "message": "CSV content hash does not match the manifest record",
+                    }
+                )
+
+            header: list[str] | None = None
+            rows: list[list[str]] = []
+            header_ok = False
+            records_ok = False
+            can_parse = True
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                issues.append(
+                    {"code": "csv", "message": f"CSV is not valid UTF-8: {error.reason}"}
+                )
+                text = ""
+                can_parse = False
+            if can_parse and _ends_inside_quote(text):
+                issues.append(
+                    {"code": "csv", "message": "CSV has a quoted field that is never closed"}
+                )
+                can_parse = False
+            if can_parse:
+                parse_failed = False
+                try:
+                    # Non-strict parsing matches import semantics: only the
+                    # explicitly enumerated structural problems are failures.
+                    parsed = [
+                        row
+                        for row in csv.reader(io.StringIO(text, newline=""))
+                        if row != []
+                    ]
+                except csv.Error as error:
+                    issues.append(
+                        {"code": "csv", "message": f"CSV structure is invalid: {error}"}
+                    )
+                    parsed = []
+                    parse_failed = True
+                if not parsed and not parse_failed:
+                    issues.append({"code": "csv", "message": "CSV has no header row"})
+                elif parsed:
+                    header = parsed[0]
+                    rows = parsed[1:]
+                    empty_positions = [
+                        position + 1 for position, name in enumerate(header) if name == ""
+                    ]
+                    if empty_positions:
+                        issues.append(
+                            {
+                                "code": "csv",
+                                "message": "CSV header has empty field name(s) at "
+                                f"position(s) {empty_positions}",
+                            }
+                        )
+                    seen: set[str] = set()
+                    duplicates: list[str] = []
+                    for name in header:
+                        if name in seen and name not in duplicates:
+                            duplicates.append(name)
+                        seen.add(name)
+                    if duplicates:
+                        issues.append(
+                            {
+                                "code": "csv",
+                                "message": "CSV header has duplicate field name(s): "
+                                + ", ".join(repr(name) for name in duplicates),
+                            }
+                        )
+                    header_ok = not empty_positions and not duplicates
+                    ragged = [
+                        row_number
+                        for row_number, row in enumerate(rows, start=1)
+                        if len(row) != len(header)
+                    ]
+                    if ragged:
+                        issues.append(
+                            {
+                                "code": "csv",
+                                "message": f"CSV record(s) {ragged} do not have the same "
+                                f"number of fields as the header ({len(header)})",
+                            }
+                        )
+                    records_ok = header_ok and not ragged
+
+            if header is not None:
+                # Record numbering ignores blank physical lines and quoted
+                # newlines already, so the count stays determinable even when
+                # individual records are ragged.
+                if len(rows) != record["row_count"]:
+                    issues.append(
+                        {
+                            "code": "rows",
+                            "message": f"CSV contains {len(rows)} data record(s) but the "
+                            f"manifest record lists {record['row_count']}",
+                        }
+                    )
+
+            if header_ok:
+                # The field set is fixed by the header and stays checkable
+                # even when some data records are ragged.
+                assert header is not None
+                expected_schema = record["schema"]
+                actual_fields = set(header)
+                missing_fields = sorted(name for name in expected_schema if name not in actual_fields)
+                extra_fields = sorted(name for name in actual_fields if name not in expected_schema)
+                if missing_fields or extra_fields:
+                    details = []
+                    if missing_fields:
+                        details.append("missing from CSV: " + ", ".join(missing_fields))
+                    if extra_fields:
+                        details.append("unexpected in CSV: " + ", ".join(extra_fields))
+                    issues.append(
+                        {
+                            "code": "schema",
+                            "message": "CSV field set does not match the manifest record ("
+                            + "; ".join(details)
+                            + ")",
+                        }
+                    )
+                if records_ok:
+                    # Type inference needs consistent column counts so each
+                    # value can be aligned with its header position.
+                    observed = {name: set() for name in header}
+                    for row in rows:
+                        for position, name in enumerate(header):
+                            observed[name].add(_kind(row[position]))
+                    inferred = {
+                        name: _merge_kinds(kinds) for name, kinds in observed.items()
+                    }
+                    for name in sorted(expected_schema):
+                        if name in inferred and inferred[name] != expected_schema[name]:
+                            issues.append(
+                                {
+                                    "code": "schema",
+                                    "message": f"field {name!r} infers as {inferred[name]!r} "
+                                    f"but the manifest record declares "
+                                    f"{expected_schema[name]!r}",
+                                }
+                            )
+
+        category_order = {
+            "missing": 0,
+            "hash": 1,
+            "csv": 2,
+            "rows": 3,
+            "schema": 4,
+            "lineage": 5,
+        }
+        issues.sort(key=lambda issue: category_order[issue["code"]])
+        return {
+            "dataset": record["dataset"],
+            "version": record["version"],
+            "passed": not issues,
+            "issues": issues,
+        }
 
     @staticmethod
     def _validate_rules_payload(rules: Any) -> list[dict[str, Any]]:

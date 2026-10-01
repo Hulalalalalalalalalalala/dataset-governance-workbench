@@ -964,5 +964,473 @@ class CliTest(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stderr)), {"error"})
 
 
+class VerifyExportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+        # A catalog rooted at a workspace that never exists; verification must
+        # never consult workspace state.
+        self.offline = Catalog(self.root / "never-created-workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def write_csv(self, name: str, contents) -> Path:
+        path = self.root / name
+        if isinstance(contents, str):
+            path.write_text(contents, encoding="utf-8")
+        else:
+            path.write_bytes(contents)
+        return path
+
+    def export_dir(self, dataset="events", version=1, destination="export"):
+        return self.root / destination
+
+    def load_manifest(self, directory: Path):
+        return json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+
+    def save_manifest(self, directory: Path, manifest):
+        (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def export_simple(self, csv_contents="id,active,score\n1,true,2.5\n2,false,3\n"):
+        self.catalog.import_csv("events", self.write_csv("events.csv", csv_contents))
+        directory = self.root / "export"
+        self.catalog.export("events", 1, directory)
+        return directory
+
+    def rewrite_data(self, directory: Path, contents, fix_hash=False, file_name=None):
+        manifest = self.load_manifest(directory)
+        data_name = file_name or manifest["file"]
+        path = directory / data_name
+        if isinstance(contents, str):
+            path.write_text(contents, encoding="utf-8")
+        else:
+            path.write_bytes(contents)
+        if fix_hash:
+            import hashlib
+
+            manifest["record"]["content_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.save_manifest(directory, manifest)
+        return manifest
+
+    # ---- passing reports -------------------------------------------------
+
+    def test_plain_export_verifies_offline(self):
+        directory = self.export_simple()
+        report = self.offline.verify_export(directory)
+        self.assertEqual(
+            report, {"dataset": "events", "version": 1, "passed": True, "issues": []}
+        )
+
+    def test_header_only_is_zero_records(self):
+        self.catalog.import_csv("events", self.write_csv("h.csv", "id,name\n"))
+        directory = self.root / "export"
+        self.catalog.export("events", 1, directory)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(report["passed"], report["issues"])
+
+    def test_blank_physical_lines_and_quoted_newlines_do_not_add_records(self):
+        contents = 'id,name\n\n1,"line one\nline two"\n\n2,Bob\n'
+        directory = self.export_simple(contents)
+        manifest = self.load_manifest(directory)
+        self.assertEqual(manifest["record"]["row_count"], 2)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(report["passed"], report["issues"])
+
+    def test_cleaned_export_with_lineage_verifies(self):
+        self.catalog.import_csv("p", self.write_csv("p.csv", "id,name\n1, Ada \n"))
+        self.catalog.clean("p", 1, [{"type": "trim", "column": "name"}])
+        directory = self.root / "cleaned"
+        self.catalog.export("p", 2, directory)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(report["passed"], report["issues"])
+
+    def test_unknown_extra_manifest_fields_ignored(self):
+        directory = self.export_simple()
+        manifest = self.load_manifest(directory)
+        manifest["extra"] = {"nested": [1, 2]}
+        manifest["record"]["unexpected"] = 42
+        self.save_manifest(directory, manifest)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(report["passed"], report["issues"])
+
+    # ---- issue categories -------------------------------------------------
+
+    def test_missing_data_file(self):
+        directory = self.export_simple()
+        (directory / "events-v1.csv").unlink()
+        report = self.offline.verify_export(directory)
+        self.assertFalse(report["passed"])
+        self.assertEqual([i["code"] for i in report["issues"]], ["missing"])
+        self.assertEqual(set(report["issues"][0]), {"code", "message"})
+
+    def test_hash_mismatch(self):
+        directory = self.export_simple()
+        self.rewrite_data(directory, "id,active,score\n1,true,2.5\n2,false,9\n")
+        report = self.offline.verify_export(directory)
+        self.assertEqual([i["code"] for i in report["issues"]], ["hash"])
+
+    def test_structure_problems(self):
+        def expect(contents, fix_hash=True, raw=False):
+            directory = self.export_simple()
+            self.rewrite_data(directory, contents, fix_hash=fix_hash)
+            codes = [i["code"] for i in self.offline.verify_export(directory)["issues"]]
+            self.assertIn("csv", codes, contents)
+
+        expect("id,id\n1,2\n")  # duplicate headers
+        expect("id,\n1,2\n")  # empty header field
+        expect("id,a\n1,2,3\n")  # ragged record
+        expect('id,a\n1,"unclosed\n')  # unclosed quote
+        expect(b"id,a\n1,\xff\n", raw=True)  # invalid UTF-8
+
+    def test_no_header_row_is_structure_error(self):
+        directory = self.export_simple()
+        self.rewrite_data(directory, "", fix_hash=True)
+        report = self.offline.verify_export(directory)
+        self.assertEqual([i["code"] for i in report["issues"]], ["csv"])
+
+    def test_row_count_mismatch(self):
+        directory = self.export_simple()
+        manifest = self.rewrite_data(
+            directory, "id,active,score\n1,true,2.5\n", fix_hash=True
+        )
+        # manifest still says 2 rows, file now has 1
+        self.assertEqual(manifest["record"]["row_count"], 2)
+        report = self.offline.verify_export(directory)
+        self.assertEqual([i["code"] for i in report["issues"]], ["rows"])
+
+    def test_schema_field_and_type_mismatch(self):
+        directory = self.export_simple()
+        # renamed field
+        self.rewrite_data(directory, "id,active,rating\n1,true,2.5\n2,false,3\n", fix_hash=True)
+        report = self.offline.verify_export(directory)
+        self.assertEqual([i["code"] for i in report["issues"]], ["schema"])
+        self.assertIn("rating", report["issues"][0]["message"])
+
+        # type change: score widens from number to text, same hash recorded
+        directory2 = self.root / "typed2"
+        self.catalog.import_csv("s", self.write_csv("s.csv", "id,score\n1,2.5\n2,3\n"))
+        self.catalog.export("s", 1, directory2)
+        self.rewrite_data(directory2, "id,score\n1,2.5\n2,abc\n", fix_hash=True)
+        report = self.offline.verify_export(directory2)
+        self.assertEqual([i["code"] for i in report["issues"]], ["schema"])
+        self.assertIn("'number'", report["issues"][0]["message"])
+
+    def test_type_inference_matches_import_semantics(self):
+        # integer column widening to text yields string mismatch
+        directory = self.root / "typed"
+        self.catalog.import_csv("t", self.write_csv("t.csv", "v\n1\n2\n"))
+        self.catalog.export("t", 1, directory)
+        self.rewrite_data(directory, "v\n1\nabc\n", fix_hash=True)
+        report = self.offline.verify_export(directory)
+        self.assertEqual([i["code"] for i in report["issues"]], ["schema"])
+        self.assertIn("infers as 'string'", report["issues"][0]["message"])
+
+    def test_importer_tolerated_quoting_is_not_a_structure_error(self):
+        # Non-strict reader accepts text immediately after a closing quote,
+        # exactly as import does; verification must not reject it.
+        directory = self.root / "quoted"
+        self.catalog.import_csv("q", self.write_csv("q.csv", "id,n\n1,\"x\"y\n"))
+        self.catalog.export("q", 1, directory)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(report["passed"], report["issues"])
+
+    # ---- lineage ----------------------------------------------------------
+
+    def test_missing_or_empty_lineage_is_accepted(self):
+        directory = self.export_simple()
+        for lineage in (None, []):
+            manifest = self.load_manifest(directory)
+            if lineage is None:
+                manifest.pop("lineage", None)
+            else:
+                manifest["lineage"] = lineage
+            self.save_manifest(directory, manifest)
+            self.assertTrue(self.offline.verify_export(directory)["passed"])
+
+    def test_lineage_chain_mismatches_reported(self):
+        directory = self.export_simple()
+        manifest = self.load_manifest(directory)
+        record_hash = manifest["record"]["content_sha256"]
+        # A valid-shaped single entry whose links contradict the v1 record.
+        manifest["lineage"] = [
+            {
+                "dataset": "events",
+                "version": 2,
+                "sourceVersion": 1,
+                "sourceSha256": "a" * 64,
+                "contentSha256": record_hash,
+                "rowCount": 99,
+            }
+        ]
+        self.save_manifest(directory, manifest)
+        report = self.offline.verify_export(directory)
+        codes = [i["code"] for i in report["issues"]]
+        self.assertTrue(codes and all(code == "lineage" for code in codes))
+
+    def test_lineage_same_dataset_and_descending_versions_required(self):
+        directory = self.export_simple()
+        manifest = self.load_manifest(directory)
+        manifest["lineage"] = [
+            {
+                "dataset": "other",
+                "version": 1,
+                "sourceVersion": 1,  # not below version
+                "sourceSha256": "a" * 64,
+                "contentSha256": "b" * 64,
+                "rowCount": 2,
+            }
+        ]
+        self.save_manifest(directory, manifest)
+        issues = self.offline.verify_export(directory)["issues"]
+        self.assertTrue(all(i["code"] == "lineage" for i in issues))
+        self.assertGreaterEqual(len(issues), 2)
+
+    def test_lineage_adjacent_entries_must_link(self):
+        directory = self.export_simple()
+        manifest = self.load_manifest(directory)
+        record_hash = manifest["record"]["content_sha256"]
+        manifest["lineage"] = [
+            {
+                "dataset": "events",
+                "version": 2,
+                "sourceVersion": 1,
+                "sourceSha256": "a" * 64,
+                "contentSha256": "c" * 64,
+                "rowCount": 2,
+            },
+            {
+                "dataset": "events",
+                "version": 3,
+                "sourceVersion": 2,
+                "sourceSha256": "d" * 64,  # does not equal prior contentSha256
+                "contentSha256": record_hash,
+                "rowCount": 2,
+            },
+        ]
+        self.save_manifest(directory, manifest)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(any("hash" in i["message"] for i in report["issues"]))
+        self.assertTrue(all(i["code"] == "lineage" for i in report["issues"]))
+
+    def test_malformed_lineage_entry_reported(self):
+        directory = self.export_simple()
+        manifest = self.load_manifest(directory)
+        manifest["lineage"] = [{"dataset": "events"}, "not-an-object"]
+        self.save_manifest(directory, manifest)
+        report = self.offline.verify_export(directory)
+        self.assertTrue(all(i["code"] == "lineage" for i in report["issues"]))
+        self.assertEqual(len(report["issues"]), 2)
+
+    # ---- ordering ----------------------------------------------------------
+
+    def test_issues_ordered_missing_hash_csv_rows_schema_lineage(self):
+        directory = self.export_simple()
+        (directory / "events-v1.csv").unlink()  # missing
+        manifest = self.load_manifest(directory)
+        manifest["lineage"] = [{"dataset": "events"}]  # lineage problem
+        self.save_manifest(directory, manifest)
+        codes = [i["code"] for i in self.offline.verify_export(directory)["issues"]]
+        self.assertEqual(codes, ["missing", "lineage"])
+
+        directory2 = self.root / "multi"
+        self.catalog.import_csv("m", self.write_csv("m.csv", "a,b\n1,2\n3,4\n"))
+        self.catalog.export("m", 1, directory2)
+        # tamper bytes (hash), make ragged (csv), claim wrong row count (rows),
+        # and the field/type checks follow
+        (directory2 / "m-v1.csv").write_text("a,b,c\n1,2\nbad\n", encoding="utf-8")
+        manifest2 = self.load_manifest(directory2)
+        manifest2["record"]["row_count"] = 99
+        self.save_manifest(directory2, manifest2)
+        codes = [i["code"] for i in self.offline.verify_export(directory2)["issues"]]
+        self.assertEqual(codes[0], "hash")
+        self.assertEqual(codes, ["hash", "csv", "rows", "schema"])
+
+    # ---- manifest and parameter errors ------------------------------------
+
+    def test_manifest_errors_raise_value_error(self):
+        directory = self.export_simple()
+
+        def reject(rewrite):
+            rewrite(directory)
+            with self.assertRaises(ValueError):
+                self.offline.verify_export(directory)
+            # restore a valid manifest between cases
+            self.catalog.export("events", 1, directory)
+
+        reject(lambda d: (d / "manifest.json").write_text("{not json", encoding="utf-8"))
+        reject(lambda d: (d / "manifest.json").write_text("[]", encoding="utf-8"))
+        reject(
+            lambda d: self.save_manifest(
+                d, {"schemaVersion": 2, "record": {}, "file": "x"}
+            )
+        )
+        reject(
+            lambda d: self.save_manifest(
+                d, {"schemaVersion": 1.0, "record": {}, "file": "x"}
+            )
+        )
+        reject(
+            lambda d: self.save_manifest(
+                d, {"schemaVersion": True, "record": {}, "file": "x"}
+            )
+        )
+        reject(lambda d: self.save_manifest(d, {"schemaVersion": 1, "file": "x"}))
+        reject(lambda d: self.save_manifest(d, {"schemaVersion": 1, "record": {}}))
+
+        def record_mutation(mutate):
+            def do(d):
+                manifest = self.load_manifest(d)
+                mutate(manifest["record"])
+                self.save_manifest(d, manifest)
+            return do
+
+        reject(record_mutation(lambda r: r.update(version=0)))
+        reject(record_mutation(lambda r: r.update(version=True)))
+        reject(record_mutation(lambda r: r.update(version=1.5)))
+        reject(record_mutation(lambda r: r.update(row_count=-1)))
+        reject(record_mutation(lambda r: r.update(row_count=True)))
+        reject(record_mutation(lambda r: r.update(content_sha256="A" * 64)))
+        reject(record_mutation(lambda r: r.update(content_sha256="abc")))
+        reject(record_mutation(lambda r: r.update(dataset="")))
+        reject(record_mutation(lambda r: r.update(schema={})))
+        reject(record_mutation(lambda r: r.__setitem__("schema", {"id": "datetime"})))
+
+        def file_name(value):
+            def do(d):
+                manifest = self.load_manifest(d)
+                manifest["file"] = value
+                self.save_manifest(d, manifest)
+            return do
+
+        reject(file_name(""))
+        reject(file_name("."))
+        reject(file_name(".."))
+        reject(file_name("a/b.csv"))
+        reject(file_name("a\\b.csv"))
+        reject(file_name(3))
+
+        # invalid UTF-8 manifest
+        def bad_utf8(d):
+            (d / "manifest.json").write_bytes(b'{"schemaVersion": 1, "x": \xff}')
+        reject(bad_utf8)
+        # the restored manifest is still usable
+        self.assertTrue(self.offline.verify_export(directory)["passed"])
+
+    def test_missing_manifest_raises_os_error(self):
+        directory = self.export_simple()
+        (directory / "manifest.json").unlink()
+        with self.assertRaises(OSError):
+            self.offline.verify_export(directory)
+
+    def test_missing_export_directory_raises_os_error(self):
+        with self.assertRaises(OSError):
+            self.offline.verify_export(self.root / "no-such-directory")
+
+    def test_path_traversal_rejected_before_reading_target(self):
+        directory = self.export_simple()
+        outside = self.root / "outside.csv"
+        outside.write_bytes((directory / "events-v1.csv").read_bytes())
+        for name in ("../outside.csv", "sub/../x", "..\\outside.csv"):
+            manifest = self.load_manifest(directory)
+            manifest["file"] = name
+            self.save_manifest(directory, manifest)
+            with self.assertRaises(ValueError):
+                self.offline.verify_export(directory)
+
+    def test_symlink_outside_directory_rejected(self):
+        directory = self.export_simple()
+        outside = self.root / "outside.csv"
+        outside.write_bytes(b"id,active,score\n1,true,2.5\n2,false,3\n")
+        data = directory / "events-v1.csv"
+        data.unlink()
+        data.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            self.offline.verify_export(directory)
+
+    def test_verification_writes_nothing_and_is_repeatable(self):
+        directory = self.export_simple()
+        snapshot = {
+            path.name: path.read_bytes() for path in directory.iterdir()
+        }
+        first = self.offline.verify_export(directory)
+        second = self.offline.verify_export(directory)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            snapshot, {path.name: path.read_bytes() for path in directory.iterdir()}
+        )
+
+    def test_report_has_no_machine_paths(self):
+        directory = self.export_simple()
+        (directory / "events-v1.csv").unlink()
+        report = self.offline.verify_export(directory)
+        rendered = json.dumps(report)
+        self.assertNotIn(str(self.root), rendered)
+        self.assertNotIn(str(directory), rendered)
+
+
+class CliVerifyExportTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "ws"
+        self.catalog = Catalog(self.workspace)
+        source = self.root / "events.csv"
+        source.write_text("id,active,score\n1,true,2.5\n2,false,3\n", encoding="utf-8")
+        self.catalog.import_csv("events", source)
+        self.directory = self.root / "export"
+        self.catalog.export("events", 1, self.directory)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "governance_workbench",
+                "--workspace",
+                str(self.workspace),
+                *arguments,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_passing_verify_exit_0(self):
+        result = self.run_cli("verify-export", str(self.directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(report["dataset"], "events")
+        self.assertEqual(report["version"], 1)
+
+    def test_failing_verify_exit_1_with_report_on_stdout(self):
+        (self.directory / "events-v1.csv").unlink()
+        result = self.run_cli("verify-export", str(self.directory))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        report = json.loads(result.stdout)
+        self.assertFalse(report["passed"])
+        self.assertEqual([i["code"] for i in report["issues"]], ["missing"])
+
+    def test_manifest_error_exit_2_stderr_envelope(self):
+        (self.directory / "manifest.json").write_text("{bad json", encoding="utf-8")
+        result = self.run_cli("verify-export", str(self.directory))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+    def test_missing_export_dir_exit_2(self):
+        result = self.run_cli("verify-export", str(self.root / "gone"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+
 if __name__ == "__main__":
     unittest.main()

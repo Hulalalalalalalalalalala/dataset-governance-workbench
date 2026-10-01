@@ -156,10 +156,37 @@ class Catalog:
             raise KeyError(f"unknown dataset version: {dataset}@{version}")
         return versions[version - 1]
 
-    def compare(self, dataset: str, left: int, right: int) -> dict[str, Any]:
-        before, after = self.get(dataset, left), self.get(dataset, right)
+    @staticmethod
+    def _validate_keys(keys: Any) -> list[str]:
+        if not isinstance(keys, list) or not keys:
+            raise ValueError("keys must be a non-empty list of column names")
+        normalized: list[str] = []
+        for index, key in enumerate(keys):
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"keys[{index}] must be a non-empty string")
+            normalized.append(key)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("keys must not contain duplicate column names")
+        return normalized
+
+    def compare(
+        self,
+        dataset: str,
+        left: int,
+        right: int,
+        keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if keys is not None:
+            # Keyed comparison re-verifies both stored blobs against their
+            # version records and parses both CSVs before reporting anything;
+            # any failure rejects the whole comparison with no partial diff.
+            state = self._load()
+            before = self._version_record(state, dataset, left)
+            after = self._version_record(state, dataset, right)
+        else:
+            before, after = self.get(dataset, left), self.get(dataset, right)
         before_schema, after_schema = before["schema"], after["schema"]
-        return {
+        result = {
             "dataset": dataset,
             "left": left,
             "right": right,
@@ -172,6 +199,117 @@ class Catalog:
             },
             "contentChanged": before["content_sha256"] != after["content_sha256"],
             "rowDelta": after["row_count"] - before["row_count"],
+        }
+        if keys is not None:
+            result["rowDiff"] = self._row_diff(dataset, left, right, before, after, keys)
+        return result
+
+    def _row_diff(
+        self,
+        dataset: str,
+        left: int,
+        right: int,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        keys: list[str],
+    ) -> dict[str, Any]:
+        key_columns = self._validate_keys(keys)
+        sides = (
+            ("left", left, before),
+            ("right", right, after),
+        )
+        parsed: dict[str, tuple[list[str], list[list[str]]]] = {}
+        for side_name, version, record in sides:
+            blob_path = self.workspace / record["blob"]
+            if not blob_path.exists():
+                raise ValueError(f"stored data missing for {dataset}@{version}")
+            content_hash = _sha256(blob_path)
+            if content_hash != record["content_sha256"]:
+                raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+            header, rows = self._read_stored_csv(blob_path, dataset, version)
+            for key in key_columns:
+                if key not in header:
+                    raise ValueError(f"key column {key!r} missing for {dataset}@{version}")
+            parsed[side_name] = (header, rows)
+
+        def index_rows(
+            side_name: str, header: list[str], rows: list[list[str]]
+        ) -> dict[tuple[str, ...], tuple[int, list[str]]]:
+            positions = [header.index(name) for name in key_columns]
+            indexed: dict[tuple[str, ...], tuple[int, list[str]]] = {}
+            for number, row in enumerate(rows, start=1):
+                key_values = tuple(row[position] for position in positions)
+                if any(value == "" for value in key_values):
+                    raise ValueError(
+                        f"empty key value in {side_name} record {number} "
+                        f"for {dataset}@{left if side_name == 'left' else right}"
+                    )
+                if key_values in indexed:
+                    raise ValueError(
+                        f"duplicate key in {side_name} record {number} "
+                        f"for {dataset}@{left if side_name == 'left' else right}"
+                    )
+                indexed[key_values] = (number, row)
+            return indexed
+
+        left_header, left_rows = parsed["left"]
+        right_header, right_rows = parsed["right"]
+        left_index = index_rows("left", left_header, left_rows)
+        right_index = index_rows("right", right_header, right_rows)
+
+        all_columns = sorted(set(left_header) | set(right_header))
+        added: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        modified: list[dict[str, Any]] = []
+        unchanged_count = 0
+
+        for key_values, (right_number, right_row) in right_index.items():
+            if key_values not in left_index:
+                added.append(
+                    {
+                        "key": list(key_values),
+                        "row": right_number,
+                        "values": dict(sorted(zip(right_header, right_row))),
+                    }
+                )
+                continue
+            left_number, left_row = left_index[key_values]
+            changes: dict[str, dict[str, str | None]] = {}
+            for name in all_columns:
+                left_value = left_row[left_header.index(name)] if name in left_header else None
+                right_value = right_row[right_header.index(name)] if name in right_header else None
+                if left_value != right_value:
+                    changes[name] = {"from": left_value, "to": right_value}
+            if changes:
+                modified.append(
+                    {
+                        "key": list(key_values),
+                        "leftRow": left_number,
+                        "rightRow": right_number,
+                        "changes": changes,
+                    }
+                )
+            else:
+                unchanged_count += 1
+
+        for key_values, (left_number, left_row) in left_index.items():
+            if key_values not in right_index:
+                removed.append(
+                    {
+                        "key": list(key_values),
+                        "row": left_number,
+                        "values": dict(sorted(zip(left_header, left_row))),
+                    }
+                )
+
+        added.sort(key=lambda item: item["row"])
+        removed.sort(key=lambda item: item["row"])
+        modified.sort(key=lambda item: item["rightRow"])
+        return {
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+            "unchangedCount": unchanged_count,
         }
 
     def export(self, dataset: str, version: int, destination: str | Path) -> dict[str, Any]:
@@ -443,7 +581,12 @@ class Catalog:
     def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
         with blob_path.open("r", encoding="utf-8", newline="") as handle:
             # Blank physical lines are not data records, matching DictReader.
-            parsed = [row for row in csv.reader(handle) if row != []]
+            try:
+                parsed = [row for row in csv.reader(handle) if row != []]
+            except csv.Error as error:
+                raise ValueError(
+                    f"stored CSV for {dataset}@{version} is unparseable: {error}"
+                ) from error
         if not parsed:
             raise ValueError(f"stored CSV for {dataset}@{version} has no header")
         header = parsed[0]

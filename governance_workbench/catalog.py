@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import shutil
 import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -452,23 +451,170 @@ class Catalog:
             result["rowDiff"] = self._row_diff(dataset, left, right, key_columns, state)
         return result
 
+    @staticmethod
+    def _write_export_temp(directory: Path, content: bytes) -> Path:
+        """Land one export file through a unique temporary file.
+
+        The temporary file lives in the destination directory so the final
+        name is always given via an atomic replace; a write or flush failure
+        removes the temporary file and leaves no name behind.
+        """
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".export.", suffix=".tmp", dir=directory
+        )
+        temporary = Path(temporary_name)
+        try:
+            # Match the ordinary create-mode (0666 masked by the umask) that a
+            # plain file copy would use; mkstemp defaults to 0600.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.fchmod(descriptor, 0o666 & ~umask)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with suppress(OSError):
+                temporary.unlink()
+            raise
+        return temporary
+
+    @staticmethod
+    def _commit_export_files(
+        directory: Path, file_name: str, data: bytes, manifest_bytes: bytes
+    ) -> None:
+        """Atomically publish the CSV and manifest for one export.
+
+        Both files are written to temporary names first and only renamed into
+        place afterwards. If anything fails, every pre-existing file is
+        restored to its exact prior state and every temporary or newly
+        created file is removed: a new CSV can never be left without its
+        manifest, or vice versa.
+        """
+        data_target = directory / file_name
+        manifest_target = directory / "manifest.json"
+
+        # Recover a destination left mid-commit by a hard crash: a leftover
+        # backup restores the previous file when the target is missing, and is
+        # simply cleared when the target is already in place.
+        for target in (data_target, manifest_target):
+            backup = target.with_name(f".{target.name}.bak")
+            if backup.exists() or backup.is_symlink():
+                if target.exists() or target.is_symlink():
+                    with suppress(OSError):
+                        backup.unlink()
+                else:
+                    os.replace(backup, target)
+
+        data_tmp: Path | None = None
+        manifest_tmp: Path | None = None
+        backups: list[tuple[Path, Path | None, bool]] = []
+        try:
+            data_tmp = Catalog._write_export_temp(directory, data)
+            manifest_tmp = Catalog._write_export_temp(directory, manifest_bytes)
+            for target in (data_target, manifest_target):
+                existed = target.exists() or target.is_symlink()
+                backup_path: Path | None = None
+                if existed:
+                    backup_path = target.with_name(f".{target.name}.bak")
+                    with suppress(OSError):
+                        backup_path.unlink()
+                    os.replace(target, backup_path)
+                backups.append((target, backup_path, existed))
+            os.replace(data_tmp, data_target)
+            os.replace(manifest_tmp, manifest_target)
+        except BaseException:
+            # Roll back every rename: restored targets come back from their
+            # backups, targets that did not exist before are removed, and all
+            # temporary files are discarded.
+            for target, backup_path, existed in backups:
+                if backup_path is not None:
+                    with suppress(OSError):
+                        os.replace(backup_path, target)
+                elif not existed:
+                    with suppress(OSError):
+                        target.unlink()
+            if data_tmp is not None:
+                with suppress(OSError):
+                    data_tmp.unlink()
+            if manifest_tmp is not None:
+                with suppress(OSError):
+                    manifest_tmp.unlink()
+            raise
+        for _, backup_path, _ in backups:
+            if backup_path is not None:
+                with suppress(OSError):
+                    backup_path.unlink()
+
     def export(self, dataset: str, version: int, destination: str | Path) -> dict[str, Any]:
-        record = self.get(dataset, version)
+        state = self._load()
+        record = self._version_record(state, dataset, version)
+
+        # Snapshot the stored bytes once: the hash check, structural parse,
+        # and the delivered file all derive from this same read, so a blob
+        # that changes during the export can never be shipped under a record
+        # that describes different content.
+        blob_path = self.workspace / record["blob"]
+        if not blob_path.exists():
+            raise ValueError(f"stored data missing for {dataset}@{version}")
+        content = blob_path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != record["content_sha256"]:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+
+        # The delivered CSV must be structurally valid under the import rules
+        # and agree with the record's row count, field set, and inferred
+        # types; the bytes themselves are never rewritten.
+        header, rows = _read_csv_records(content)
+        if len(rows) != record["row_count"]:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} contains {len(rows)} data "
+                f"record(s) but the version record lists {record['row_count']}"
+            )
+        expected_fields = set(record["schema"])
+        actual_fields = set(header)
+        if actual_fields != expected_fields:
+            missing_fields = sorted(expected_fields - actual_fields)
+            extra_fields = sorted(actual_fields - expected_fields)
+            details = []
+            if missing_fields:
+                details.append("missing from CSV: " + ", ".join(missing_fields))
+            if extra_fields:
+                details.append("unexpected in CSV: " + ", ".join(extra_fields))
+            raise ValueError(
+                f"stored CSV field set for {dataset}@{version} does not match "
+                "the version record (" + "; ".join(details) + ")"
+            )
+        observed = {name: set() for name in header}
+        for row in rows:
+            for position, name in enumerate(header):
+                observed[name].add(_kind(row[position]))
+        inferred = {name: _merge_kinds(kinds) for name, kinds in observed.items()}
+        for name in sorted(expected_fields):
+            if inferred.get(name) != record["schema"][name]:
+                raise ValueError(
+                    f"field {name!r} infers as {inferred.get(name)!r} in the stored "
+                    f"CSV but the version record declares {record['schema'][name]!r} "
+                    f"for {dataset}@{version}"
+                )
+
+        file_name = f"{dataset}-v{version}.csv"
+        manifest = {
+            "schemaVersion": 1,
+            "record": record,
+            "file": file_name,
+        }
+        lineage_records = state["lineage"].get(dataset, {})
+        if str(version) in lineage_records:
+            # Cleaned versions carry their full, source-first lineage chain;
+            # plain imported versions ship no lineage at all.
+            manifest["lineage"] = self.lineage(dataset, version)["chain"]
+        manifest_bytes = (
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+
         destination_path = Path(destination).resolve()
         destination_path.mkdir(parents=True, exist_ok=True)
-        source = self.workspace / record["blob"]
-        data_path = destination_path / f"{dataset}-v{version}.csv"
-        shutil.copyfile(source, data_path)
-        manifest = {"schemaVersion": 1, "record": record, "file": data_path.name}
-        lineage_records = self._load()["lineage"].get(dataset, {})
-        if str(version) in lineage_records:
-            # Cleaned versions carry their full lineage chain in the manifest.
-            manifest["lineage"] = self.lineage(dataset, version)["chain"]
-        manifest_path = destination_path / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        self._commit_export_files(destination_path, file_name, content, manifest_bytes)
         return manifest
 
     # ------------------------------------------------------------------

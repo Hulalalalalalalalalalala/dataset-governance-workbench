@@ -85,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, OSError) as error:
             return _fail(str(error))
     elif args.command == "export":
-        _print(catalog.export(args.dataset, args.version, args.destination))
+        try:
+            _print(catalog.export(args.dataset, args.version, args.destination))
+        except (ValueError, OSError) as error:
+            return _fail(str(error))
     elif args.command == "verify-export":
         try:
             report = catalog.verify_export(args.directory)

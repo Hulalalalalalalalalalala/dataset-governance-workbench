@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import shutil
 import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -453,23 +452,153 @@ class Catalog:
         return result
 
     def export(self, dataset: str, version: int, destination: str | Path) -> dict[str, Any]:
-        record = self.get(dataset, version)
-        destination_path = Path(destination).resolve()
-        destination_path.mkdir(parents=True, exist_ok=True)
-        source = self.workspace / record["blob"]
-        data_path = destination_path / f"{dataset}-v{version}.csv"
-        shutil.copyfile(source, data_path)
-        manifest = {"schemaVersion": 1, "record": record, "file": data_path.name}
-        lineage_records = self._load()["lineage"].get(dataset, {})
-        if str(version) in lineage_records:
+        """Deliver the CSV and manifest for a version into *destination*.
+
+        The stored blob is snapshotted once as raw bytes and checked against
+        the version record (existence, SHA-256, CSV structure per the import
+        rules, record count, field set, and inferred types) before anything
+        is written, so the delivered CSV always matches the selected version
+        even if the stored file changes mid-export. Both output files are
+        landed through temporary files with the previous contents backed up;
+        any failure restores the destination directory to its prior state
+        and leaves no new or temporary files behind. The workspace itself is
+        only read, never modified.
+        """
+        state = self._load()
+        record = self._version_record(state, dataset, version)
+        # A corrupt catalog record is reported as inconsistent source data,
+        # never as a KeyError/TypeError escaping the documented interface.
+        self._verified_manifest_record(record)
+        blob_name = record.get("blob")
+        if not isinstance(blob_name, str) or not blob_name:
+            raise ValueError(f"stored data record incomplete for {dataset}@{version}")
+
+        source = self.workspace / blob_name
+        if not source.exists():
+            raise ValueError(f"stored data missing for {dataset}@{version}")
+        # Snapshot the source once as raw bytes: the hash check, the
+        # structural parse, and the delivered CSV all derive from this same
+        # read, so a concurrent rewrite of the blob cannot produce a
+        # delivery that disagrees with the version record.
+        with source.open("rb") as handle:
+            content = handle.read()
+        if hashlib.sha256(content).hexdigest() != record["content_sha256"]:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        try:
+            header, rows = _read_csv_records(content)
+        except ValueError as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} is invalid: {error}"
+            ) from error
+
+        # The snapshot must agree with everything the version record claims;
+        # a mismatch means the stored data and the catalog have drifted apart.
+        if len(rows) != record["row_count"]:
+            raise ValueError(
+                f"stored data record count mismatch for {dataset}@{version}: "
+                f"the record lists {record['row_count']} but the data has {len(rows)}"
+            )
+        schema = record["schema"]
+        if set(header) != set(schema):
+            raise ValueError(
+                f"stored data field set mismatch for {dataset}@{version}"
+            )
+        observed = {name: set() for name in header}
+        for row in rows:
+            for position, name in enumerate(header):
+                observed[name].add(_kind(row[position]))
+        inferred = {name: _merge_kinds(kinds) for name, kinds in observed.items()}
+        if inferred != schema:
+            raise ValueError(
+                f"stored data type inference mismatch for {dataset}@{version}"
+            )
+
+        data_name = f"{dataset}-v{version}.csv"
+        manifest = {"schemaVersion": 1, "record": record, "file": data_name}
+        if str(version) in state["lineage"].get(dataset, {}):
             # Cleaned versions carry their full lineage chain in the manifest.
             manifest["lineage"] = self.lineage(dataset, version)["chain"]
+        manifest_bytes = (
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+
+        # All checks passed before this point; only now is the destination
+        # created or touched.
+        destination_path = Path(destination).resolve()
+        destination_path.mkdir(parents=True, exist_ok=True)
+        if not destination_path.is_dir():
+            raise OSError(f"export destination is not a directory: {destination_path}")
+        data_path = destination_path / data_name
         manifest_path = destination_path / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        self._deliver_export(
+            destination_path,
+            ((data_path, content), (manifest_path, manifest_bytes)),
         )
         return manifest
+
+    @staticmethod
+    def _deliver_export(
+        directory: Path, outputs: tuple[tuple[Path, bytes], ...]
+    ) -> None:
+        """Atomically replace *outputs* inside *directory*, rolling back on failure.
+
+        Each pre-existing target is first renamed aside as a backup, then
+        every new file is written to a temporary file in the same directory
+        and renamed into place. Any failure removes the new files, restores
+        the backups, and deletes temporary files, so the directory keeps
+        exactly its prior contents; on success the backups are removed.
+        """
+        for target, _ in outputs:
+            if target.is_dir() and not target.is_symlink():
+                raise OSError(
+                    f"cannot overwrite non-file export target: {target}"
+                )
+        backups: list[tuple[Path, Path]] = []
+        placed: list[Path] = []
+        try:
+            for target, _ in outputs:
+                if not target.exists() and not target.is_symlink():
+                    continue
+                descriptor, backup_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".bak", dir=directory
+                )
+                os.close(descriptor)
+                backup = Path(backup_name)
+                backup.unlink()
+                os.replace(target, backup)
+                backups.append((target, backup))
+            for target, payload in outputs:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".tmp", dir=directory
+                )
+                temporary = Path(temporary_name)
+                try:
+                    # mkstemp defaults to 0600; match the ordinary
+                    # create-mode (0666 masked by the umask) of a plain copy.
+                    umask = os.umask(0)
+                    os.umask(umask)
+                    os.fchmod(descriptor, 0o666 & ~umask)
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    temporary.replace(target)
+                except BaseException:
+                    with suppress(OSError):
+                        temporary.unlink()
+                    raise
+                placed.append(target)
+        except BaseException:
+            for target in placed:
+                with suppress(OSError):
+                    target.unlink()
+            for target, backup in reversed(backups):
+                with suppress(OSError):
+                    os.replace(backup, target)
+            raise
+        for _, backup in backups:
+            with suppress(OSError):
+                backup.unlink()
 
     # ------------------------------------------------------------------
     # Offline export verification

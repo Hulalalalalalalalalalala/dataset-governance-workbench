@@ -214,6 +214,47 @@ class Catalog:
         )
         temporary.replace(self.state_path)
 
+    def _store_blob(self, content: bytes, content_hash: str) -> Path:
+        """Store *content* under its content hash and return the blob path.
+
+        Content-addressed storage may be shared, but an existing file is only
+        trusted once its bytes match the claimed hash; a damaged blob is
+        reported, never overwritten or "repaired" for the versions that
+        already point at it. New blobs land through a unique temporary file
+        in the same directory and are atomically named only after a full
+        flush, so a write failure leaves no file at the content-addressed
+        path.
+        """
+        self.blobs.mkdir(parents=True, exist_ok=True)
+        blob = self.blobs / f"{content_hash}.csv"
+        if blob.exists():
+            if _sha256(blob) != content_hash:
+                raise OSError(
+                    f"stored blob {blob.name} is corrupt: content does not "
+                    "match its hash"
+                )
+            return blob
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{content_hash}.", suffix=".tmp", dir=self.blobs
+        )
+        temporary = Path(temporary_name)
+        try:
+            # mkstemp defaults to 0600; match the ordinary create-mode
+            # (0666 masked by the umask) that a plain file copy would use.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.fchmod(descriptor, 0o666 & ~umask)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(blob)
+        except BaseException:
+            with suppress(OSError):
+                temporary.unlink()
+            raise
+        return blob
+
     def import_csv(self, dataset: str, source: str | Path) -> DatasetVersion:
         if not dataset or any(character in dataset for character in "/\\\0"):
             raise ValueError("dataset must be a non-empty portable name")
@@ -234,41 +275,7 @@ class Catalog:
                 observed[name].add(_kind(row[position]))
         row_count = len(rows)
 
-        self.blobs.mkdir(parents=True, exist_ok=True)
-        blob = self.blobs / f"{content_hash}.csv"
-        if blob.exists():
-            # Content-addressed storage may be shared, but only trust an
-            # existing file once its bytes match the claimed hash; a damaged
-            # blob is reported, never overwritten or "repaired" for the
-            # versions that already point at it.
-            if _sha256(blob) != content_hash:
-                raise OSError(
-                    f"stored blob {blob.name} is corrupt: content does not "
-                    "match its hash"
-                )
-        else:
-            # Land the blob through a unique temporary file in the same
-            # directory and atomically name it only after a full flush; a
-            # write failure leaves no file at the content-addressed path.
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{content_hash}.", suffix=".tmp", dir=self.blobs
-            )
-            temporary = Path(temporary_name)
-            try:
-                # mkstemp defaults to 0600; match the ordinary create-mode
-                # (0666 masked by the umask) that a plain file copy would use.
-                umask = os.umask(0)
-                os.umask(umask)
-                os.fchmod(descriptor, 0o666 & ~umask)
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(content)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                temporary.replace(blob)
-            except BaseException:
-                with suppress(OSError):
-                    temporary.unlink()
-                raise
+        blob = self._store_blob(content, content_hash)
 
         state = self._load()
         versions = state["datasets"].setdefault(dataset, [])
@@ -1685,10 +1692,13 @@ class Catalog:
         writer.writerows(rows)
         content = buffer.getvalue().encode("utf-8")
         content_hash = hashlib.sha256(content).hexdigest()
-        self.blobs.mkdir(parents=True, exist_ok=True)
-        blob = self.blobs / f"{content_hash}.csv"
-        if not blob.exists():
-            blob.write_bytes(content)
+        # The result blob is stored with the same integrity rules as an
+        # import: an existing file is reused only after its bytes verify
+        # against the result hash, and a new file lands atomically so a
+        # write failure leaves no partial blob behind. Any failure here
+        # happens before the version and lineage are appended, so no version
+        # number is consumed.
+        blob = self._store_blob(content, content_hash)
 
         observed = {name: set() for name in columns}
         for row in rows:

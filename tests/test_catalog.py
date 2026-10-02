@@ -635,6 +635,480 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(len(self.catalog.list_datasets()["d"]), 1)
 
 
+class ReferenceRuleTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def csv_file(self, contents: str, name: str = "data.csv") -> Path:
+        path = self.root / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def import_reference_side(self):
+        self.catalog.import_csv(
+            "客户", self.csv_file("编号,地区,备注\nC1,北,x\nC2,南,y\n", "cust-v1.csv")
+        )
+        self.catalog.import_csv(
+            "客户",
+            self.csv_file("编号,地区,备注\nC1,北,x\nC2,南,y\nC3,东,z\n", "cust-v2.csv"),
+        )
+
+    def reference_rule(self, **overrides):
+        rule = {
+            "id": "客户引用",
+            "type": "reference",
+            "columns": ["客户号", "地区"],
+            "reference": {"dataset": "客户", "version": 2, "columns": ["编号", "地区"]},
+        }
+        rule.update(overrides)
+        return rule
+
+    # ---- configuration ---------------------------------------------------
+
+    def test_valid_reference_rule_configuration(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv"))
+        result = self.catalog.set_rules("orders", [self.reference_rule()])
+        self.assertEqual(result["revision"], 1)
+        rule = result["rules"][0]
+        self.assertEqual(rule["type"], "reference")
+        self.assertEqual(rule["columns"], ["客户号", "地区"])
+        self.assertEqual(
+            rule["reference"],
+            {"dataset": "客户", "version": 2, "columns": ["编号", "地区"]},
+        )
+
+    def test_single_column_reference_rule(self):
+        self.catalog.import_csv("ref", self.csv_file("code\nA\nB\n", "ref.csv"))
+        self.catalog.import_csv("d", self.csv_file("c\nA\n", "d.csv"))
+        result = self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["c"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+                }
+            ],
+        )
+        self.assertEqual(result["revision"], 1)
+        self.assertTrue(self.catalog.validate("d", 1)["passed"])
+
+    def test_invalid_reference_configurations(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv"))
+
+        def reject(rule):
+            with self.assertRaises(ValueError):
+                self.catalog.set_rules("orders", [rule])
+
+        reject({"id": "r", "type": "reference",
+                "reference": {"dataset": "客户", "version": 2, "columns": ["编号"]}})  # no columns
+        reject(self.reference_rule(reference=None))  # missing reference object
+        reject(self.reference_rule(extra=1))  # extra attribute
+        reject(self.reference_rule(column="客户号"))  # single-column form not allowed
+        reject(self.reference_rule(min=1))
+        reject(self.reference_rule(max=2))
+        reject(self.reference_rule(columns=[]))  # empty columns
+        reject(self.reference_rule(columns="客户号"))  # not an array
+        reject(self.reference_rule(columns=["客户号", ""]))  # empty name
+        reject(self.reference_rule(columns=["客户号", 7]))  # non-string
+        reject(self.reference_rule(columns=["客户号", "客户号"]))  # duplicates
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 2,
+                                              "columns": ["编号", "地区"], "x": 1}))
+        reject(self.reference_rule(reference={"version": 2, "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "", "version": 2,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": 5, "version": 2,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "客户",
+                                              "columns": ["编号", "地区"]}))  # no version
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 0,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": -1,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": True,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 2.0,
+                                              "columns": ["编号", "地区"]}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 2,
+                                              "columns": []}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 2,
+                                              "columns": ["编号", "编号"]}))
+        reject(self.reference_rule(reference={"dataset": "客户", "version": 2,
+                                              "columns": ["编号"]}))  # unequal lengths
+        reject(self.reference_rule(columns=["客户号"],
+                                   reference={"dataset": "客户", "version": 2,
+                                              "columns": ["编号", "地区"]}))
+        # old rule types reject the new attributes
+        reject({"id": "r", "column": "客户号", "type": "required", "columns": ["客户号"]})
+        reject({"id": "r", "column": "客户号", "type": "unique",
+                "reference": {"dataset": "客户", "version": 2, "columns": ["编号"]}})
+        # id uniqueness still applies across mixed types
+        with self.assertRaises(ValueError):
+            self.catalog.set_rules(
+                "orders",
+                [
+                    self.reference_rule(),
+                    {"id": "客户引用", "column": "地区", "type": "required"},
+                ],
+            )
+
+    def test_reference_target_checked_at_config_time(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv"))
+
+        def reject(reference):
+            with self.assertRaises(ValueError):
+                self.catalog.set_rules("orders", [self.reference_rule(reference=reference)])
+
+        reject({"dataset": "missing", "version": 1, "columns": ["编号", "地区"]})
+        reject({"dataset": "客户", "version": 3, "columns": ["编号", "地区"]})
+        reject({"dataset": "客户", "version": 1, "columns": ["编号", "不存在"]})
+        # failed configurations consumed no revision number
+        result = self.catalog.set_rules("orders", [self.reference_rule()])
+        self.assertEqual(result["revision"], 1)
+
+    def test_local_columns_checked_at_validation_time(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,区域\nC1,北\n", "orders.csv"))
+        # 地区 is not a column of the local version; configuration still succeeds
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("orders", 1)
+        self.assertIn("orders@1", str(context.exception))
+
+    # ---- matching semantics ------------------------------------------------
+
+    def test_match_and_mismatch_violations(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders",
+            self.csv_file(
+                "客户号,地区,金额\n"
+                "C1,北,10\n"     # ok
+                "C3,东,20\n"     # ok (only in reference version 2)
+                "C9,北,30\n"     # unknown customer
+                "C1,南,40\n"     # known customer, wrong region combination
+                "C2,南,50\n"     # ok
+                "C2,南,60\n",    # ok (duplicate local rows are each checked)
+                "orders.csv",
+            ),
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        report = self.catalog.validate("orders", 1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["rowCount"], 6)
+        self.assertEqual(len(report["results"]), 1)
+        result = report["results"][0]
+        self.assertEqual(result["id"], "客户引用")
+        self.assertEqual(result["type"], "reference")
+        self.assertEqual(result["columns"], ["客户号", "地区"])
+        self.assertNotIn("column", result)
+        reference = result["reference"]
+        self.assertEqual(reference["dataset"], "客户")
+        self.assertEqual(reference["version"], 2)
+        self.assertEqual(reference["columns"], ["编号", "地区"])
+        self.assertEqual(
+            reference["content_sha256"], self.catalog.get("客户", 2)["content_sha256"]
+        )
+        self.assertEqual(result["violations"], [3, 4])
+        self.assertEqual(result["violationCount"], 2)
+
+    def test_raw_string_matching_no_trimming_or_numeric_conversion(self):
+        self.catalog.import_csv("ref", self.csv_file("code\n1\n x\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d", self.csv_file('c\n1\n01\n 1\nx\n x\n"1,5"\n', "d.csv")
+        )
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["c"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+                }
+            ],
+        )
+        report = self.catalog.validate("d", 1)
+        # "01", " 1", "x", "1,5" are not reference values; separators are plain
+        self.assertEqual(report["results"][0]["violations"], [2, 3, 4, 6])
+
+    def test_empty_local_value_and_duplicate_rows_reported_per_record(self):
+        self.catalog.import_csv("ref", self.csv_file("a,b\nX,1\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d", self.csv_file("a,b\nX,1\nX,\n,1\n,\nZ,9\nZ,9\n", "d.csv")
+        )
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        report = self.catalog.validate("d", 1)
+        # rows 2-4 have an empty side value; rows 5-6 repeat an unknown pair
+        self.assertEqual(report["results"][0]["violations"], [2, 3, 4, 5, 6])
+
+    def test_reference_side_empty_value_fails_whole_run(self):
+        self.catalog.import_csv("ref", self.csv_file("a,b\nX,1\nY,\n", "ref.csv"))
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("d", 1)
+        self.assertIn("ref@1", str(context.exception))
+        # nothing was persisted
+        self.assertEqual(self.catalog.validation_history("d", 1), [])
+
+    def test_reference_side_duplicate_combination_fails_whole_run(self):
+        self.catalog.import_csv("ref", self.csv_file("a,b\nX,1\nX,1\n", "ref.csv"))
+        self.catalog.import_csv("d", self.csv_file("a,b\n", "d.csv"))  # header only
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a"]},
+                }
+            ],
+        )
+        # fails even though the local side has no records at all
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("d", 1)
+        self.assertIn("ref@1", str(context.exception))
+
+    def test_header_only_reference_and_empty_sides(self):
+        self.catalog.import_csv("ref", self.csv_file("a,b\n", "ref.csv"))  # header only
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\nY,2\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        report = self.catalog.validate("d", 1)
+        # a header-only reference version is legal; every local record violates
+        self.assertEqual(report["results"][0]["violations"], [1, 2])
+        self.assertFalse(report["passed"])
+        # both sides without records pass
+        self.catalog.import_csv("empty", self.csv_file("a,b\n", "empty.csv"))
+        self.catalog.set_rules(
+            "empty",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        self.assertTrue(self.catalog.validate("empty", 1)["passed"])
+
+    def test_mixed_with_existing_rule_types_in_config_order(self):
+        self.catalog.import_csv("ref", self.csv_file("code\nA\nB\n", "ref.csv"))
+        self.catalog.import_csv("d", self.csv_file("c,v\nA,5\nQ,99\nA,9\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "v-range", "column": "v", "type": "range", "min": 0, "max": 10},
+                {
+                    "id": "c-ref",
+                    "type": "reference",
+                    "columns": ["c"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+                },
+                {"id": "c-required", "column": "c", "type": "required"},
+            ],
+        )
+        report = self.catalog.validate("d", 1)
+        self.assertEqual(
+            [item["id"] for item in report["results"]],
+            ["v-range", "c-ref", "c-required"],
+        )
+        by_id = {item["id"]: item for item in report["results"]}
+        self.assertEqual(by_id["v-range"]["violations"], [2])
+        self.assertEqual(by_id["c-ref"]["violations"], [2])
+        self.assertEqual(by_id["c-required"]["violations"], [])
+        self.assertFalse(report["passed"])
+
+    def test_cleaned_versions_work_on_either_side(self):
+        self.catalog.import_csv("ref", self.csv_file("code\n A \nB\n", "ref.csv"))
+        self.catalog.clean("ref", 1, [{"type": "trim", "column": "code"}])
+        self.catalog.import_csv("d", self.csv_file("c\nA\nB\nC\n", "d.csv"))
+        self.catalog.clean("d", 1, [{"type": "drop_duplicates", "columns": ["c"]}])
+        # cleaned version 2 of ref as the reference side, cleaned version 2 of
+        # d as the local side
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["c"],
+                    "reference": {"dataset": "ref", "version": 2, "columns": ["code"]},
+                }
+            ],
+        )
+        report = self.catalog.validate("d", 2)
+        self.assertEqual(report["results"][0]["violations"], [3])
+
+    def test_new_reference_version_keeps_old_revision_meaning(self):
+        self.catalog.import_csv("ref", self.csv_file("code\nA\n", "ref-v1.csv"))
+        self.catalog.import_csv("d", self.csv_file("c\nA\nB\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["c"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+                }
+            ],
+        )
+        first = self.catalog.validate("d", 1)
+        self.assertEqual(first["results"][0]["violations"], [2])
+        # a new version on the reference side does not change the pinned target
+        self.catalog.import_csv("ref", self.csv_file("code\nA\nB\n", "ref-v2.csv"))
+        again = self.catalog.validate("d", 1)
+        self.assertEqual(again, first)
+        self.assertEqual(
+            again["results"][0]["reference"]["content_sha256"],
+            self.catalog.get("ref", 1)["content_sha256"],
+        )
+
+    # ---- persistence and re-verification ------------------------------------
+
+    def test_report_persists_and_revalidation_rechecks_every_side(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\nC9,北\n", "orders.csv"))
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        first = self.catalog.validate("orders", 1)
+        second = self.catalog.validate("orders", 1)
+        self.assertEqual(first, second)
+        # exactly one report persisted, retrievable after a restart
+        reloaded = Catalog(self.catalog.workspace)
+        history = reloaded.validation_history("orders", 1)
+        self.assertEqual(history, [first])
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["validations"]["orders"]["1"]), 1)
+
+        # tampering with the reference side is noticed on revalidation
+        reference_record = self.catalog.get("客户", 2)
+        reference_blob = self.catalog.workspace / reference_record["blob"]
+        reference_original = reference_blob.read_bytes()
+        reference_blob.write_text("编号,地区,备注\nC1,北,x\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as context:
+            reloaded.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+        reference_blob.write_bytes(reference_original)
+
+        # tampering with the local side is noticed as well
+        local_record = self.catalog.get("orders", 1)
+        local_blob = self.catalog.workspace / local_record["blob"]
+        local_original = local_blob.read_bytes()
+        local_blob.write_text("客户号,地区\nC1,北\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as context:
+            reloaded.validate("orders", 1)
+        self.assertIn("orders@1", str(context.exception))
+        local_blob.write_bytes(local_original)
+
+        # a missing reference file fails the run without touching the report
+        reference_blob.unlink()
+        with self.assertRaises(ValueError) as context:
+            reloaded.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+        reference_blob.write_bytes(reference_original)
+        # the stored report survived every failed revalidation unchanged
+        self.assertEqual(reloaded.validation_history("orders", 1), [first])
+        self.assertEqual(reloaded.validate("orders", 1), first)
+
+    def test_structurally_invalid_side_fails_whole_run(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv"))
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        # corrupt the reference blob in place, then fix the catalog hash so
+        # only the structural problem remains
+        record = self.catalog.get("客户", 2)
+        blob = self.catalog.workspace / record["blob"]
+        blob.write_text("编号,地区,备注\nC1,北\n", encoding="utf-8")  # ragged
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        state["datasets"]["客户"][1]["content_sha256"] = hashlib.sha256(
+            blob.read_bytes()
+        ).hexdigest()
+        self.catalog.state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+        self.assertEqual(self.catalog.validation_history("orders", 1), [])
+
+    def test_failed_report_write_leaves_no_partial_result(self):
+        self.import_reference_side()
+        self.catalog.import_csv("orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv"))
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        with mock.patch.object(Catalog, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.catalog.validate("orders", 1)
+        self.assertEqual(self.catalog.validation_history("orders", 1), [])
+        self.assertEqual(len(self.catalog.list_datasets()["orders"]), 1)
+        self.assertEqual(self.catalog.lineage("orders", 1), {"dataset": "orders", "version": 1, "chain": []})
+        report = self.catalog.validate("orders", 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(self.catalog.validation_history("orders", 1)), 1)
+
+    def test_self_reference_and_historical_revision(self):
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\n", "d-v1.csv"))
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\nY,2\n", "d-v2.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "d", "version": 2, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        self.assertTrue(self.catalog.validate("d", 1)["passed"])
+        # a version may also reference itself
+        self.assertTrue(self.catalog.validate("d", 2)["passed"])
+        # a later revision does not rewrite the historical one
+        self.catalog.set_rules("d", [{"id": "r2", "column": "a", "type": "required"}])
+        historical = self.catalog.validate("d", 1, revision=1)
+        self.assertEqual(historical["rulesRevision"], 1)
+        self.assertEqual(historical["results"][0]["type"], "reference")
+
+
 class CleanTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1243,6 +1717,62 @@ class CliTest(unittest.TestCase):
         self.assertIn("record", manifest)
         self.assertIn("file", manifest)
         self.assertEqual(len(manifest["lineage"]), 1)
+
+    def test_reference_rule_commands_and_exit_codes(self):
+        (self.root / "customers.csv").write_text("编号,地区\nC1,北\nC2,南\n", encoding="utf-8")
+        (self.root / "orders.csv").write_text("客户号,地区\nC1,北\nC9,北\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("import", "客户", str(self.root / "customers.csv")).returncode, 0)
+        self.assertEqual(self.run_cli("import", "orders", str(self.root / "orders.csv")).returncode, 0)
+
+        rules_path = self.root / "rules.json"
+        rules_path.write_text(json.dumps([
+            {"id": "客户引用", "type": "reference", "columns": ["客户号", "地区"],
+             "reference": {"dataset": "客户", "version": 1, "columns": ["编号", "地区"]}},
+            {"id": "地区必填", "column": "地区", "type": "required"},
+        ], ensure_ascii=False), encoding="utf-8")
+        result = self.run_cli("rules", "orders", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["revision"], 1)
+
+        # violations on stdout with exit 1
+        result = self.run_cli("validate", "orders", "1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["passed"])
+        reference_result = report["results"][0]
+        self.assertEqual(reference_result["type"], "reference")
+        self.assertEqual(reference_result["columns"], ["客户号", "地区"])
+        self.assertEqual(reference_result["reference"]["dataset"], "客户")
+        self.assertEqual(reference_result["reference"]["version"], 1)
+        self.assertRegex(reference_result["reference"]["content_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(reference_result["violations"], [2])
+
+        # persisted report comes back from the history command
+        result = self.run_cli("validations", "orders", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [report])
+
+        # an unknown reference target fails configuration with the envelope
+        bad_rules = self.root / "bad-rules.json"
+        bad_rules.write_text(json.dumps([
+            {"id": "r", "type": "reference", "columns": ["客户号"],
+             "reference": {"dataset": "客户", "version": 9, "columns": ["编号"]}},
+        ]), encoding="utf-8")
+        result = self.run_cli("rules", "orders", str(bad_rules))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+
+        # a tampered reference file fails revalidation with the envelope
+        catalog = Catalog(self.workspace)
+        blob = catalog.workspace / catalog.get("客户", 1)["blob"]
+        blob.write_text("编号,地区\nC1,北\n", encoding="utf-8")
+        result = self.run_cli("validate", "orders", "1")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        payload = json.loads(result.stderr)
+        self.assertEqual(set(payload), {"error"})
+        self.assertIn("客户@1", payload["error"])
 
     def test_clean_and_lineage_error_envelope(self):
         self.run_cli("import", "d", str(self.root / "good.csv"))

@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_RULE_TYPES = {"required", "unique", "range"}
-_RULE_KEYS = {"id", "column", "type", "min", "max"}
+_RULE_TYPES = {"required", "unique", "range", "reference"}
+_RULE_KEYS = {"id", "column", "type", "min", "max", "columns", "reference"}
+_REFERENCE_RULE_KEYS = {"id", "type", "columns", "reference"}
+_REFERENCE_KEYS = {"dataset", "version", "columns"}
 _TYPE_NAMES = {"null", "boolean", "integer", "number", "string"}
 _OPERATION_KEYS = {
     "trim": {"type", "column"},
@@ -852,7 +854,53 @@ class Catalog:
         }
 
     @staticmethod
-    def _validate_rules_payload(rules: Any) -> list[dict[str, Any]]:
+    def _column_array(value: Any, where: str) -> list[str]:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{where} must be a non-empty array")
+        if any(not isinstance(name, str) or not name for name in value):
+            raise ValueError(f"{where} must contain only non-empty strings")
+        if len(set(value)) != len(value):
+            raise ValueError(f"{where} must not contain duplicates")
+        return list(value)
+
+    @classmethod
+    def _validate_reference_payload(cls, rule: dict[str, Any], where: str) -> dict[str, Any]:
+        misplaced = set(rule) - _REFERENCE_RULE_KEYS
+        if misplaced:
+            raise ValueError(f"{where} has unknown attributes: {sorted(misplaced)}")
+        columns = cls._column_array(rule.get("columns"), f"{where}.columns")
+        reference = rule.get("reference")
+        if not isinstance(reference, dict):
+            raise ValueError(f"{where}.reference must be an object")
+        extra = set(reference) - _REFERENCE_KEYS
+        if extra:
+            raise ValueError(f"{where}.reference has unknown attributes: {sorted(extra)}")
+        dataset = reference.get("dataset")
+        if not isinstance(dataset, str) or not dataset:
+            raise ValueError(f"{where}.reference.dataset must be a non-empty string")
+        version = reference.get("version")
+        if not _is_int(version) or version < 1:
+            raise ValueError(f"{where}.reference.version must be a positive integer")
+        ref_columns = cls._column_array(
+            reference.get("columns"), f"{where}.reference.columns"
+        )
+        if len(columns) != len(ref_columns):
+            raise ValueError(
+                f"{where}.columns and {where}.reference.columns must have the same length"
+            )
+        return {
+            "id": rule["id"],
+            "type": "reference",
+            "columns": columns,
+            "reference": {
+                "dataset": dataset,
+                "version": version,
+                "columns": ref_columns,
+            },
+        }
+
+    @classmethod
+    def _validate_rules_payload(cls, rules: Any) -> list[dict[str, Any]]:
         if not isinstance(rules, list) or not rules:
             raise ValueError("rules must be a non-empty array")
         normalized: list[dict[str, Any]] = []
@@ -869,12 +917,19 @@ class Catalog:
                 raise ValueError(f"{where}.id must be a non-empty string")
             if identifier in seen_ids:
                 raise ValueError(f"duplicate rule id: {identifier}")
-            column = rule.get("column")
-            if not isinstance(column, str) or not column:
-                raise ValueError(f"{where}.column must be a non-empty column name")
             rule_type = rule.get("type")
             if rule_type not in _RULE_TYPES:
                 raise ValueError(f"{where}.type must be one of {sorted(_RULE_TYPES)}")
+            if rule_type == "reference":
+                normalized.append(cls._validate_reference_payload(rule, where))
+                seen_ids.add(identifier)
+                continue
+            misplaced = set(rule) & {"columns", "reference"}
+            if misplaced:
+                raise ValueError(f"{where} has unknown attributes: {sorted(misplaced)}")
+            column = rule.get("column")
+            if not isinstance(column, str) or not column:
+                raise ValueError(f"{where}.column must be a non-empty column name")
             entry: dict[str, Any] = {"id": identifier, "column": column, "type": rule_type}
             if rule_type == "range":
                 if "min" not in rule and "max" not in rule:
@@ -901,11 +956,44 @@ class Catalog:
             normalized.append(entry)
         return normalized
 
+    @staticmethod
+    def _check_reference_targets(state: dict[str, Any], rules: list[dict[str, Any]]) -> None:
+        """Verify reference-rule targets against already stored versions.
+
+        The referenced dataset, version, and columns must all exist when the
+        revision is created; the local columns are only checked when a data
+        version is validated. Versions appended later on the reference side
+        do not change what an existing revision points at.
+        """
+        for index, rule in enumerate(rules):
+            if rule["type"] != "reference":
+                continue
+            where = f"rules[{index}].reference"
+            reference = rule["reference"]
+            target = reference["dataset"]
+            versions = state["datasets"].get(target)
+            if versions is None:
+                raise ValueError(f"{where}.dataset names unknown dataset: {target}")
+            version = reference["version"]
+            if version > len(versions):
+                raise ValueError(
+                    f"{where}.version names unknown data version: {target}@{version}"
+                )
+            schema = versions[version - 1]["schema"]
+            missing = [name for name in reference["columns"] if name not in schema]
+            if missing:
+                raise ValueError(
+                    f"{where}.columns {missing} missing from {target}@{version}"
+                )
+
     def set_rules(self, dataset: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
         state = self._load()
         if dataset not in state["datasets"]:
             raise ValueError(f"unknown dataset: {dataset}")
         normalized = self._validate_rules_payload(rules)
+        # Checked before anything is appended, so a failed configuration
+        # neither adds a revision nor consumes a revision number.
+        self._check_reference_targets(state, normalized)
         history = state["rules"].setdefault(dataset, [])
         revision = len(history) + 1
         history.append(
@@ -947,17 +1035,40 @@ class Catalog:
 
         stored = state["validations"].setdefault(dataset, {})
         existing = stored.get(str(version), {}).get(str(rule_revision))
+        has_reference = any(rule["type"] == "reference" for rule in rules)
         if existing is not None:
-            # The stored blob hash is re-verified against both the catalog
-            # record and the stored report on every invocation even when the
-            # report itself is reused.
-            blob_path = self.workspace / record["blob"]
-            if not blob_path.exists():
-                raise ValueError(f"stored data missing for {dataset}@{version}")
-            current_hash = _sha256(blob_path)
-            if current_hash != record["content_sha256"] or current_hash != existing["content_sha256"]:
-                raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+            if has_reference:
+                # A validation involving reference rules re-verifies every
+                # file it depends on before the stored report is reused:
+                # both sides' existence, hashes (against the catalog records
+                # and the stored report), CSV structure, and rule fields.
+                # Any problem fails the whole run; the stored report is
+                # neither returned partially nor overwritten.
+                self._reference_sides(state, dataset, version, rules, existing["report"])
+            else:
+                # The stored blob hash is re-verified against both the catalog
+                # record and the stored report on every invocation even when
+                # the report itself is reused.
+                blob_path = self.workspace / record["blob"]
+                if not blob_path.exists():
+                    raise ValueError(f"stored data missing for {dataset}@{version}")
+                current_hash = _sha256(blob_path)
+                if current_hash != record["content_sha256"] or current_hash != existing["content_sha256"]:
+                    raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
             return dict(existing["report"])
+
+        if has_reference:
+            report, content_hash = self._validate_with_references(
+                state, dataset, version, rules, rule_revision
+            )
+            # Persist only after the full report is built; a write failure
+            # discards this report instead of leaving a partial entry behind.
+            stored.setdefault(str(version), {})[str(rule_revision)] = {
+                "content_sha256": content_hash,
+                "report": report,
+            }
+            self._save(state)
+            return dict(report)
 
         blob_path = self.workspace / record["blob"]
         if not blob_path.exists():
@@ -1043,6 +1154,247 @@ class Catalog:
         }
         self._save(state)
         return dict(report)
+
+    def _load_verified_side(
+        self,
+        state: dict[str, Any],
+        dataset: str,
+        version: int,
+        expected_hash: str | None = None,
+    ) -> tuple[str, list[str], list[list[str]]]:
+        """Re-verify and strictly parse one stored version, returning
+        ``(content_hash, header, rows)``.
+
+        Existence, the content hash (against the catalog record and, when
+        given, a previously recorded hash), and the CSV structure are all
+        checked; every error names the dataset and version involved.
+        """
+        record = self._version_record(state, dataset, version)
+        blob_path = self.workspace / record["blob"]
+        if not blob_path.exists():
+            raise ValueError(f"stored data missing for {dataset}@{version}")
+        content_hash = _sha256(blob_path)
+        if content_hash != record["content_sha256"]:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        if expected_hash is not None and content_hash != expected_hash:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        try:
+            header, rows = self._read_stored_csv(blob_path, dataset, version)
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
+            ) from error
+        except csv.Error as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
+            ) from error
+        return content_hash, header, rows
+
+    def _reference_sides(
+        self,
+        state: dict[str, Any],
+        dataset: str,
+        version: int,
+        rules: list[dict[str, Any]],
+        report: dict[str, Any] | None = None,
+    ) -> tuple[tuple[str, list[str], list[list[str]]], dict[tuple[str, int], tuple[str, list[str], list[list[str]]]]]:
+        """Load and verify the local side and every referenced side.
+
+        Returns ``(local, references)`` where ``local`` is the
+        ``(content_hash, header, rows)`` triple of the validated version and
+        ``references`` maps each referenced ``(dataset, version)`` to the
+        same triple. When ``report`` is given (a persisted report being
+        reused), each side's hash is additionally checked against the hash
+        recorded in that report. Field existence is verified on every call:
+        local columns against the selected version, reference columns
+        against their side.
+        """
+        expected_local = report["content_sha256"] if report is not None else None
+        local = self._load_verified_side(state, dataset, version, expected_local)
+        expected_reference: dict[tuple[str, int], str] = {}
+        if report is not None:
+            for item in report["results"]:
+                if item["type"] == "reference":
+                    reference = item["reference"]
+                    expected_reference[(reference["dataset"], reference["version"])] = (
+                        reference["content_sha256"]
+                    )
+        references: dict[tuple[str, int], tuple[str, list[str], list[list[str]]]] = {}
+        for rule in rules:
+            if rule["type"] != "reference":
+                continue
+            reference = rule["reference"]
+            key = (reference["dataset"], reference["version"])
+            if key in references:
+                continue
+            if key == (dataset, version):
+                references[key] = local
+            else:
+                references[key] = self._load_verified_side(
+                    state,
+                    reference["dataset"],
+                    reference["version"],
+                    expected_reference.get(key),
+                )
+        for rule in rules:
+            if rule["type"] == "reference":
+                local_names = rule["columns"]
+                reference = rule["reference"]
+                key = (reference["dataset"], reference["version"])
+                ref_header = references[key][1]
+                ref_names = reference["columns"]
+            else:
+                local_names = [rule["column"]]
+                ref_header = []
+                ref_names = []
+            for name in local_names:
+                if name not in local[1]:
+                    raise ValueError(f"missing column {name!r} for {dataset}@{version}")
+            for name in ref_names:
+                if name not in ref_header:
+                    raise ValueError(
+                        f"missing column {name!r} for "
+                        f"{reference['dataset']}@{reference['version']}"
+                    )
+        return local, references
+
+    def _validate_with_references(
+        self,
+        state: dict[str, Any],
+        dataset: str,
+        version: int,
+        rules: list[dict[str, Any]],
+        rule_revision: int,
+    ) -> tuple[dict[str, Any], str]:
+        """Validate a version against a revision containing reference rules.
+
+        Both sides are strictly parsed. Combinations are matched on raw
+        strings — no trimming, no numeric conversion, and separators inside
+        values have no special meaning. Empty values or duplicate complete
+        combinations on a reference side fail the whole run, even when the
+        local side has no records.
+        """
+        (content_hash, header, rows), references = self._reference_sides(
+            state, dataset, version, rules
+        )
+
+        # Build each referenced combination set before scanning local rows,
+        # so reference-side problems surface even with zero local records.
+        combination_sets: dict[str, set[tuple[str, ...]]] = {}
+        for rule in rules:
+            if rule["type"] != "reference":
+                continue
+            reference = rule["reference"]
+            key = (reference["dataset"], reference["version"])
+            _, ref_header, ref_rows = references[key]
+            positions = [ref_header.index(name) for name in reference["columns"]]
+            combinations: set[tuple[str, ...]] = set()
+            for record_number, row in enumerate(ref_rows, start=1):
+                combination = tuple(row[position] for position in positions)
+                if any(part == "" for part in combination):
+                    raise ValueError(
+                        f"empty value in referenced column(s) of "
+                        f"{reference['dataset']}@{reference['version']} "
+                        f"record {record_number}"
+                    )
+                if combination in combinations:
+                    raise ValueError(
+                        f"duplicate complete combination in referenced "
+                        f"{reference['dataset']}@{reference['version']}"
+                    )
+                combinations.add(combination)
+            combination_sets[rule["id"]] = combinations
+
+        column_positions = {
+            rule["id"]: [
+                header.index(name)
+                for name in (
+                    rule["columns"] if rule["type"] == "reference" else [rule["column"]]
+                )
+            ]
+            for rule in rules
+        }
+        violations_by_id: dict[str, list[int]] = {rule["id"]: [] for rule in rules}
+        seen_unique: dict[str, dict[str, list[int]]] = {
+            rule["id"]: {} for rule in rules if rule["type"] == "unique"
+        }
+        for row_number, row in enumerate(rows, start=1):
+            for rule in rules:
+                rule_type = rule["type"]
+                positions = column_positions[rule["id"]]
+                violations = violations_by_id[rule["id"]]
+                if rule_type == "required":
+                    if row[positions[0]] == "":
+                        violations.append(row_number)
+                elif rule_type == "unique":
+                    value = row[positions[0]]
+                    if value != "":
+                        seen_unique[rule["id"]].setdefault(value, []).append(row_number)
+                elif rule_type == "range":
+                    value = row[positions[0]]
+                    if value == "":
+                        continue
+                    number = _finite_number(value)
+                    if number is None or not (
+                        ("min" not in rule or number >= rule["min"])
+                        and ("max" not in rule or number <= rule["max"])
+                    ):
+                        violations.append(row_number)
+                else:  # reference
+                    combination = tuple(row[position] for position in positions)
+                    if (
+                        any(part == "" for part in combination)
+                        or combination not in combination_sets[rule["id"]]
+                    ):
+                        violations.append(row_number)
+
+        for rule_id, groups in seen_unique.items():
+            violations_by_id[rule_id] = sorted(
+                line for lines in groups.values() if len(lines) > 1 for line in lines
+            )
+
+        report_results = []
+        for rule in rules:
+            violations = violations_by_id[rule["id"]]
+            if rule["type"] == "reference":
+                reference = rule["reference"]
+                key = (reference["dataset"], reference["version"])
+                report_results.append(
+                    {
+                        "id": rule["id"],
+                        "type": "reference",
+                        "columns": list(rule["columns"]),
+                        "reference": {
+                            "dataset": reference["dataset"],
+                            "version": reference["version"],
+                            "columns": list(reference["columns"]),
+                            "content_sha256": references[key][0],
+                        },
+                        "violations": violations,
+                        "violationCount": len(violations),
+                    }
+                )
+            else:
+                report_results.append(
+                    {
+                        "id": rule["id"],
+                        "column": rule["column"],
+                        "type": rule["type"],
+                        "violations": violations,
+                        "violationCount": len(violations),
+                    }
+                )
+        total_violations = sum(item["violationCount"] for item in report_results)
+        report = {
+            "dataset": dataset,
+            "version": version,
+            "content_sha256": content_hash,
+            "rulesRevision": rule_revision,
+            "rowCount": len(rows),
+            "passed": total_violations == 0,
+            "results": report_results,
+        }
+        return report, content_hash
 
     def validation_history(self, dataset: str, version: int) -> list[dict[str, Any]]:
         state = self._load()

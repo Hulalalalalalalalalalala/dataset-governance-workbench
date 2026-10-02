@@ -2,6 +2,7 @@ import csv as csv_module
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1339,6 +1340,126 @@ class CleanTest(unittest.TestCase):
             self.catalog.clean("people", 1, bad)
         self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
 
+    # ---- result blob integrity ------------------------------------------
+
+    def test_corrupt_existing_result_blob_rejected_and_untouched(self):
+        first = self.clean_people()
+        blob = self.catalog.workspace / first["blob"]
+        original = blob.read_bytes()
+        for damaged in (b"", original[:5], b"id,name,region\n9,9,9\n"):
+            blob.write_bytes(damaged)
+            with self.assertRaises(OSError):
+                self.clean_people()
+            # the damaged file is left exactly as found
+            self.assertEqual(blob.read_bytes(), damaged)
+            # no version or lineage record was added or changed
+            state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(state["datasets"]["people"]), 2)
+            self.assertEqual(set(state["lineage"]["people"]), {"2"})
+        # once storage is repaired, retry uses the original next version
+        blob.write_bytes(original)
+        second = self.clean_people()
+        self.assertEqual(second["version"], 3)
+        self.assertEqual(second["content_sha256"], first["content_sha256"])
+        self.assertEqual(blob.read_bytes(), original)
+        self.assertEqual(
+            hashlib.sha256(blob.read_bytes()).hexdigest(), second["content_sha256"]
+        )
+
+    def test_result_blob_write_failure_leaves_no_file_and_no_version(self):
+        expected = b"id,name,region\n1,Ada,x\n2,Bob,y\n3,Ada,z\n"
+        result_blob = self.catalog.blobs / f"{hashlib.sha256(expected).hexdigest()}.csv"
+        with mock.patch.object(tempfile, "mkstemp", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.clean_people()
+        # no content-addressed file for the result and no temporary by-product
+        self.assertFalse(result_blob.exists())
+        self.assertEqual(list(self.catalog.blobs.glob("*.tmp")), [])
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["datasets"]["people"]), 1)
+        self.assertNotIn("people", state.get("lineage", {}))
+        # retry once writes succeed: the original next version number is used
+        result = self.clean_people()
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(
+            hashlib.sha256((self.catalog.workspace / result["blob"]).read_bytes()).hexdigest(),
+            result["content_sha256"],
+        )
+
+    def test_partial_result_write_failure_clears_incomplete_file(self):
+        expected = b"id,name,region\n1,Ada,x\n2,Bob,y\n3,Ada,z\n"
+        result_blob = self.catalog.blobs / f"{hashlib.sha256(expected).hexdigest()}.csv"
+        real_fdopen = os.fdopen
+
+        def broken_fdopen(*args, **kwargs):
+            handle = real_fdopen(*args, **kwargs)
+
+            def fail(_payload):
+                raise OSError("disk full")
+
+            handle.write = fail
+            return handle
+
+        with mock.patch.object(os, "fdopen", broken_fdopen):
+            with self.assertRaises(OSError):
+                self.clean_people()
+        # no hash-named file that a later run could mistake for valid data,
+        # and no temporary by-product remains
+        self.assertFalse(result_blob.exists())
+        self.assertEqual(list(self.catalog.blobs.glob("*.tmp")), [])
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["datasets"]["people"]), 1)
+        # retry succeeds with the original next version number
+        result = self.clean_people()
+        self.assertEqual(result["version"], 2)
+
+    def test_result_identical_to_imported_version_shares_blob(self):
+        self.catalog.import_csv("plain", self.csv_file("a,b\n1,2\n", "plain.csv"))
+        result = self.catalog.clean("plain", 1, [{"type": "trim", "column": "a"}])
+        first = self.catalog.get("plain", 1)
+        # the clean result is byte-identical to the imported version: the
+        # existing file is shared and its bytes are unchanged
+        self.assertEqual(result["blob"], first["blob"])
+        self.assertEqual(result["content_sha256"], first["content_sha256"])
+        blob = self.catalog.workspace / result["blob"]
+        self.assertEqual(blob.read_bytes(), b"a,b\n1,2\n")
+        self.assertEqual(result["version"], 2)
+
+    def test_orphaned_result_blob_verified_and_reused_on_retry(self):
+        expected = b"id,name,region\n1,Ada,x\n2,Bob,y\n3,Ada,z\n"
+        with mock.patch.object(Catalog, "_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.clean_people()
+        # no version registered, but the complete result file is kept
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["datasets"]["people"]), 1)
+        result_blob = self.catalog.blobs / f"{hashlib.sha256(expected).hexdigest()}.csv"
+        self.assertTrue(result_blob.exists())
+        self.assertEqual(result_blob.read_bytes(), expected)
+        # reopen the workspace and retry: the orphaned file is re-verified
+        # against the result hash and reused, and the original next version
+        # number is consumed
+        reloaded = Catalog(self.catalog.workspace)
+        result = reloaded.clean(
+            "people",
+            1,
+            [
+                {"type": "trim", "column": "name"},
+                {"type": "rename", "column": "city", "to": "region"},
+                {"type": "drop_duplicates", "columns": ["id", "name"]},
+            ],
+        )
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["content_sha256"], hashlib.sha256(expected).hexdigest())
+        self.assertEqual((self.catalog.workspace / result["blob"]).read_bytes(), expected)
+        # the persisted record matches the file exactly
+        persisted = reloaded.get("people", 2)
+        self.assertEqual(persisted["content_sha256"], result["content_sha256"])
+        self.assertEqual(persisted["row_count"], 3)
+        self.assertEqual(
+            persisted["schema"], {"id": "integer", "name": "string", "region": "string"}
+        )
+
 
 class KeyedCompareTest(unittest.TestCase):
     def setUp(self):
@@ -1717,6 +1838,36 @@ class CliTest(unittest.TestCase):
         self.assertIn("record", manifest)
         self.assertIn("file", manifest)
         self.assertEqual(len(manifest["lineage"]), 1)
+
+    def test_clean_blob_corruption_fails_with_stderr_envelope(self):
+        result = self.run_cli("import", "d", str(self.root / "good.csv"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        ops_path = self.root / "ops.json"
+        ops_path.write_text(json.dumps([
+            {"type": "trim", "column": "v"},
+            {"type": "rename", "column": "v", "to": "value"},
+        ]), encoding="utf-8")
+        result = self.run_cli("clean", "d", "1", str(ops_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cleaned = json.loads(result.stdout)
+        blob = self.workspace / ".dgw" / "blobs" / f"{cleaned['content_sha256']}.csv"
+        self.assertTrue(blob.exists())
+
+        # a result file that exists but does not match its hash is storage
+        # corruption: exit 2, stderr-only envelope, file left untouched
+        blob.write_bytes(b"corrupt\n")
+        result = self.run_cli("clean", "d", "1", str(ops_path))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.count("\n"), 1)
+        payload = json.loads(result.stderr)
+        self.assertEqual(set(payload), {"error"})
+        self.assertTrue(payload["error"])
+        self.assertEqual(blob.read_bytes(), b"corrupt\n")
+        # no version was added
+        listing = json.loads(self.run_cli("list").stdout)
+        self.assertEqual(len(listing["d"]), 2)
 
     def test_reference_rule_commands_and_exit_codes(self):
         (self.root / "customers.csv").write_text("编号,地区\nC1,北\nC2,南\n", encoding="utf-8")

@@ -1694,6 +1694,154 @@ class CleanTest(unittest.TestCase):
             self.catalog.clean("people", 1, bad)
         self.assertEqual(len(self.catalog.list_datasets()["people"]), 2)
 
+    def test_bare_carriage_return_in_value_survives_noop_trim(self):
+        # The quoted field contains a bare carriage return (not CRLF); a
+        # no-op trim must keep the single record and the whole cell intact.
+        self.catalog.import_csv(
+            "notes",
+            self.csv_file('id,说明\r\n1,"甲\r乙"\r\n', "notes.csv"),
+        )
+        result = self.catalog.clean("notes", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["row_count"], 1)
+        self.assertEqual(result["schema"], {"id": "integer", "说明": "string"})
+        entry = result["lineage"]
+        self.assertEqual(entry["steps"][0]["modifiedRows"], [])
+        self.assertEqual(entry["rowMapping"], [1])
+
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        # The in-field CR is quoted, so it cannot become a record boundary.
+        self.assertEqual(stored, 'id,说明\n1,"甲\r乙"\n'.encode("utf-8"))
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "说明"])
+        self.assertEqual(rows, [["1", "甲\r乙"]])
+
+        # Keyed comparison by id reports the row as unchanged, not modified.
+        diff = self.catalog.compare("notes", 1, 2, keys=["id"])["rowDiff"]
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["modified"], [])
+        self.assertEqual(diff["unchangedCount"], 1)
+
+        self.catalog.set_rules("notes", [
+            {"id": "req", "column": "说明", "type": "required"},
+            {"id": "uniq", "column": "id", "type": "unique"},
+        ])
+        report = self.catalog.validate("notes", 2)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["rowCount"], 1)
+
+        self.catalog.export("notes", 2, self.root / "out")
+        verification = self.catalog.verify_export(self.root / "out")
+        self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_bare_carriage_return_does_not_add_columns_or_rows_multicolumn(self):
+        # Two columns on both sides of a quoted bare CR: no extra column and
+        # no extra record after cleaning and re-reading.
+        self.catalog.import_csv(
+            "cr",
+            self.csv_file('a,b\r\n1,"x\ry"\r\n2,"p\r\nq"\r\n', "cr.csv"),
+        )
+        result = self.catalog.clean("cr", 1, [{"type": "trim", "column": "a"}])
+        self.assertEqual(result["row_count"], 2)
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(stored, 'a,b\n1,"x\ry"\n2,"p\r\nq"\n'.encode("utf-8"))
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["a", "b"])
+        self.assertEqual(rows, [["1", "x\ry"], ["2", "p\r\nq"]])
+        self.assertEqual(result["lineage"]["rowMapping"], [1, 2])
+
+    def test_bare_carriage_return_in_header_only_file(self):
+        # A quoted bare CR in a header name, with zero data records, cleans to
+        # zero rows; the name, null types, and empty row mapping all agree.
+        self.catalog.import_csv(
+            "heads",
+            self.csv_file('id,"说\r明"\n', "heads.csv"),
+        )
+        result = self.catalog.clean("heads", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(result["row_count"], 0)
+        self.assertEqual(result["schema"], {"id": "null", "说\r明": "null"})
+        self.assertEqual(result["lineage"]["rowMapping"], [])
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(stored, 'id,"说\r明"\n'.encode("utf-8"))
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "说\r明"])
+        self.assertEqual(rows, [])
+        self.catalog.export("heads", 2, self.root / "heads-out")
+        verification = self.catalog.verify_export(self.root / "heads-out")
+        self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_rename_to_name_with_bare_carriage_return(self):
+        self.catalog.import_csv(
+            "rn",
+            self.csv_file('id,说明\r\n1,"甲\r乙"\r\n', "rn.csv"),
+        )
+        result = self.catalog.clean(
+            "rn", 1, [{"type": "rename", "column": "说明", "to": "备\r注"}]
+        )
+        self.assertEqual(result["schema"], {"id": "integer", "备\r注": "string"})
+        self.assertEqual(result["lineage"]["columnMapping"], {"id": "id", "备\r注": "说明"})
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(stored, 'id,"备\r注"\n1,"甲\r乙"\n'.encode("utf-8"))
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "备\r注"])
+        self.assertEqual(rows, [["1", "甲\r乙"]])
+        # A rule can address the renamed column and the exported result verifies.
+        self.catalog.set_rules("rn", [{"id": "req", "column": "备\r注", "type": "required"}])
+        self.assertTrue(self.catalog.validate("rn", 2)["passed"])
+        self.catalog.export("rn", 2, self.root / "rn-out")
+        verification = self.catalog.verify_export(self.root / "rn-out")
+        self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_trim_keeps_internal_carriage_return_and_strips_ends(self):
+        # Leading/trailing whitespace (including CR) is still stripped; an
+        # internal CR is content and must be retained verbatim.
+        self.catalog.import_csv(
+            "tr",
+            self.csv_file('id,v\r\n1,"\t甲\r乙 "\r\n2,"\r甲\r乙\r"\r\n', "tr.csv"),
+        )
+        result = self.catalog.clean("tr", 1, [{"type": "trim", "column": "v"}])
+        self.assertEqual(result["lineage"]["steps"][0]["modifiedRows"], [1, 2])
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(stored, 'id,v\n1,"甲\r乙"\n2,"甲\r乙"\n'.encode("utf-8"))
+        _, rows = _read_csv_records(stored)
+        self.assertEqual(rows, [["1", "甲\r乙"], ["2", "甲\r乙"]])
+
+    def test_dedup_compares_carriage_return_values_as_raw_strings(self):
+        # "甲\r乙" is one value: duplicates collapse, and it is distinct from
+        # "甲乙"; dedup meaning is unchanged by CR handling.
+        self.catalog.import_csv(
+            "dd",
+            self.csv_file('id,v\r\n1,"甲\r乙"\r\n2,"甲\r乙"\r\n3,"甲乙"\r\n', "dd.csv"),
+        )
+        result = self.catalog.clean("dd", 1, [{"type": "drop_duplicates", "columns": ["v"]}])
+        self.assertEqual(result["lineage"]["steps"][0]["deletedRows"], [2])
+        self.assertEqual(result["lineage"]["rowMapping"], [1, 3])
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "v"])
+        self.assertEqual(rows, [["1", "甲\r乙"], ["3", "甲乙"]])
+
+    def test_special_character_output_format_is_unchanged(self):
+        # Comma, double quote, newline, and CRLF inside fields keep the exact
+        # historical minimal-quoting byte format after a no-op clean.
+        self.catalog.import_csv(
+            "spec",
+            self.csv_file(
+                'id,v\n1,"a,b"\n2,"x""y"\n3,"l1\nl2"\n4,"p\r\nq"\n5,z\n',
+                "spec.csv",
+            ),
+        )
+        result = self.catalog.clean("spec", 1, [{"type": "trim", "column": "id"}])
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        self.assertEqual(
+            stored,
+            b'id,v\n1,"a,b"\n2,"x""y"\n3,"l1\nl2"\n4,"p\r\nq"\n5,z\n',
+        )
+        # Re-cleaning stays deterministic and byte-identical.
+        again = self.catalog.clean("spec", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(again["content_sha256"], result["content_sha256"])
+
 
 class KeyedCompareTest(unittest.TestCase):
     def setUp(self):
@@ -2072,6 +2220,49 @@ class CliTest(unittest.TestCase):
         self.assertIn("record", manifest)
         self.assertIn("file", manifest)
         self.assertEqual(len(manifest["lineage"]), 1)
+
+    def test_clean_command_preserves_bare_carriage_return_end_to_end(self):
+        # id/说明 with one record whose 说明 is the literal value 甲\r乙;
+        # a no-op trim on id must keep one record and the whole cell.
+        (self.root / "cr.csv").write_bytes('id,说明\r\n1,"甲\r乙"\r\n'.encode("utf-8"))
+        result = self.run_cli("import", "d", str(self.root / "cr.csv"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["row_count"], 1)
+
+        ops_path = self.root / "ops.json"
+        ops_path.write_text(json.dumps([{"type": "trim", "column": "id"}]), encoding="utf-8")
+        result = self.run_cli("clean", "d", "1", str(ops_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cleaned = json.loads(result.stdout)
+        self.assertEqual(cleaned["row_count"], 1)
+        self.assertEqual(cleaned["schema"], {"id": "integer", "说明": "string"})
+        self.assertEqual(cleaned["lineage"]["rowMapping"], [1])
+        self.assertEqual(cleaned["lineage"]["steps"][0]["modifiedRows"], [])
+
+        # The new version must be re-readable with exactly one record/column.
+        catalog = Catalog(self.workspace)
+        record = catalog.get("d", 2)
+        blob = catalog.workspace / record["blob"]
+        header, rows = _read_csv_records(blob.read_bytes())
+        self.assertEqual(header, ["id", "说明"])
+        self.assertEqual(rows, [["1", "甲\r乙"]])
+
+        # Keyed comparison by id: no row-level modification.
+        result = self.run_cli("compare", "d", "1", "2", "--keys", "id")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        diff = json.loads(result.stdout)["rowDiff"]
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["modified"], [])
+        self.assertEqual(diff["unchangedCount"], 1)
+
+        # Export and offline verification pass.
+        result = self.run_cli("export", "d", "2", str(self.root / "cr-out"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_cli("verify-export", str(self.root / "cr-out"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["passed"], report["issues"])
 
     def test_reference_rule_commands_and_exit_codes(self):
         (self.root / "customers.csv").write_text("编号,地区\nC1,北\nC2,南\n", encoding="utf-8")

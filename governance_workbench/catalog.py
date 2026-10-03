@@ -177,6 +177,52 @@ def _read_csv_records(content: bytes) -> tuple[list[str], list[list[str]]]:
     return header, rows
 
 
+# Characters that delimit CSV records or fields; any field containing one
+# must be quoted so its content cannot be read back as a record boundary.
+_CSV_FIELD_SPECIAL = (",", '"', "\r", "\n")
+
+
+def _csv_quote_field(field: str, quote_empty: bool) -> str:
+    """Quote one field in the same minimal style as :func:`csv.writer`.
+
+    A bare carriage return is included alongside ``\\n``, the delimiter, and
+    the quote character even though not every CSV build quotes it: some
+    CPython builds/versions only quote characters that match their line
+    terminator, so relying on the library can leave an in-field ``\\r``
+    unquoted and let a conforming reader split the record there. Quoting it
+    here keeps the written bytes correct on every build and stays
+    byte-for-byte identical to the historical output for data without a bare
+    ``\\r``.
+    """
+    if field == "":
+        # csv.writer quotes a lone empty field so the single-column physical
+        # line is not mistaken for a blank line (which readers skip); empty
+        # fields in a multi-column row stay unquoted because the surrounding
+        # delimiters keep the record non-blank.
+        return '""' if quote_empty else field
+    if any(character in field for character in _CSV_FIELD_SPECIAL):
+        return '"' + field.replace('"', '""') + '"'
+    return field
+
+
+def _write_clean_csv(header: list[str], rows: list[list[str]]) -> bytes:
+    """Serialize cleaned records deterministically with ``\\n`` record ends.
+
+    Header names and cell values are preserved verbatim — commas, quotes,
+    newlines, and bare carriage returns included — by quoting any field that
+    contains a record/field boundary character. This matches
+    ``csv.writer(..., lineterminator="\\n")`` byte-for-byte on this build for
+    CR-free data while guaranteeing that a bare ``\\r`` inside a field name
+    or value is quoted on every build.
+    """
+    quote_empty = len(header) == 1
+    lines = [
+        ",".join(_csv_quote_field(field, quote_empty) for field in record)
+        for record in (header, *rows)
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class _PlainRuleEvaluator:
     """Judge the plain (non-reference) rules of a revision row by row.
 
@@ -1695,12 +1741,11 @@ class Catalog:
             steps.append(step)
 
         # Deterministic serialization: identical source and operations always
-        # produce identical CSV bytes.
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(columns)
-        writer.writerows(rows)
-        content = buffer.getvalue().encode("utf-8")
+        # produce identical CSV bytes. Field-internal record/field boundary
+        # characters (including a bare carriage return) are quoted
+        # deterministically so a cleaned field name or value can never be read
+        # back as a record boundary or extra column.
+        content = _write_clean_csv(columns, rows)
         content_hash = hashlib.sha256(content).hexdigest()
         # The result blob is stored with the same integrity rules as an
         # import: an existing file is reused only after its bytes verify

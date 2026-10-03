@@ -2,6 +2,7 @@ import csv as csv_module
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,9 +11,47 @@ from pathlib import Path
 from unittest import mock
 
 from governance_workbench import Catalog
+from governance_workbench import catalog as catalog_module
 from governance_workbench.catalog import _read_csv_records
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _directory_snapshot(directory) -> dict:
+    """Map every regular file under *directory* to its current bytes."""
+    base = Path(directory)
+    return {
+        path.relative_to(base): path.read_bytes()
+        for path in base.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+class _FailingOutputFile:
+    """File-like object whose ``write`` always raises OSError.
+
+    Wraps a real ``os.fdopen`` result so the descriptor lifecycle and the
+    temporary file on disk behave normally, while the payload write fails -
+    a stand-in for a disk-full or I/O error in the middle of delivery.
+    """
+
+    def __init__(self, real_fdopen, fd, args, kwargs):
+        self._handle = real_fdopen(fd, *args, **kwargs)
+
+    def write(self, payload):
+        raise OSError("simulated write failure")
+
+    def flush(self):
+        self._handle.flush()
+
+    def fileno(self):
+        return self._handle.fileno()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._handle.__exit__(*exc)
 
 
 def legacy_import(catalog: Catalog, dataset: str, contents: str) -> str:
@@ -98,6 +137,322 @@ class CatalogTest(unittest.TestCase):
         on_disk = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
         self.assertEqual(manifest["record"]["content_sha256"], record.content_sha256)
+
+
+class ExportDeliveryTest(unittest.TestCase):
+    """Regression coverage for joint CSV + manifest delivery.
+
+    Both files must land together or not at all: a failure partway through
+    restores the destination directory to exactly its prior bytes, and the
+    workspace (catalog state and stored blobs) is never modified.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+        # CRLF line endings, quoted fields with embedded commas and spaces:
+        # the delivered bytes must survive verbatim, not be re-normalized.
+        self.v1 = b'id,name\r\n1,"Ada, Q"\r\n'
+        self.v2 = b'id,name,region\r\n1,"Bob, K",APAC\r\n2,"Li, M",EMEA\r\n'
+        source1 = self.root / "v1.csv"
+        source1.write_bytes(self.v1)
+        source2 = self.root / "v2.csv"
+        source2.write_bytes(self.v2)
+        self.catalog.import_csv("d", source1)
+        self.catalog.import_csv("d", source2)
+        self.data_name = "d-v2.csv"
+        self.record2 = self.catalog.get("d", 2)
+        self.expected_manifest_bytes = (
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "record": self.record2,
+                    "file": self.data_name,
+                },
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        # Pre-existing contents deliberately different from the new delivery,
+        # so a test that only covered byte-identical overwrites would not pass.
+        self.stale_csv = b"old,header\n9,9\n"
+        self.stale_manifest = b'{"stale": true, "file": "d-v1.csv"}\n'
+        self.extra_file = ("notes.txt", b"unrelated file, untouched\n")
+        self.nested_file = ("sub/nested.bin", b"\x00\x01\x02")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_destination(self, *, csv_present=True, manifest_present=True):
+        directory = self.root / "export"
+        directory.mkdir()
+        if csv_present:
+            (directory / self.data_name).write_bytes(self.stale_csv)
+        if manifest_present:
+            (directory / "manifest.json").write_bytes(self.stale_manifest)
+        relative, payload = self.extra_file
+        (directory / relative).write_bytes(payload)
+        relative, payload = self.nested_file
+        nested = directory / relative
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_bytes(payload)
+        return directory
+
+    def assertWorkspaceUnchanged(self):
+        # export only reads the workspace: catalog state and both stored
+        # blobs must be byte-identical before and after.
+        self.assertEqual(
+            self.catalog.state_path.read_bytes(), self.workspace_state_bytes
+        )
+        for version, original in (
+            (1, self.v1),
+            (2, self.v2),
+        ):
+            record = self.catalog.get("d", version)
+            blob = self.catalog.workspace / record["blob"]
+            self.assertEqual(blob.read_bytes(), original)
+
+    def snapshot_workspace(self):
+        self.workspace_state_bytes = self.catalog.state_path.read_bytes()
+
+    def assertNoDeliveryArtifacts(self, directory):
+        leftovers = [
+            path.name
+            for path in directory.iterdir()
+            if path.name.startswith(".") or path.suffix in (".tmp", ".bak")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def assertStaleContents(self, directory, *, csv_present, manifest_present):
+        data_path = directory / self.data_name
+        manifest_path = directory / "manifest.json"
+        if csv_present:
+            self.assertEqual(data_path.read_bytes(), self.stale_csv)
+        else:
+            self.assertFalse(data_path.exists())
+        if manifest_present:
+            self.assertEqual(manifest_path.read_bytes(), self.stale_manifest)
+        else:
+            self.assertFalse(manifest_path.exists())
+
+    def assertUnrelatedFilesIntact(self, directory):
+        relative, payload = self.extra_file
+        self.assertEqual((directory / relative).read_bytes(), payload)
+        relative, payload = self.nested_file
+        self.assertEqual((directory / relative).read_bytes(), payload)
+
+    def export_bytes(self, directory):
+        return (directory / self.data_name).read_bytes(), (
+            directory / "manifest.json"
+        ).read_bytes()
+
+    # ---- successful delivery ---------------------------------------------
+
+    def test_successful_export_replaces_only_the_two_delivered_files(self):
+        directory = self.make_destination()
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        manifest = self.catalog.export("d", 2, directory)
+
+        data_bytes, manifest_bytes = self.export_bytes(directory)
+        # CSV is the stored version's exact original bytes: CRLF and quoting
+        # are preserved and the file differs from the pre-existing CSV.
+        self.assertEqual(data_bytes, self.v2)
+        self.assertNotEqual(data_bytes, self.stale_csv)
+        # the returned manifest equals the on-disk JSON byte-for-byte and
+        # still points at this selected version and data file.
+        self.assertEqual(manifest_bytes, self.expected_manifest_bytes)
+        self.assertEqual(json.loads(manifest_bytes), manifest)
+        self.assertEqual(manifest["file"], self.data_name)
+        self.assertEqual(manifest["record"]["version"], 2)
+        self.assertEqual(manifest["record"]["dataset"], "d")
+        self.assertEqual(manifest["record"]["content_sha256"], self.record2["content_sha256"])
+        # only the two delivered files changed; every other name and its
+        # contents are untouched.
+        after = _directory_snapshot(directory)
+        self.assertEqual(set(before) - {Path(self.data_name), Path("manifest.json")},
+                         set(after) - {Path(self.data_name), Path("manifest.json")})
+        for relative in set(before) & set(after):
+            if relative in (Path(self.data_name), Path("manifest.json")):
+                continue
+            self.assertEqual(after[relative], before[relative], relative)
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+        # the result is internally consistent and verifies offline.
+        self.assertTrue(Catalog(self.root / "offline").verify_export(directory)["passed"])
+
+    def test_successful_export_without_previous_targets_creates_both(self):
+        directory = self.root / "fresh"
+        directory.mkdir()
+        relative, payload = self.extra_file
+        (directory / relative).write_bytes(payload)
+        self.snapshot_workspace()
+
+        self.catalog.export("d", 2, directory)
+
+        data_bytes, manifest_bytes = self.export_bytes(directory)
+        self.assertEqual(data_bytes, self.v2)
+        self.assertEqual(manifest_bytes, self.expected_manifest_bytes)
+        self.assertEqual((directory / relative).read_bytes(), payload)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    # ---- write failure after the CSV is placed ----------------------------
+
+    def patch_manifest_write_to_fail(self):
+        """Fail the payload write for the manifest (the second output file).
+
+        The CSV has already been renamed into place by the time the manifest
+        temporary file is written, so this drives the rollback path where a
+        new CSV sits beside an undelivered manifest.
+        """
+        real_fdopen = os.fdopen
+        call_count = {"n": 0}
+
+        def fdopen(fd, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                return _FailingOutputFile(real_fdopen, fd, args, kwargs)
+            return real_fdopen(fd, *args, **kwargs)
+
+        return mock.patch.object(catalog_module.os, "fdopen", side_effect=fdopen)
+
+    def test_manifest_write_failure_restores_original_csv_and_manifest(self):
+        directory = self.make_destination()
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_manifest_write_to_fail():
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        # both originals are back at their prior bytes: never new CSV with
+        # the old manifest, and neither file lost.
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertStaleContents(directory, csv_present=True, manifest_present=True)
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    def test_manifest_write_failure_with_no_prior_csv_leaves_no_csv(self):
+        # only an old manifest exists; the CSV target is absent. After a
+        # failed delivery the old manifest must remain and no half-delivered
+        # CSV (nor its backup) may be left behind.
+        directory = self.make_destination(csv_present=False, manifest_present=True)
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_manifest_write_to_fail():
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertStaleContents(directory, csv_present=False, manifest_present=True)
+        self.assertFalse((directory / self.data_name).exists())
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    def test_failure_when_neither_target_exists_creates_neither(self):
+        directory = self.root / "empty-dest"
+        directory.mkdir()
+        relative, payload = self.extra_file
+        (directory / relative).write_bytes(payload)
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_manifest_write_to_fail():
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertFalse((directory / self.data_name).exists())
+        self.assertFalse((directory / "manifest.json").exists())
+        self.assertEqual((directory / relative).read_bytes(), payload)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    # ---- rename / replace failure -----------------------------------------
+
+    def patch_replace_to_fail(self, target_name):
+        real_replace = Path.replace
+
+        def failing_replace(self, target, *args, **kwargs):
+            if Path(target).name == target_name:
+                raise OSError("simulated replace failure")
+            return real_replace(self, target, *args, **kwargs)
+
+        return mock.patch.object(Path, "replace", failing_replace)
+
+    def test_csv_replace_failure_restores_everything(self):
+        directory = self.make_destination()
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_replace_to_fail(self.data_name):
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertStaleContents(directory, csv_present=True, manifest_present=True)
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    def test_manifest_replace_failure_restores_csv_and_manifest(self):
+        # The CSV replacement succeeds; the manifest's final rename fails.
+        directory = self.make_destination()
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_replace_to_fail("manifest.json"):
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertStaleContents(directory, csv_present=True, manifest_present=True)
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    def test_manifest_replace_failure_with_only_manifest_present(self):
+        directory = self.make_destination(csv_present=False, manifest_present=True)
+        before = _directory_snapshot(directory)
+        self.snapshot_workspace()
+
+        with self.patch_replace_to_fail("manifest.json"):
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+
+        self.assertEqual(_directory_snapshot(directory), before)
+        self.assertStaleContents(directory, csv_present=False, manifest_present=True)
+        self.assertFalse((directory / self.data_name).exists())
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+
+    def test_failed_export_is_retryable(self):
+        directory = self.make_destination()
+        self.snapshot_workspace()
+
+        with self.patch_manifest_write_to_fail():
+            with self.assertRaises(OSError):
+                self.catalog.export("d", 2, directory)
+        # no retry or recovery entry is required; a plain re-export just works
+        manifest = self.catalog.export("d", 2, directory)
+
+        data_bytes, manifest_bytes = self.export_bytes(directory)
+        self.assertEqual(data_bytes, self.v2)
+        self.assertEqual(json.loads(manifest_bytes), manifest)
+        self.assertUnrelatedFilesIntact(directory)
+        self.assertNoDeliveryArtifacts(directory)
+        self.assertWorkspaceUnchanged()
+        self.assertTrue(Catalog(self.root / "offline").verify_export(directory)["passed"])
 
 
 class StrictImportTest(unittest.TestCase):

@@ -1287,6 +1287,47 @@ class Catalog:
             entry = history[revision - 1]
         return entry["revision"], [dict(rule) for rule in entry["rules"]]
 
+    def _snapshot_blob(
+        self,
+        state: dict[str, Any],
+        dataset: str,
+        version: int,
+        expected_hash: str | None = None,
+    ) -> tuple[str, bytes]:
+        """Snapshot one stored version as raw bytes and verify its hash.
+
+        The blob is read in a single pass and never touched again by the
+        caller: the returned bytes are what gets hashed, parsed, and judged.
+        Replacing, rewriting, or deleting the file after this point therefore
+        cannot mix a recorded hash with records from a later file, nor leak
+        later fields into a run already in progress.
+
+        Existence and the content hash (against the catalog record and, when
+        given, the hash recorded in a previously persisted report) are all
+        checked; every error names the dataset and version involved.
+        """
+        record = self._version_record(state, dataset, version)
+        blob_path = self.workspace / record["blob"]
+        if not blob_path.exists():
+            raise ValueError(f"stored data missing for {dataset}@{version}")
+        try:
+            with blob_path.open("rb") as handle:
+                content = handle.read()
+        except FileNotFoundError as error:
+            # The file can still vanish between the existence check and the
+            # open; report it as the same named, recoverable condition.
+            raise ValueError(f"stored data missing for {dataset}@{version}") from error
+        except OSError as error:
+            raise OSError(
+                f"could not read stored data for {dataset}@{version}: {error}"
+            ) from error
+        content_hash = hashlib.sha256(content).hexdigest()
+        if content_hash != record["content_sha256"]:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        if expected_hash is not None and content_hash != expected_hash:
+            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        return content_hash, content
+
     def validate(
         self,
         dataset: str,
@@ -1299,7 +1340,6 @@ class Catalog:
         versions = state["datasets"][dataset]
         if not isinstance(version, int) or isinstance(version, bool) or version < 1 or version > len(versions):
             raise ValueError(f"unknown data version: {dataset}@{version}")
-        record = versions[version - 1]
         rule_revision, rules = self._rules_revision(state, dataset, revision)
 
         stored = state["validations"].setdefault(dataset, {})
@@ -1315,15 +1355,12 @@ class Catalog:
                 # neither returned partially nor overwritten.
                 self._reference_sides(state, dataset, version, rules, existing["report"])
             else:
-                # The stored blob hash is re-verified against both the catalog
-                # record and the stored report on every invocation even when
-                # the report itself is reused.
-                blob_path = self.workspace / record["blob"]
-                if not blob_path.exists():
-                    raise ValueError(f"stored data missing for {dataset}@{version}")
-                current_hash = _sha256(blob_path)
-                if current_hash != record["content_sha256"] or current_hash != existing["content_sha256"]:
-                    raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+                # The stored blob is re-snapshotted and re-verified against
+                # both the catalog record and the stored report on every
+                # invocation even when the report itself is reused.
+                self._snapshot_blob(
+                    state, dataset, version, existing["content_sha256"]
+                )
             return dict(existing["report"])
 
         if has_reference:
@@ -1339,31 +1376,31 @@ class Catalog:
             self._save(state)
             return dict(report)
 
-        blob_path = self.workspace / record["blob"]
-        if not blob_path.exists():
-            raise ValueError(f"stored data missing for {dataset}@{version}")
-        content_hash = _sha256(blob_path)
-        if content_hash != record["content_sha256"]:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        # Snapshot the blob once as raw bytes: the hash above, the parse, and
+        # every rule judgment below all derive from this same in-memory
+        # content, so rewriting, replacing, or deleting the stored file after
+        # this point cannot pair the recorded hash with rows from a different
+        # file or leak later fields into this run.
+        content_hash, content = self._snapshot_blob(state, dataset, version)
+        text = content.decode("utf-8")
 
         evaluator = _PlainRuleEvaluator(rules)
-        with blob_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = reader.fieldnames or []
-            for rule in rules:
-                if rule["column"] not in fieldnames:
-                    raise ValueError(
-                        f"missing column {rule['column']!r} for {dataset}@{version}"
-                    )
-            row_number = 0
-            for row in reader:
-                row_number += 1
-                # A short record reads as an empty value for its missing
-                # trailing fields; extra fields are not rule columns.
-                evaluator.scan(
-                    row_number,
-                    lambda column: row[column] if row[column] is not None else "",
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        fieldnames = reader.fieldnames or []
+        for rule in rules:
+            if rule["column"] not in fieldnames:
+                raise ValueError(
+                    f"missing column {rule['column']!r} for {dataset}@{version}"
                 )
+        row_number = 0
+        for row in reader:
+            row_number += 1
+            # A short record reads as an empty value for its missing
+            # trailing fields; extra fields are not rule columns.
+            evaluator.scan(
+                row_number,
+                lambda column: row[column] if row[column] is not None else "",
+            )
         evaluator.finish()
 
         report_results = [
@@ -1395,27 +1432,13 @@ class Catalog:
 
         Existence, the content hash (against the catalog record and, when
         given, a previously recorded hash), and the CSV structure are all
-        checked; every error names the dataset and version involved.
+        derived from a single byte snapshot; every error names the dataset
+        and version involved.
         """
-        record = self._version_record(state, dataset, version)
-        blob_path = self.workspace / record["blob"]
-        if not blob_path.exists():
-            raise ValueError(f"stored data missing for {dataset}@{version}")
-        content_hash = _sha256(blob_path)
-        if content_hash != record["content_sha256"]:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-        if expected_hash is not None and content_hash != expected_hash:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-        try:
-            header, rows = self._read_stored_csv(blob_path, dataset, version)
-        except UnicodeDecodeError as error:
-            raise ValueError(
-                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
-            ) from error
-        except csv.Error as error:
-            raise ValueError(
-                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
-            ) from error
+        content_hash, content = self._snapshot_blob(
+            state, dataset, version, expected_hash
+        )
+        header, rows = self._parse_stored_csv(content, dataset, version)
         return content_hash, header, rows
 
     def _reference_sides(
@@ -1646,10 +1669,28 @@ class Catalog:
         return normalized
 
     @staticmethod
-    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
-        with blob_path.open("r", encoding="utf-8", newline="") as handle:
-            # Blank physical lines are not data records, matching DictReader.
-            parsed = [row for row in csv.reader(handle) if row != []]
+    def _parse_stored_csv(
+        content: bytes, dataset: str, version: int
+    ) -> tuple[list[str], list[list[str]]]:
+        """Strictly parse the snapshotted bytes of a stored version.
+
+        Decoding and parsing are identical to :func:`_read_csv_records`, but
+        the error wording stays the one stored-data consumers expect. Blank
+        physical lines are not data records and a quoted newline does not
+        advance the record number.
+        """
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
+            ) from error
+        try:
+            parsed = [row for row in csv.reader(io.StringIO(text, newline="")) if row != []]
+        except csv.Error as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
+            ) from error
         if not parsed:
             raise ValueError(f"stored CSV for {dataset}@{version} has no header")
         header = parsed[0]
@@ -1666,6 +1707,12 @@ class Catalog:
                 )
             rows.append(list(record))
         return header, rows
+
+    @staticmethod
+    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
+        with blob_path.open("rb") as handle:
+            content = handle.read()
+        return Catalog._parse_stored_csv(content, dataset, version)
 
     def clean(self, dataset: str, version: int, operations: Any) -> dict[str, Any]:
         """Clean a stored version and append the result as a new immutable version.

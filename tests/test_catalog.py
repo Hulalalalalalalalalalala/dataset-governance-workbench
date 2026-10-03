@@ -990,6 +990,114 @@ class ValidationTest(unittest.TestCase):
         self.assertEqual(source.read_bytes(), before)
         self.assertEqual(len(self.catalog.list_datasets()["d"]), 1)
 
+    def test_plain_validation_reads_the_blob_once(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n2\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        blob = self.catalog.workspace / self.catalog.get("d", 1)["blob"]
+        opens = 0
+        real_open = Path.open
+
+        def counting_open(self, mode="r", *args, **kwargs):
+            nonlocal opens
+            if self == blob:
+                opens += 1
+            return real_open(self, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", counting_open):
+            self.catalog.validate("d", 1)
+        # one snapshot serves the hash, the row count, and every rule result
+        self.assertEqual(opens, 1)
+
+    def test_report_matches_hashed_content_when_blob_replaced_during_read(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n2\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        original = blob.read_bytes()
+        tampered = b"v\n999\n"  # one row, out of range
+
+        real_open = Path.open
+
+        class SwappingHandle:
+            """Return the original bytes once, swapping the on-disk file at
+            the same instant — the old window between hashing and reading."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def read(self, *args, **kwargs):
+                data = self._real.read(*args, **kwargs)
+                blob.write_bytes(tampered)
+                return data
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                self._real.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._real.__exit__(*exc)
+
+        def swapping_open(self, mode="r", *args, **kwargs):
+            real = real_open(self, mode, *args, **kwargs)
+            if self == blob and "b" in mode:
+                return SwappingHandle(real)
+            return real
+
+        try:
+            with mock.patch.object(Path, "open", swapping_open):
+                report = self.catalog.validate("d", 1)
+        finally:
+            blob.write_bytes(original)
+        # hash, row count, and violations all describe the bytes actually read
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        self.assertEqual(report["rowCount"], 2)
+        self.assertEqual(report["results"][0]["violations"], [])
+        self.assertTrue(report["passed"])
+
+    def test_run_completes_from_snapshot_when_blob_rewritten_afterwards(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n2\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        real_snapshot = self.catalog._snapshot_blob
+
+        def snapshot_then_rewrite(self, state, dataset, version, expected_hash=None):
+            result = real_snapshot(state, dataset, version, expected_hash)
+            blob.write_bytes(b"v\n999\n")
+            return result
+
+        with mock.patch.object(Catalog, "_snapshot_blob", snapshot_then_rewrite):
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["rowCount"], 2)
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        # the next call observes the change and fails the hash check
+        with self.assertRaises(ValueError):
+            self.catalog.validate("d", 1)
+
+    def test_run_completes_from_snapshot_when_blob_deleted_afterwards(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n2\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        real_snapshot = self.catalog._snapshot_blob
+
+        def snapshot_then_delete(self, state, dataset, version, expected_hash=None):
+            result = real_snapshot(state, dataset, version, expected_hash)
+            blob.unlink()
+            return result
+
+        with mock.patch.object(Catalog, "_snapshot_blob", snapshot_then_delete):
+            report = self.catalog.validate("d", 1)
+        # the missing file cannot undo a result already derived from the bytes
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["rowCount"], 2)
+        with self.assertRaises(ValueError):
+            self.catalog.validate("d", 1)
+
 
 class ReferenceRuleTest(unittest.TestCase):
     def setUp(self):
@@ -1463,6 +1571,175 @@ class ReferenceRuleTest(unittest.TestCase):
         historical = self.catalog.validate("d", 1, revision=1)
         self.assertEqual(historical["rulesRevision"], 1)
         self.assertEqual(historical["results"][0]["type"], "reference")
+
+    # ---- single-snapshot consistency --------------------------------------
+
+    def test_each_side_is_snapshotted_once(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        local_blob = self.catalog.workspace / self.catalog.get("orders", 1)["blob"]
+        ref_blob = self.catalog.workspace / self.catalog.get("客户", 2)["blob"]
+        counts = {local_blob: 0, ref_blob: 0}
+        real_open = Path.open
+
+        def counting_open(self, mode="r", *args, **kwargs):
+            if self in counts:
+                counts[self] += 1
+            return real_open(self, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", counting_open):
+            self.catalog.validate("orders", 1)
+        # one snapshot per side serves hash verification and all matching
+        self.assertEqual(counts, {local_blob: 1, ref_blob: 1})
+
+    def test_self_referenced_version_is_snapshotted_once(self):
+        self.catalog.import_csv("d", self.csv_file("a\nX\nY\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a"],
+                    "reference": {"dataset": "d", "version": 1, "columns": ["a"]},
+                }
+            ],
+        )
+        blob = self.catalog.workspace / self.catalog.get("d", 1)["blob"]
+        opens = 0
+        real_open = Path.open
+
+        def counting_open(self, mode="r", *args, **kwargs):
+            nonlocal opens
+            if self == blob:
+                opens += 1
+            return real_open(self, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", counting_open):
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(report["passed"])
+        # local and reference target are the very same content snapshot
+        self.assertEqual(opens, 1)
+
+    def test_multiple_rules_to_same_target_share_one_snapshot(self):
+        # Distinct bytes so the two datasets occupy distinct content-addressed
+        # blobs; the point under test is dedup of the same target version.
+        self.catalog.import_csv("ref", self.csv_file("a,b\nX,1\nY,2\n", "ref.csv"))
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\n", "d.csv"))
+        rule = {
+            "columns": ["a", "b"],
+            "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+        }
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "r1", "type": "reference", **rule},
+                {"id": "r2", "type": "reference", **rule},
+            ],
+        )
+        ref_blob = self.catalog.workspace / self.catalog.get("ref", 1)["blob"]
+        opens = 0
+        real_open = Path.open
+
+        def counting_open(self, mode="r", *args, **kwargs):
+            nonlocal opens
+            if self == ref_blob:
+                opens += 1
+            return real_open(self, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", counting_open):
+            self.catalog.validate("d", 1)
+        self.assertEqual(opens, 1)
+
+    def test_reference_result_uses_snapshot_when_target_rewritten_afterwards(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders",
+            self.csv_file("客户号,地区\nC1,北\nC9,北\n", "orders.csv"),
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        ref_record = self.catalog.get("客户", 2)
+        ref_blob = self.catalog.workspace / ref_record["blob"]
+        original = ref_blob.read_bytes()
+        # a replacement reference side that would make every row match
+        replacement = "编号,地区,备注\nC1,北,x\nC9,北,y\n".encode("utf-8")
+        real_snapshot = self.catalog._snapshot_blob
+
+        def snapshot_then_rewrite(self, state, dataset, version, expected_hash=None):
+            result = real_snapshot(state, dataset, version, expected_hash)
+            if (dataset, version) == ("客户", 2):
+                ref_blob.write_bytes(replacement)
+            return result
+
+        try:
+            with mock.patch.object(Catalog, "_snapshot_blob", snapshot_then_rewrite):
+                report = self.catalog.validate("orders", 1)
+        finally:
+            ref_blob.write_bytes(original)
+        # judged against the snapshotted (original) target: row 2 still violates
+        self.assertEqual(report["results"][0]["violations"], [2])
+        self.assertEqual(
+            report["results"][0]["reference"]["content_sha256"],
+            ref_record["content_sha256"],
+        )
+        self.assertFalse(report["passed"])
+
+    def test_reference_run_completes_from_snapshot_when_target_deleted_afterwards(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        ref_blob = self.catalog.workspace / self.catalog.get("客户", 2)["blob"]
+        real_snapshot = self.catalog._snapshot_blob
+
+        def snapshot_then_delete(self, state, dataset, version, expected_hash=None):
+            result = real_snapshot(state, dataset, version, expected_hash)
+            if (dataset, version) == ("客户", 2):
+                ref_blob.unlink()
+            return result
+
+        with mock.patch.object(Catalog, "_snapshot_blob", snapshot_then_delete):
+            report = self.catalog.validate("orders", 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(
+            report["results"][0]["reference"]["content_sha256"],
+            self.catalog.get("客户", 2)["content_sha256"],
+        )
+        # deletion is noticed on the next call and fails without a partial result
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+
+    def test_local_rewrite_after_snapshot_does_not_enter_reference_results(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        local_record = self.catalog.get("orders", 1)
+        local_blob = self.catalog.workspace / local_record["blob"]
+        real_snapshot = self.catalog._snapshot_blob
+
+        def snapshot_then_rewrite(self, state, dataset, version, expected_hash=None):
+            result = real_snapshot(state, dataset, version, expected_hash)
+            if (dataset, version) == ("orders", 1):
+                # replacement with an extra, later-added field and records
+                local_blob.write_text(
+                    "客户号,地区,经办人\nC1,北,me\nC9,北,you\n", encoding="utf-8"
+                )
+            return result
+
+        with mock.patch.object(Catalog, "_snapshot_blob", snapshot_then_rewrite):
+            report = self.catalog.validate("orders", 1)
+        # only the snapshotted one-row, two-column local content participated
+        self.assertEqual(report["rowCount"], 1)
+        self.assertEqual(report["content_sha256"], local_record["content_sha256"])
+        self.assertEqual(report["results"][0]["violations"], [])
+        self.assertTrue(report["passed"])
 
 
 class CleanTest(unittest.TestCase):

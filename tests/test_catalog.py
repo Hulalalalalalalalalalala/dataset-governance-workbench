@@ -2046,6 +2046,141 @@ class CleanTest(unittest.TestCase):
         blob.write_bytes(original)
         self.assertEqual(len(self.catalog.list_datasets()["people"]), 1)
 
+    def three_record_dataset(self):
+        # Records 1 and 3 share the dedup value "a"; only records 1 and 2
+        # survive and record 3 is deleted, leaving two rows.
+        self.catalog.import_csv(
+            "src",
+            self.csv_file("a,b\n1,x\n2,y\n1,z\n", "src.csv"),
+        )
+        record = self.catalog.get("src", 1)
+        blob = self.catalog.workspace / record["blob"]
+        return record, blob, blob.read_bytes()
+
+    def open_blob_once_then_mutate(self, blob, original, mutate):
+        """Build a ``Path.open`` replacement.
+
+        The first open of *blob* returns the already-obtained *original*
+        bytes and runs ``mutate`` once that read block closes — reproducing
+        the file being replaced or deleted in the window between hashing it
+        and reading its records. Any later open (or open of another path)
+        goes to the real file.
+        """
+        real_open = Path.open
+        state = {"fired": False, "mutated": False}
+
+        def opening(path, *args, **kwargs):
+            if Path(path) != blob or state["fired"]:
+                return real_open(path, *args, **kwargs)
+            state["fired"] = True
+
+            def mutate_once():
+                if not state["mutated"]:
+                    state["mutated"] = True
+                    mutate()
+
+            class Handle:
+                def __init__(self):
+                    self._buffer = io.BytesIO(original)
+
+                def read(self, *arguments):
+                    return self._buffer.read(*arguments)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    mutate_once()
+                    return False
+
+                def close(self):
+                    mutate_once()
+
+            return Handle()
+
+        return opening
+
+    def test_clean_processes_verified_snapshot_when_blob_replaced(self):
+        record, blob, original = self.three_record_dataset()
+        replacement = b"a,b\n9,q\n"
+        opening = self.open_blob_once_then_mutate(
+            blob, original, lambda: blob.write_bytes(replacement)
+        )
+        with mock.patch.object(Path, "open", opening):
+            cleaned = self.catalog.clean(
+                "src", 1, [{"type": "drop_duplicates", "columns": ["a"]}]
+            )
+
+        # The later one-record file never enters this result: dedup still ran
+        # on the verified three records, keeping the first two.
+        self.assertEqual(cleaned["version"], 2)
+        self.assertEqual(cleaned["row_count"], 2)
+        self.assertEqual(
+            (self.catalog.workspace / cleaned["blob"]).read_bytes(),
+            b"a,b\n1,x\n2,y\n",
+        )
+        self.assertEqual(cleaned["schema"], {"a": "integer", "b": "string"})
+        entry = cleaned["lineage"]
+        self.assertEqual(entry["sourceSha256"], record["content_sha256"])
+        self.assertEqual(entry["contentSha256"], cleaned["content_sha256"])
+        self.assertEqual(entry["rowCount"], 2)
+        self.assertEqual(entry["rowMapping"], [1, 2])
+        self.assertEqual(entry["steps"][0]["inputRows"], 3)
+        self.assertEqual(entry["steps"][0]["outputRows"], 2)
+        self.assertEqual(entry["steps"][0]["deletedRows"], [3])
+        # the source version is still the original three-record record
+        self.assertEqual(self.catalog.get("src", 1)["row_count"], 3)
+
+    def test_clean_succeeds_when_blob_deleted_after_verified_snapshot(self):
+        record, blob, original = self.three_record_dataset()
+        opening = self.open_blob_once_then_mutate(blob, original, blob.unlink)
+        with mock.patch.object(Path, "open", opening):
+            # The complete, verified content is already held in memory, so the
+            # later deletion is not a missing-input failure.
+            cleaned = self.catalog.clean(
+                "src", 1, [{"type": "drop_duplicates", "columns": ["a"]}]
+            )
+        self.assertEqual(cleaned["row_count"], 2)
+        self.assertEqual(cleaned["lineage"]["rowMapping"], [1, 2])
+        self.assertEqual(
+            cleaned["lineage"]["sourceSha256"], record["content_sha256"]
+        )
+
+    def test_later_clean_reverifies_current_blob_without_prior_success(self):
+        record, blob, original = self.three_record_dataset()
+        first = self.catalog.clean(
+            "src", 1, [{"type": "drop_duplicates", "columns": ["a"]}]
+        )
+        self.assertEqual(first["version"], 2)
+        # After the earlier success the source is replaced by a different,
+        # one-record file; a fresh cleaning must re-verify then-current bytes
+        # rather than reuse the previous success.
+        blob.write_bytes(b"a,b\n9,q\n")
+        with self.assertRaises(ValueError):
+            self.catalog.clean(
+                "src", 1, [{"type": "drop_duplicates", "columns": ["a"]}]
+            )
+        self.assertEqual(len(self.catalog.list_datasets()["src"]), 2)
+
+    def test_unreadable_blob_before_snapshot_raises_oserror_adds_nothing(self):
+        self.three_record_dataset()
+        record = self.catalog.get("src", 1)
+        blob = self.catalog.workspace / record["blob"]
+        real_open = Path.open
+
+        def deny_open(path, *args, **kwargs):
+            if Path(path) == blob:
+                raise PermissionError("denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", deny_open):
+            with self.assertRaises(OSError):
+                self.catalog.clean(
+                    "src", 1, [{"type": "drop_duplicates", "columns": ["a"]}]
+                )
+        self.assertEqual(len(self.catalog.list_datasets()["src"]), 1)
+        self.assertEqual(self.catalog.lineage("src", 1)["chain"], [])
+
     def test_ragged_stored_csv_rejected(self):
         legacy_import(self.catalog, "ragged", "a,b\n1,2,3\n")
         with self.assertRaises(ValueError):

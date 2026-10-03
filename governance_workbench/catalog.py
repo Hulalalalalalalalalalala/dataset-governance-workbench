@@ -1729,15 +1729,16 @@ class Catalog:
         steps_plan = self._validate_operations_payload(operations)
 
         state = self._load()
-        record = self._version_record(state, dataset, version)
-        blob_path = self.workspace / record["blob"]
-        if not blob_path.exists():
-            raise ValueError(f"stored data missing for {dataset}@{version}")
-        source_hash = _sha256(blob_path)
-        if source_hash != record["content_sha256"]:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-
-        header, rows = self._read_stored_csv(blob_path, dataset, version)
+        # Snapshot the source blob once as raw bytes before cleaning: the hash
+        # recorded in the lineage, the structural parse, the inferred schema,
+        # and every operation below all derive from this same in-memory
+        # content. Rewriting, replacing, or deleting the stored file after
+        # this point can therefore neither pair the original hash with fields
+        # or rows from a later file, nor let new records enter this result or
+        # turn a later deletion into a missing-input failure. A later run
+        # re-snapshots and re-verifies the file as it is then.
+        source_hash, content = self._snapshot_blob(state, dataset, version)
+        header, rows = self._parse_stored_csv(content, dataset, version)
 
         columns = list(header)
         origins = list(header)  # source column behind each current column

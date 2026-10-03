@@ -1729,15 +1729,14 @@ class Catalog:
         steps_plan = self._validate_operations_payload(operations)
 
         state = self._load()
-        record = self._version_record(state, dataset, version)
-        blob_path = self.workspace / record["blob"]
-        if not blob_path.exists():
-            raise ValueError(f"stored data missing for {dataset}@{version}")
-        source_hash = _sha256(blob_path)
-        if source_hash != record["content_sha256"]:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
+        # Snapshot the source once as raw bytes: the hash check against the
+        # version record and the parsed records below both derive from this
+        # same read, so replacing, rewriting, or deleting the stored file
+        # after this point can neither pair the recorded source hash with
+        # rows from a different file nor fail this run as missing input.
+        source_hash, content = self._snapshot_blob(state, dataset, version)
 
-        header, rows = self._read_stored_csv(blob_path, dataset, version)
+        header, rows = self._parse_stored_csv(content, dataset, version)
 
         columns = list(header)
         origins = list(header)  # source column behind each current column

@@ -793,6 +793,48 @@ class RulesConfigurationTest(unittest.TestCase):
         result = self.catalog.set_rules("things", [{"id": "a", "column": "id", "type": "required"}])
         self.assertEqual(result["revision"], 1)
 
+    def test_integer_bounds_keep_exact_value(self):
+        big = 9007199254740993
+        result = self.catalog.set_rules(
+            "things",
+            [{"id": "r", "column": "v", "type": "range", "min": -big, "max": big}],
+        )
+        rule = result["rules"][0]
+        self.assertIsInstance(rule["min"], int)
+        self.assertIsInstance(rule["max"], int)
+        self.assertEqual((rule["min"], rule["max"]), (-big, big))
+        # the saved revision stores the exact integers as well
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        stored = state["rules"]["things"][0]["rules"][0]
+        self.assertEqual((stored["min"], stored["max"]), (-big, big))
+        reloaded = json.loads(json.dumps(rule))
+        self.assertEqual((reloaded["min"], reloaded["max"]), (-big, big))
+
+    def test_distinct_large_integer_bounds_are_not_collapsed(self):
+        # these two integers are equal once widened to float; configuration
+        # must still reject min > max and not consume a revision number
+        with self.assertRaises(ValueError):
+            self.catalog.set_rules("things", [
+                {"id": "r", "column": "v", "type": "range",
+                 "min": 9007199254740993, "max": 9007199254740992},
+            ])
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state.get("rules", {}).get("things", []), [])
+        result = self.catalog.set_rules("things", [
+            {"id": "r", "column": "v", "type": "required"},
+        ])
+        self.assertEqual(result["revision"], 1)
+
+    def test_equal_integer_bounds_are_a_legal_closed_interval(self):
+        big = 9007199254740992
+        result = self.catalog.set_rules("things", [
+            {"id": "r", "column": "v", "type": "range", "min": big, "max": big},
+        ])
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(
+            (result["rules"][0]["min"], result["rules"][0]["max"]), (big, big)
+        )
+
     def test_works_with_legacy_workspace_state(self):
         state_path = self.catalog.state_path
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -900,6 +942,91 @@ class ValidationTest(unittest.TestCase):
         )
         report = self.catalog.validate("r", 1)
         self.assertTrue(report["passed"])
+
+    def test_range_distinguishes_integers_beyond_float_safe_range(self):
+        # 2**53 is exactly representable as a float; 2**53 + 1 is a
+        # distinct integer that float parsing rounds back down.
+        boundary = 9007199254740992
+        above = 9007199254740993
+        self.catalog.import_csv(
+            "r",
+            self.csv_file(
+                "v\n"
+                f"{boundary}\n"          # at max: passes
+                f"{above}\n"             # one over max: violates
+                f"{boundary}.0\n"        # same number, decimal form: passes
+                "9.007199254740992e15\n"  # scientific form of boundary: passes
+                "9.007199254740993e15\n"  # scientific form of above: violates
+                f"{-above}\n"            # below min when min = -boundary: violates
+                f"{-boundary}\n"         # at min: passes
+            ),
+        )
+        self.catalog.set_rules("r", [
+            {"id": "mx", "column": "v", "type": "range", "max": boundary},
+            {"id": "mn", "column": "v", "type": "range", "min": -boundary},
+            {"id": "both", "column": "v", "type": "range",
+             "min": -boundary, "max": boundary},
+        ])
+        by_id = {item["id"]: item for item in self.catalog.validate("r", 1)["results"]}
+        # max-only: only values above the max violate; the large negative passes
+        self.assertEqual(by_id["mx"]["violations"], [2, 5])
+        self.assertEqual(by_id["mx"]["violationCount"], 2)
+        # min-only: only the one value below the negative bound violates
+        self.assertEqual(by_id["mn"]["violations"], [6])
+        self.assertEqual(by_id["both"]["violations"], [2, 5, 6])
+
+    def test_range_equal_integer_bound_endpoint_forms(self):
+        big = 9007199254740993
+        self.catalog.import_csv(
+            "r",
+            self.csv_file(
+                "v\n"
+                f"{big}\n"
+                f"{big}.0\n"
+                "9.007199254740993e15\n"
+                "9.007199254740993E15\n"
+                f"{big - 1}\n"
+            ),
+        )
+        self.catalog.set_rules("r", [
+            {"id": "r", "column": "v", "type": "range", "min": big, "max": big},
+        ])
+        result = self.catalog.validate("r", 1)["results"][0]
+        # every spelling of the same integer is inside the closed interval
+        self.assertEqual(result["violations"], [5])
+        self.assertEqual(result["violationCount"], 1)
+
+    def test_range_float_bounds_keep_endpoint_inclusion(self):
+        self.catalog.import_csv(
+            "r",
+            self.csv_file("v\n0.1\n1e-1\n10.5\n1.05e1\n0.09999999999999999\n"),
+        )
+        self.catalog.set_rules("r", [
+            {"id": "r", "column": "v", "type": "range", "min": 0.1, "max": 10.5},
+        ])
+        result = self.catalog.validate("r", 1)["results"][0]
+        self.assertEqual(result["violations"], [5])
+
+    def test_range_extreme_exponents_keep_float_verdicts(self):
+        # overflowing magnitudes are still rejected as non-finite; values
+        # underflowing the float range still compare as signed zero
+        self.catalog.import_csv(
+            "r",
+            self.csv_file(
+                "v\n"
+                "1e309\n"        # row 1: overflow -> non-finite -> violates
+                "-1e400\n"       # row 2: overflow -> violates
+                "1e-400\n"       # row 3: underflow -> zero
+                "-1e-400\n"      # row 4: underflow -> negative zero
+                "0\n"            # row 5: zero
+            ),
+        )
+        self.catalog.set_rules("r", [
+            {"id": "r", "column": "v", "type": "range", "min": 0, "max": 0},
+        ])
+        result = self.catalog.validate("r", 1)["results"][0]
+        # -0.0 (underflow) equals 0 and stays inside the closed interval
+        self.assertEqual(result["violations"], [1, 2])
 
     def test_columns_match_verbatim(self):
         self.catalog.import_csv("c", self.csv_file(" id\n1\n"))
@@ -1315,6 +1442,37 @@ class ReferenceRuleTest(unittest.TestCase):
         self.assertEqual(by_id["c-ref"]["violations"], [2])
         self.assertEqual(by_id["c-required"]["violations"], [])
         self.assertFalse(report["passed"])
+
+    def test_mixed_range_large_integer_bounds_match_plain_path(self):
+        # range judgement must be exact and identical whether the revision
+        # mixes reference rules or not (both paths share one evaluator)
+        self.catalog.import_csv("ref", self.csv_file("code\nA\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d",
+            self.csv_file(
+                "c,v\nA,9007199254740992\nA,9007199254740993\nA,9.007199254740992e15\n",
+                "d.csv",
+            ),
+        )
+        rules = [
+            {"id": "v-range", "column": "v", "type": "range", "max": 9007199254740992},
+            {
+                "id": "c-ref",
+                "type": "reference",
+                "columns": ["c"],
+                "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+            },
+        ]
+        self.catalog.set_rules("d", rules)
+        mixed = self.catalog.validate("d", 1)
+        by_id = {item["id"]: item for item in mixed["results"]}
+        self.assertEqual(by_id["v-range"]["violations"], [2])
+        self.assertEqual(by_id["c-ref"]["violations"], [])
+        self.assertFalse(mixed["passed"])
+        # same data with only the range rule: identical range verdict
+        self.catalog.set_rules("d", [rules[0]])
+        plain = self.catalog.validate("d", 1, revision=2)
+        self.assertEqual(plain["results"][0]["violations"], [2])
 
     def test_cleaned_versions_work_on_either_side(self):
         self.catalog.import_csv("ref", self.csv_file("code\n A \nB\n", "ref.csv"))
@@ -2105,6 +2263,46 @@ class CliTest(unittest.TestCase):
         result = self.run_cli("verify-export", str(export_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["passed"])
+
+    def test_range_large_integer_bounds_via_cli(self):
+        (self.root / "big.csv").write_text(
+            "v\n9007199254740992\n9007199254740993\n9.007199254740992e15\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_cli("import", "d", str(self.root / "big.csv")).returncode, 0)
+
+        rules_path = self.root / "big-rules.json"
+        rules_path.write_text(json.dumps([
+            {"id": "r", "column": "v", "type": "range", "max": 9007199254740992},
+        ]), encoding="utf-8")
+        result = self.run_cli("rules", "d", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rule = json.loads(result.stdout)["rules"][0]
+        self.assertEqual(rule["max"], 9007199254740992)
+        self.assertNotIn("min", rule)
+
+        result = self.run_cli("validate", "d", "1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["results"][0]["violations"], [2])
+        self.assertEqual(report["results"][0]["violationCount"], 1)
+
+        # min > max with float-collapsible integers: error JSON on stderr,
+        # exit 2, no revision consumed
+        bad_rules = self.root / "bad-big-rules.json"
+        bad_rules.write_text(json.dumps([
+            {"id": "r", "column": "v", "type": "range",
+             "min": 9007199254740993, "max": 9007199254740992},
+        ]), encoding="utf-8")
+        result = self.run_cli("rules", "d", str(bad_rules))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(set(json.loads(result.stderr)), {"error"})
+        # the rejected configuration consumed no revision number
+        result = self.run_cli("rules", "d", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["revision"], 2)
 
     def test_error_envelope_on_stderr_only(self):
         self.run_cli("import", "d", str(self.root / "good.csv"))

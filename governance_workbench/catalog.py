@@ -11,6 +11,7 @@ import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,16 +38,53 @@ def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
 
 
-def _finite_number(value: str) -> float | None:
-    """Parse a raw CSV cell as a finite number.
+def _finite_number(value: str) -> Decimal | None:
+    """Parse a raw CSV cell as an exact finite decimal.
 
     Whitespace is never stripped, underscores and tokens such as ``inf`` or
     ``nan`` are rejected, so only literal numeric strings are accepted.
+    Values are parsed as :class:`~decimal.Decimal` rather than ``float`` so
+    that integers beyond the float-safe range (e.g. ``9007199254740993``)
+    keep their exact value when compared against the rule bounds; text
+    denoting the same number (``1``, ``1.0``, ``1e0``) yields the same
+    decimal and therefore the same verdict.
+
+    Text outside the finite-float exponent range keeps the old verdict:
+    overflowing magnitudes (e.g. ``1e309``) stay rejected as non-finite and
+    underflowing magnitudes collapse to signed zero, exactly as ``float``
+    parsed them before.
     """
     if not _NUMBER_RE.match(value):
         return None
-    number = float(value)
-    return number if math.isfinite(number) else None
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not number.is_finite():
+        return None
+    try:
+        as_float = float(number)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(as_float):
+        return None
+    if as_float == 0.0:
+        # Decimal underflow: the value used to compare as (signed) zero.
+        return Decimal("-0") if number < 0 else Decimal("0")
+    return number
+
+
+def _bound_decimal(bound: int | float) -> Decimal:
+    """Render a configured numeric bound as an exact Decimal.
+
+    Integer bounds convert exactly; float bounds convert through their
+    shortest round-trip text (the value actually written in JSON, e.g.
+    ``0.1``) rather than the underlying binary approximation, so a cell
+    spelling the same decimal as the bound stays inside an inclusive bound.
+    """
+    if _is_int(bound):
+        return Decimal(bound)
+    return Decimal(repr(bound))
 
 
 def _sha256(path: Path) -> str:
@@ -233,6 +271,17 @@ class _PlainRuleEvaluator:
         self._seen_unique: dict[str, dict[str, list[int]]] = {
             rule["id"]: {} for rule in self.rules if rule["type"] == "unique"
         }
+        # Bounds are stored exactly (int rules keep integer bounds, float
+        # rules keep float bounds); convert to Decimal for comparison so a
+        # cell is never rounded to a nearby double before the bound check.
+        self._range_bounds: dict[str, tuple[Decimal | None, Decimal | None]] = {
+            rule["id"]: (
+                _bound_decimal(rule["min"]) if "min" in rule else None,
+                _bound_decimal(rule["max"]) if "max" in rule else None,
+            )
+            for rule in self.rules
+            if rule["type"] == "range"
+        }
 
     def scan(self, row_number: int, value_of: Callable[[str], str]) -> None:
         """Evaluate one data record; ``value_of`` maps a column name to its raw text."""
@@ -249,9 +298,10 @@ class _PlainRuleEvaluator:
                 if value == "":
                     continue
                 number = _finite_number(value)
+                minimum, maximum = self._range_bounds[rule["id"]]
                 if number is None or not (
-                    ("min" not in rule or number >= rule["min"])
-                    and ("max" not in rule or number <= rule["max"])
+                    (minimum is None or number >= minimum)
+                    and (maximum is None or number <= maximum)
                 ):
                     self.violations[rule["id"]].append(row_number)
 
@@ -1189,21 +1239,26 @@ class Catalog:
             if rule_type == "range":
                 if "min" not in rule and "max" not in rule:
                     raise ValueError(f"{where} range requires min or max")
-                bounds: dict[str, float] = {}
+                bounds: dict[str, int | float] = {}
                 for key in ("min", "max"):
                     if key not in rule:
                         continue
                     bound = rule[key]
                     # bool is a subclass of int; boundaries must be finite
-                    # numbers rather than booleans.
-                    if not isinstance(bound, (int, float)) or isinstance(bound, bool):
-                        raise ValueError(f"{where}.{key} must be a finite number")
-                    bound = float(bound)
-                    if not math.isfinite(bound):
+                    # numbers rather than booleans. Integer bounds are kept
+                    # as ints (never widened to float) so values beyond the
+                    # float-safe range stay distinct.
+                    if _is_int(bound):
+                        bounds[key] = bound
+                        continue
+                    if not isinstance(bound, float) or not math.isfinite(bound):
                         raise ValueError(f"{where}.{key} must be a finite number")
                     bounds[key] = bound
-                if "min" in bounds and "max" in bounds and bounds["min"] > bounds["max"]:
-                    raise ValueError(f"{where} min must not be greater than max")
+                if "min" in bounds and "max" in bounds:
+                    # Compare via Decimal: a plain int/float ordering can
+                    # collapse distinct large integers after float widening.
+                    if _bound_decimal(bounds["min"]) > _bound_decimal(bounds["max"]):
+                        raise ValueError(f"{where} min must not be greater than max")
                 entry.update(bounds)
             elif "min" in rule or "max" in rule:
                 raise ValueError(f"{where} bounds are only valid for range rules")

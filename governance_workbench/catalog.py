@@ -12,7 +12,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _RULE_TYPES = {"required", "unique", "range", "reference"}
 _RULE_KEYS = {"id", "column", "type", "min", "max", "columns", "reference"}
@@ -175,6 +175,89 @@ def _read_csv_records(content: bytes) -> tuple[list[str], list[list[str]]]:
             )
         rows.append(record)
     return header, rows
+
+
+class _PlainRuleEvaluator:
+    """Judge the plain (non-reference) rules of a revision row by row.
+
+    This is the single implementation of required/unique/range semantics,
+    shared by both validation paths so a plain rule behaves identically
+    whether the revision contains only plain rules or mixes in reference
+    rules: ``required`` treats only the empty string as missing (a
+    whitespace-only value is present), ``unique`` skips empty strings and
+    compares the raw text, and ``range`` skips empty values and accepts
+    only finite numeric text within the inclusive bounds.
+    """
+
+    def __init__(self, rules: list[dict[str, Any]]):
+        self.rules = [rule for rule in rules if rule["type"] != "reference"]
+        self.violations: dict[str, list[int]] = {
+            rule["id"]: [] for rule in self.rules
+        }
+        self._seen_unique: dict[str, dict[str, list[int]]] = {
+            rule["id"]: {} for rule in self.rules if rule["type"] == "unique"
+        }
+
+    def scan(self, row_number: int, value_of: Callable[[str], str]) -> None:
+        """Evaluate one data record; ``value_of`` maps a column name to its raw text."""
+        for rule in self.rules:
+            value = value_of(rule["column"])
+            rule_type = rule["type"]
+            if rule_type == "required":
+                if value == "":
+                    self.violations[rule["id"]].append(row_number)
+            elif rule_type == "unique":
+                if value != "":
+                    self._seen_unique[rule["id"]].setdefault(value, []).append(row_number)
+            else:  # range
+                if value == "":
+                    continue
+                number = _finite_number(value)
+                if number is None or not (
+                    ("min" not in rule or number >= rule["min"])
+                    and ("max" not in rule or number <= rule["max"])
+                ):
+                    self.violations[rule["id"]].append(row_number)
+
+    def finish(self) -> None:
+        """Resolve unique groups: every record of a duplicated value violates,
+        including the first occurrence, in ascending record order."""
+        for rule_id, groups in self._seen_unique.items():
+            self.violations[rule_id] = sorted(
+                line for lines in groups.values() if len(lines) > 1 for line in lines
+            )
+
+
+def _plain_report_entry(rule: dict[str, Any], violations: list[int]) -> dict[str, Any]:
+    """Build the report entry for one plain (non-reference) rule."""
+    return {
+        "id": rule["id"],
+        "column": rule["column"],
+        "type": rule["type"],
+        "violations": violations,
+        "violationCount": len(violations),
+    }
+
+
+def _validation_report(
+    dataset: str,
+    version: int,
+    content_hash: str,
+    rule_revision: int,
+    row_count: int,
+    report_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble a validation report; it passes only when no rule has violations."""
+    total_violations = sum(item["violationCount"] for item in report_results)
+    return {
+        "dataset": dataset,
+        "version": version,
+        "content_sha256": content_hash,
+        "rulesRevision": rule_revision,
+        "rowCount": row_count,
+        "passed": total_violations == 0,
+        "results": report_results,
+    }
 
 
 @dataclass(frozen=True)
@@ -1213,6 +1296,7 @@ class Catalog:
         if content_hash != record["content_sha256"]:
             raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
 
+        evaluator = _PlainRuleEvaluator(rules)
         with blob_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             fieldnames = reader.fieldnames or []
@@ -1221,66 +1305,24 @@ class Catalog:
                     raise ValueError(
                         f"missing column {rule['column']!r} for {dataset}@{version}"
                     )
-            results: dict[str, dict[str, Any]] = {
-                rule["id"]: {"rule": rule, "violations": []} for rule in rules
-            }
-            seen_unique: dict[str, dict[str, list[int]]] = {
-                rule["id"]: {} for rule in rules if rule["type"] == "unique"
-            }
             row_number = 0
             for row in reader:
                 row_number += 1
-                for rule in rules:
-                    value = row[rule["column"]]
-                    if value is None:
-                        value = ""
-                    result = results[rule["id"]]
-                    rule_type = rule["type"]
-                    if rule_type == "required":
-                        if value == "":
-                            result["violations"].append(row_number)
-                    elif rule_type == "unique":
-                        if value != "":
-                            seen_unique[rule["id"]].setdefault(value, []).append(row_number)
-                    else:
-                        if value == "":
-                            continue
-                        number = _finite_number(value)
-                        if number is None or not (
-                            ("min" not in rule or number >= rule["min"])
-                            and ("max" not in rule or number <= rule["max"])
-                        ):
-                            result["violations"].append(row_number)
+                # A short record reads as an empty value for its missing
+                # trailing fields; extra fields are not rule columns.
+                evaluator.scan(
+                    row_number,
+                    lambda column: row[column] if row[column] is not None else "",
+                )
+        evaluator.finish()
 
-        for rule_id, groups in seen_unique.items():
-            duplicates = sorted(
-                line for lines in groups.values() if len(lines) > 1 for line in lines
-            )
-            results[rule_id]["violations"] = duplicates
-
-        report_results = []
-        for rule in rules:
-            result = results[rule["id"]]
-            violations = result["violations"]
-            report_results.append(
-                {
-                    "id": rule["id"],
-                    "column": rule["column"],
-                    "type": rule["type"],
-                    "violations": violations,
-                    "violationCount": len(violations),
-                }
-            )
-        total_violations = sum(item["violationCount"] for item in report_results)
-        report = {
-            "dataset": dataset,
-            "version": version,
-            "content_sha256": content_hash,
-            "rulesRevision": rule_revision,
-            "rowCount": row_number,
-            "passed": total_violations == 0,
-            "results": report_results,
-        }
+        report_results = [
+            _plain_report_entry(rule, evaluator.violations[rule["id"]])
+            for rule in rules
+        ]
+        report = _validation_report(
+            dataset, version, content_hash, rule_revision, row_number, report_results
+        )
 
         # Persist only after the full report is built; a write failure discards
         # this report instead of leaving a partial entry behind.
@@ -1441,58 +1483,39 @@ class Catalog:
                 combinations.add(combination)
             combination_sets[rule["id"]] = combinations
 
-        column_positions = {
-            rule["id"]: [
-                header.index(name)
-                for name in (
-                    rule["columns"] if rule["type"] == "reference" else [rule["column"]]
-                )
-            ]
+        reference_positions = {
+            rule["id"]: [header.index(name) for name in rule["columns"]]
             for rule in rules
+            if rule["type"] == "reference"
         }
-        violations_by_id: dict[str, list[int]] = {rule["id"]: [] for rule in rules}
-        seen_unique: dict[str, dict[str, list[int]]] = {
-            rule["id"]: {} for rule in rules if rule["type"] == "unique"
+        plain_positions = {
+            rule["column"]: header.index(rule["column"])
+            for rule in rules
+            if rule["type"] != "reference"
+        }
+        evaluator = _PlainRuleEvaluator(rules)
+        reference_violations: dict[str, list[int]] = {
+            rule["id"]: [] for rule in rules if rule["type"] == "reference"
         }
         for row_number, row in enumerate(rows, start=1):
+            evaluator.scan(row_number, lambda column: row[plain_positions[column]])
             for rule in rules:
-                rule_type = rule["type"]
-                positions = column_positions[rule["id"]]
-                violations = violations_by_id[rule["id"]]
-                if rule_type == "required":
-                    if row[positions[0]] == "":
-                        violations.append(row_number)
-                elif rule_type == "unique":
-                    value = row[positions[0]]
-                    if value != "":
-                        seen_unique[rule["id"]].setdefault(value, []).append(row_number)
-                elif rule_type == "range":
-                    value = row[positions[0]]
-                    if value == "":
-                        continue
-                    number = _finite_number(value)
-                    if number is None or not (
-                        ("min" not in rule or number >= rule["min"])
-                        and ("max" not in rule or number <= rule["max"])
-                    ):
-                        violations.append(row_number)
-                else:  # reference
-                    combination = tuple(row[position] for position in positions)
-                    if (
-                        any(part == "" for part in combination)
-                        or combination not in combination_sets[rule["id"]]
-                    ):
-                        violations.append(row_number)
-
-        for rule_id, groups in seen_unique.items():
-            violations_by_id[rule_id] = sorted(
-                line for lines in groups.values() if len(lines) > 1 for line in lines
-            )
+                if rule["type"] != "reference":
+                    continue
+                combination = tuple(
+                    row[position] for position in reference_positions[rule["id"]]
+                )
+                if (
+                    any(part == "" for part in combination)
+                    or combination not in combination_sets[rule["id"]]
+                ):
+                    reference_violations[rule["id"]].append(row_number)
+        evaluator.finish()
 
         report_results = []
         for rule in rules:
-            violations = violations_by_id[rule["id"]]
             if rule["type"] == "reference":
+                violations = reference_violations[rule["id"]]
                 reference = rule["reference"]
                 key = (reference["dataset"], reference["version"])
                 report_results.append(
@@ -1512,24 +1535,11 @@ class Catalog:
                 )
             else:
                 report_results.append(
-                    {
-                        "id": rule["id"],
-                        "column": rule["column"],
-                        "type": rule["type"],
-                        "violations": violations,
-                        "violationCount": len(violations),
-                    }
+                    _plain_report_entry(rule, evaluator.violations[rule["id"]])
                 )
-        total_violations = sum(item["violationCount"] for item in report_results)
-        report = {
-            "dataset": dataset,
-            "version": version,
-            "content_sha256": content_hash,
-            "rulesRevision": rule_revision,
-            "rowCount": len(rows),
-            "passed": total_violations == 0,
-            "results": report_results,
-        }
+        report = _validation_report(
+            dataset, version, content_hash, rule_revision, len(rows), report_results
+        )
         return report, content_hash
 
     def validation_history(self, dataset: str, version: int) -> list[dict[str, Any]]:

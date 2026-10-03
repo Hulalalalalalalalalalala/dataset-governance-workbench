@@ -2,6 +2,7 @@ import csv as csv_module
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,198 @@ class CatalogTest(unittest.TestCase):
         on_disk = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
         self.assertEqual(manifest["record"]["content_sha256"], record.content_sha256)
+
+
+class ExportDeliveryTest(unittest.TestCase):
+    """Regression tests for atomic delivery of the CSV + manifest pair.
+
+    Exporting into a directory that already holds files must replace exactly
+    the two delivered files on success, and restore the directory to its
+    prior state when any file operation fails mid-delivery.
+    """
+
+    CONTENTS = 'id,name,note\r\n1,"Ada, A.","line one\nline two"\r\n2,"Bo""b",plain\r\n'
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.catalog = Catalog(self.root / "workspace")
+        source = self.root / "events.csv"
+        source.write_text(self.CONTENTS, encoding="utf-8", newline="")
+        self.record = self.catalog.import_csv("events", source)
+        self.stored_bytes = (
+            self.catalog.workspace / self.record.blob
+        ).read_bytes()
+        self.destination = self.root / "export"
+        self.destination.mkdir()
+        self.data_path = self.destination / "events-v1.csv"
+        self.manifest_path = self.destination / "manifest.json"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def workspace_snapshot(self):
+        control = self.catalog.control
+        return {
+            str(path.relative_to(control)): path.read_bytes()
+            for path in sorted(control.rglob("*"))
+            if path.is_file()
+        }
+
+    def directory_snapshot(self):
+        return {
+            path.name: path.read_bytes() for path in self.destination.iterdir()
+        }
+
+    def fail_manifest_temp_write(self):
+        # The CSV temporary file is written and renamed into place first;
+        # failing the manifest temporary write leaves the delivery exactly
+        # in the "new CSV, old manifest" window that must be rolled back.
+        real_mkstemp = tempfile.mkstemp
+
+        def failing_mkstemp(suffix=None, prefix=None, dir=None, text=False):
+            if suffix == ".tmp" and prefix and "manifest.json" in prefix:
+                raise OSError("disk full")
+            return real_mkstemp(suffix=suffix, prefix=prefix, dir=dir, text=text)
+
+        return mock.patch.object(tempfile, "mkstemp", failing_mkstemp)
+
+    # ---- success over an occupied directory -------------------------------
+
+    def test_success_replaces_only_the_two_delivered_files(self):
+        old_csv = b"old,content\r\n9,zzz\r\n"
+        old_manifest = b'{"schemaVersion": 1, "file": "events-v1.csv", "stale": true}\n'
+        self.data_path.write_bytes(old_csv)
+        self.manifest_path.write_bytes(old_manifest)
+        unrelated = self.destination / "notes.txt"
+        unrelated.write_bytes(b"keep me\n")
+        # the pre-existing files genuinely differ from this delivery
+        self.assertNotEqual(old_csv, self.stored_bytes)
+        workspace_before = self.workspace_snapshot()
+
+        manifest = self.catalog.export("events", 1, self.destination)
+
+        # the CSV is the stored version's bytes exactly: CRLF, quoting and
+        # the embedded newline survive unrewritten
+        self.assertEqual(self.data_path.read_bytes(), self.stored_bytes)
+        self.assertIn(b"\r\n", self.data_path.read_bytes())
+        # the returned manifest matches the JSON on disk and points at this
+        # version's data file and record
+        on_disk = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk, manifest)
+        self.assertEqual(manifest["file"], "events-v1.csv")
+        self.assertEqual(manifest["record"]["version"], 1)
+        self.assertEqual(
+            manifest["record"]["content_sha256"], self.record.content_sha256
+        )
+        # unrelated files keep name and content; no temporary or backup
+        # files from the delivery remain
+        self.assertEqual(
+            self.directory_snapshot(),
+            {
+                "events-v1.csv": self.stored_bytes,
+                "manifest.json": self.manifest_path.read_bytes(),
+                "notes.txt": b"keep me\n",
+            },
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.destination.iterdir()),
+            ["events-v1.csv", "manifest.json", "notes.txt"],
+        )
+        # the workspace (version records and stored blobs) is untouched
+        self.assertEqual(self.workspace_snapshot(), workspace_before)
+
+    # ---- failure after the CSV is already in place -------------------------
+
+    def test_failed_manifest_delivery_restores_both_originals(self):
+        old_csv = b"previous,export\r\n1,x\r\n"
+        old_manifest = b'{"schemaVersion": 1, "old": true}\n'
+        self.data_path.write_bytes(old_csv)
+        self.manifest_path.write_bytes(old_manifest)
+        unrelated = self.destination / "notes.txt"
+        unrelated.write_bytes(b"keep me\n")
+        workspace_before = self.workspace_snapshot()
+
+        with self.fail_manifest_temp_write():
+            with self.assertRaises(OSError):
+                self.catalog.export("events", 1, self.destination)
+
+        # no new CSV next to the old manifest: both originals are restored
+        # byte-for-byte and the unrelated file is intact
+        self.assertEqual(
+            self.directory_snapshot(),
+            {
+                "events-v1.csv": old_csv,
+                "manifest.json": old_manifest,
+                "notes.txt": b"keep me\n",
+            },
+        )
+        self.assertEqual(self.workspace_snapshot(), workspace_before)
+        # the failure is not sticky: a retry delivers cleanly
+        manifest = self.catalog.export("events", 1, self.destination)
+        self.assertEqual(self.data_path.read_bytes(), self.stored_bytes)
+        self.assertEqual(
+            json.loads(self.manifest_path.read_text(encoding="utf-8")), manifest
+        )
+
+    def test_failed_delivery_with_only_preexisting_manifest(self):
+        # only the manifest exists beforehand; the failed delivery must not
+        # leave half an export behind
+        old_manifest = b'{"schemaVersion": 1, "old": true}\n'
+        self.manifest_path.write_bytes(old_manifest)
+        workspace_before = self.workspace_snapshot()
+
+        with self.fail_manifest_temp_write():
+            with self.assertRaises(OSError):
+                self.catalog.export("events", 1, self.destination)
+
+        self.assertEqual(self.manifest_path.read_bytes(), old_manifest)
+        self.assertFalse(self.data_path.exists())
+        self.assertEqual(
+            self.directory_snapshot(), {"manifest.json": old_manifest}
+        )
+        self.assertEqual(self.workspace_snapshot(), workspace_before)
+
+    def test_failed_delivery_into_empty_directory_leaves_nothing(self):
+        workspace_before = self.workspace_snapshot()
+        real_mkstemp = tempfile.mkstemp
+
+        def fail_csv_temp(suffix=None, prefix=None, dir=None, text=False):
+            if suffix == ".tmp" and prefix and "events-v1.csv" in prefix:
+                raise OSError("disk full")
+            return real_mkstemp(suffix=suffix, prefix=prefix, dir=dir, text=text)
+
+        with mock.patch.object(tempfile, "mkstemp", fail_csv_temp):
+            with self.assertRaises(OSError):
+                self.catalog.export("events", 1, self.destination)
+
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(self.workspace_snapshot(), workspace_before)
+
+    def test_failed_backup_replace_restores_originals(self):
+        # a failure while renaming the old manifest aside (after the old CSV
+        # was already moved to its backup) must still restore everything
+        old_csv = b"previous,export\r\n1,x\r\n"
+        old_manifest = b'{"schemaVersion": 1, "old": true}\n'
+        self.data_path.write_bytes(old_csv)
+        self.manifest_path.write_bytes(old_manifest)
+        workspace_before = self.workspace_snapshot()
+        real_replace = os.replace
+
+        def fail_manifest_backup(source, target):
+            if str(target).endswith(".bak") and "manifest.json" in str(target):
+                raise OSError("cannot replace")
+            return real_replace(source, target)
+
+        with mock.patch.object(os, "replace", fail_manifest_backup):
+            with self.assertRaises(OSError):
+                self.catalog.export("events", 1, self.destination)
+
+        self.assertEqual(
+            self.directory_snapshot(),
+            {"events-v1.csv": old_csv, "manifest.json": old_manifest},
+        )
+        self.assertEqual(self.workspace_snapshot(), workspace_before)
 
 
 class StrictImportTest(unittest.TestCase):

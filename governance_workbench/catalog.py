@@ -1154,6 +1154,64 @@ class Catalog:
             entry = history[revision - 1]
         return entry["revision"], [dict(rule) for rule in entry["rules"]]
 
+    @staticmethod
+    def _plain_rule_violations(
+        rules: list[dict[str, Any]],
+        header: list[str],
+        rows: list[list[str]],
+    ) -> dict[str, list[int]]:
+        """Evaluate required/unique/range rules over raw string records.
+
+        This is the single implementation of the plain rule types, shared by
+        validations with and without reference rules so a plain rule's
+        violations never depend on the rule combination: required treats only
+        the empty string as missing (whitespace-only values are filled),
+        unique skips empty strings and compares the raw text, listing every
+        record of a duplicate group in ascending record order, and range
+        skips empty values, accepts only finite numeric text, and includes
+        both bounds. Values are never trimmed or converted before judging.
+        """
+        positions = {rule["id"]: header.index(rule["column"]) for rule in rules}
+        violations: dict[str, list[int]] = {rule["id"]: [] for rule in rules}
+        seen_unique: dict[str, dict[str, list[int]]] = {
+            rule["id"]: {} for rule in rules if rule["type"] == "unique"
+        }
+        for row_number, row in enumerate(rows, start=1):
+            for rule in rules:
+                value = row[positions[rule["id"]]]
+                rule_type = rule["type"]
+                if rule_type == "required":
+                    if value == "":
+                        violations[rule["id"]].append(row_number)
+                elif rule_type == "unique":
+                    if value != "":
+                        seen_unique[rule["id"]].setdefault(value, []).append(row_number)
+                else:  # range
+                    if value == "":
+                        continue
+                    number = _finite_number(value)
+                    if number is None or not (
+                        ("min" not in rule or number >= rule["min"])
+                        and ("max" not in rule or number <= rule["max"])
+                    ):
+                        violations[rule["id"]].append(row_number)
+        for rule_id, groups in seen_unique.items():
+            violations[rule_id] = sorted(
+                line for lines in groups.values() if len(lines) > 1 for line in lines
+            )
+        return violations
+
+    @staticmethod
+    def _plain_rule_result(rule: dict[str, Any], violations: list[int]) -> dict[str, Any]:
+        """Build the report entry for one required/unique/range rule."""
+        return {
+            "id": rule["id"],
+            "column": rule["column"],
+            "type": rule["type"],
+            "violations": violations,
+            "violationCount": len(violations),
+        }
+
     def validate(
         self,
         dataset: str,
@@ -1221,63 +1279,23 @@ class Catalog:
                     raise ValueError(
                         f"missing column {rule['column']!r} for {dataset}@{version}"
                     )
-            results: dict[str, dict[str, Any]] = {
-                rule["id"]: {"rule": rule, "violations": []} for rule in rules
-            }
-            seen_unique: dict[str, dict[str, list[int]]] = {
-                rule["id"]: {} for rule in rules if rule["type"] == "unique"
-            }
-            row_number = 0
-            for row in reader:
-                row_number += 1
-                for rule in rules:
-                    value = row[rule["column"]]
-                    if value is None:
-                        value = ""
-                    result = results[rule["id"]]
-                    rule_type = rule["type"]
-                    if rule_type == "required":
-                        if value == "":
-                            result["violations"].append(row_number)
-                    elif rule_type == "unique":
-                        if value != "":
-                            seen_unique[rule["id"]].setdefault(value, []).append(row_number)
-                    else:
-                        if value == "":
-                            continue
-                        number = _finite_number(value)
-                        if number is None or not (
-                            ("min" not in rule or number >= rule["min"])
-                            and ("max" not in rule or number <= rule["max"])
-                        ):
-                            result["violations"].append(row_number)
+            rows = [
+                [row[name] if row[name] is not None else "" for name in fieldnames]
+                for row in reader
+            ]
 
-        for rule_id, groups in seen_unique.items():
-            duplicates = sorted(
-                line for lines in groups.values() if len(lines) > 1 for line in lines
-            )
-            results[rule_id]["violations"] = duplicates
-
-        report_results = []
-        for rule in rules:
-            result = results[rule["id"]]
-            violations = result["violations"]
-            report_results.append(
-                {
-                    "id": rule["id"],
-                    "column": rule["column"],
-                    "type": rule["type"],
-                    "violations": violations,
-                    "violationCount": len(violations),
-                }
-            )
+        violations_by_id = self._plain_rule_violations(rules, fieldnames, rows)
+        report_results = [
+            self._plain_rule_result(rule, violations_by_id[rule["id"]])
+            for rule in rules
+        ]
         total_violations = sum(item["violationCount"] for item in report_results)
         report = {
             "dataset": dataset,
             "version": version,
             "content_sha256": content_hash,
             "rulesRevision": rule_revision,
-            "rowCount": row_number,
+            "rowCount": len(rows),
             "passed": total_violations == 0,
             "results": report_results,
         }
@@ -1441,53 +1459,30 @@ class Catalog:
                 combinations.add(combination)
             combination_sets[rule["id"]] = combinations
 
-        column_positions = {
-            rule["id"]: [
-                header.index(name)
-                for name in (
-                    rule["columns"] if rule["type"] == "reference" else [rule["column"]]
-                )
-            ]
+        # Plain rules go through the same evaluation as a reference-free
+        # validation, so interleaving reference rules never changes their
+        # violations; reference rules keep their own raw-string combination
+        # matching below.
+        plain_rules = [rule for rule in rules if rule["type"] != "reference"]
+        violations_by_id = self._plain_rule_violations(plain_rules, header, rows)
+        reference_positions = {
+            rule["id"]: [header.index(name) for name in rule["columns"]]
             for rule in rules
+            if rule["type"] == "reference"
         }
-        violations_by_id: dict[str, list[int]] = {rule["id"]: [] for rule in rules}
-        seen_unique: dict[str, dict[str, list[int]]] = {
-            rule["id"]: {} for rule in rules if rule["type"] == "unique"
-        }
+        for rule_id in reference_positions:
+            violations_by_id[rule_id] = []
         for row_number, row in enumerate(rows, start=1):
             for rule in rules:
-                rule_type = rule["type"]
-                positions = column_positions[rule["id"]]
-                violations = violations_by_id[rule["id"]]
-                if rule_type == "required":
-                    if row[positions[0]] == "":
-                        violations.append(row_number)
-                elif rule_type == "unique":
-                    value = row[positions[0]]
-                    if value != "":
-                        seen_unique[rule["id"]].setdefault(value, []).append(row_number)
-                elif rule_type == "range":
-                    value = row[positions[0]]
-                    if value == "":
-                        continue
-                    number = _finite_number(value)
-                    if number is None or not (
-                        ("min" not in rule or number >= rule["min"])
-                        and ("max" not in rule or number <= rule["max"])
-                    ):
-                        violations.append(row_number)
-                else:  # reference
-                    combination = tuple(row[position] for position in positions)
-                    if (
-                        any(part == "" for part in combination)
-                        or combination not in combination_sets[rule["id"]]
-                    ):
-                        violations.append(row_number)
-
-        for rule_id, groups in seen_unique.items():
-            violations_by_id[rule_id] = sorted(
-                line for lines in groups.values() if len(lines) > 1 for line in lines
-            )
+                if rule["type"] != "reference":
+                    continue
+                positions = reference_positions[rule["id"]]
+                combination = tuple(row[position] for position in positions)
+                if (
+                    any(part == "" for part in combination)
+                    or combination not in combination_sets[rule["id"]]
+                ):
+                    violations_by_id[rule["id"]].append(row_number)
 
         report_results = []
         for rule in rules:
@@ -1511,15 +1506,7 @@ class Catalog:
                     }
                 )
             else:
-                report_results.append(
-                    {
-                        "id": rule["id"],
-                        "column": rule["column"],
-                        "type": rule["type"],
-                        "violations": violations,
-                        "violationCount": len(violations),
-                    }
-                )
+                report_results.append(self._plain_rule_result(rule, violations))
         total_violations = sum(item["violationCount"] for item in report_results)
         report = {
             "dataset": dataset,

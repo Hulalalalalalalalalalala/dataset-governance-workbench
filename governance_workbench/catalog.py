@@ -11,6 +11,7 @@ import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,16 +38,27 @@ def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
 
 
-def _finite_number(value: str) -> float | None:
+def _finite_number(value: str) -> int | float | None:
     """Parse a raw CSV cell as a finite number.
 
     Whitespace is never stripped, underscores and tokens such as ``inf`` or
-    ``nan`` are rejected, so only literal numeric strings are accepted.
+    ``nan`` are rejected, so only literal numeric strings are accepted. Text
+    that denotes an integer — whether written as plain digits or in an
+    equivalent decimal or scientific form such as ``9007199254740992.0`` or
+    ``9.007199254740992e15`` — is returned as an exact ``int`` so integers
+    beyond the float53 range are not rounded into a neighbouring value;
+    anything else is returned as a ``float``. Text whose magnitude overflows
+    a float is still rejected as non-finite.
     """
     if not _NUMBER_RE.match(value):
         return None
     number = float(value)
-    return number if math.isfinite(number) else None
+    if not math.isfinite(number):
+        return None
+    exact = Decimal(value)
+    if exact == exact.to_integral_value():
+        return int(exact)
+    return number
 
 
 def _sha256(path: Path) -> str:
@@ -1189,7 +1201,7 @@ class Catalog:
             if rule_type == "range":
                 if "min" not in rule and "max" not in rule:
                     raise ValueError(f"{where} range requires min or max")
-                bounds: dict[str, float] = {}
+                bounds: dict[str, int | float] = {}
                 for key in ("min", "max"):
                     if key not in rule:
                         continue
@@ -1198,9 +1210,11 @@ class Catalog:
                     # numbers rather than booleans.
                     if not isinstance(bound, (int, float)) or isinstance(bound, bool):
                         raise ValueError(f"{where}.{key} must be a finite number")
-                    bound = float(bound)
-                    if not math.isfinite(bound):
+                    if isinstance(bound, float) and not math.isfinite(bound):
                         raise ValueError(f"{where}.{key} must be a finite number")
+                    # Integers keep their exact value; rounding them to a
+                    # float would silently move the boundary for values
+                    # beyond the float53 range.
                     bounds[key] = bound
                 if "min" in bounds and "max" in bounds and bounds["min"] > bounds["max"]:
                     raise ValueError(f"{where} min must not be greater than max")

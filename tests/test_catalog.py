@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1562,6 +1563,108 @@ class CleanTest(unittest.TestCase):
         entry = result["lineage"]
         self.assertEqual(entry["steps"][0]["modifiedRows"], [2])
         self.assertEqual(entry["rowMapping"], [1, 2])
+
+    def test_bare_carriage_return_in_field_survives_noop_clean(self):
+        # A field whose value contains a lone carriage return (not \r\n) is
+        # legal on import; a content-preserving clean must write it back
+        # quoted so it is not emitted as a record boundary.
+        self.catalog.import_csv(
+            "cr",
+            self.csv_file('id,说明\r\n1,"甲\r乙"\r\n', "cr.csv"),
+        )
+        result = self.catalog.clean("cr", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(result["row_count"], 1)
+        self.assertEqual(result["lineage"]["rowMapping"], [1])
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "说明"])
+        self.assertEqual(rows, [["1", "甲\r乙"]])
+        # the carriage return is preserved verbatim inside a quoted field
+        self.assertEqual(stored, 'id,说明\n1,"甲\r乙"\n'.encode("utf-8"))
+
+    def test_bare_carriage_return_round_trips_through_compare_export_verify(self):
+        self.catalog.import_csv(
+            "cr",
+            self.csv_file('id,说明\n1,"甲\r乙"\n', "cr.csv"),
+        )
+        cleaned = self.catalog.clean("cr", 1, [{"type": "trim", "column": "id"}])
+        diff = self.catalog.compare("cr", 1, cleaned["version"], ["id"])["rowDiff"]
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+        self.assertEqual(diff["modified"], [])
+        self.assertEqual(diff["unchangedCount"], 1)
+        destination = self.root / "out"
+        self.catalog.export("cr", cleaned["version"], destination)
+        report = self.catalog.verify_export(destination)
+        self.assertTrue(report["passed"], report["issues"])
+
+    def test_bare_carriage_return_in_renamed_header_survives(self):
+        self.catalog.import_csv(
+            "cr",
+            self.csv_file('id,说明\n1,"甲\r乙"\n', "cr.csv"),
+        )
+        result = self.catalog.clean(
+            "cr", 1, [{"type": "rename", "column": "说明", "to": "b\rc"}]
+        )
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "b\rc"])
+        self.assertEqual(rows, [["1", "甲\r乙"]])
+        self.assertEqual(result["schema"], {"id": "integer", "b\rc": "string"})
+        self.assertEqual(result["lineage"]["columnMapping"], {"id": "id", "b\rc": "说明"})
+
+    def test_header_with_bare_carriage_return_and_zero_rows_stays_empty(self):
+        self.catalog.import_csv(
+            "crh",
+            self.csv_file('id,"a\rb"\n', "crh.csv"),
+        )
+        result = self.catalog.clean("crh", 1, [{"type": "trim", "column": "id"}])
+        self.assertEqual(result["row_count"], 0)
+        self.assertEqual(result["lineage"]["rowMapping"], [])
+        self.assertEqual(result["schema"], {"id": "null", "a\rb": "null"})
+        stored = (self.catalog.workspace / result["blob"]).read_bytes()
+        header, rows = _read_csv_records(stored)
+        self.assertEqual(header, ["id", "a\rb"])
+        self.assertEqual(rows, [])
+
+    def test_csv_serializer_quotes_bare_carriage_return_everywhere(self):
+        from governance_workbench.catalog import _write_csv_table
+
+        # A bare CR in any cell or header position must be emitted quoted so
+        # the reader cannot take it for a record boundary, and the table must
+        # parse back to exactly what was serialized.
+        tables = [
+            [["id", "甲\r乙"], ["1", "甲\r乙"]],
+            [["a\rb"]],
+            [["a\r", "b"], ["1", "2"]],
+            [["a", "b"], ["1", "\r"]],
+            [["a", "b"], ["1", "甲\r\n乙"]],
+        ]
+        for table in tables:
+            text = _write_csv_table(table)
+            # Every carriage return must live inside a quoted field; strip the
+            # quoted spans and confirm no bare CR remains as a record boundary.
+            bare = re.sub(r'"(?:""|[^"])*"', "", text)
+            self.assertNotIn("\r", bare)
+            parsed = [row for row in csv_module.reader(io.StringIO(text, newline="")) if row != []]
+            self.assertEqual(parsed, table)
+
+    def test_csv_serializer_matches_writer_for_values_without_bare_cr(self):
+        from governance_workbench.catalog import _write_csv_table
+
+        # Comma, quote, newline, CRLF and empty-field handling must keep the
+        # exact pre-existing bytes; only the bare-CR guarantee is new.
+        table = [
+            ["id", "name", "note", "empty"],
+            ["1", 'Ann "Q"', "line one\nline two", ""],
+            ["2", "Bob, Jr.", "a\r\nb", ""],
+            [""],
+        ]
+        buffer = io.StringIO()
+        writer = csv_module.writer(buffer, lineterminator="\n")
+        for row in table:
+            writer.writerow(row)
+        self.assertEqual(_write_csv_table(table), buffer.getvalue())
 
     def test_dedup_uses_raw_strings_and_empty_strings_participate(self):
         self.catalog.import_csv("raw", self.csv_file("a,b\n1,\n01,\n1,\n", "raw.csv"))

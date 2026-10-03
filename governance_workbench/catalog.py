@@ -123,6 +123,42 @@ def _ends_inside_quote(text: str) -> bool:
     return state == in_quoted
 
 
+def _quote_csv_field(value: str, *, single_column: bool) -> str:
+    """Quote *value* using the minimal RFC 4180 quoting the writers use.
+
+    A field is quoted when it carries the delimiter, the quote character, or
+    any line-boundary character. Both ``\\n`` and a bare ``\\r`` must be
+    quoted: the reader treats an unquoted carriage return as a record
+    boundary, so emitting a field-internal ``\\r`` bare would corrupt the
+    result into an extra (ragged) record even though cleaning reported
+    success. A lone empty field in a single-column record is quoted so it is
+    not read back as a blank physical line.
+    """
+    if (single_column and value == "") or any(
+        char in (",", '"', "\r", "\n") for char in value
+    ):
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
+def _write_csv_table(rows: list[list[str]]) -> str:
+    """Serialize a header-then-records table to deterministic CSV text.
+
+    The output byte-for-byte matches ``csv.writer(..., lineterminator="\\n")``
+    for every value that writer already handled (commas, quotes, newlines,
+    CRLF, empty fields), but quoting a bare ``\\r`` is guaranteed here rather
+    than left to the writer implementation, so a carriage return inside a
+    field or header name can never be written as a record boundary.
+    """
+    return "".join(
+        ",".join(
+            _quote_csv_field(value, single_column=len(row) == 1) for value in row
+        )
+        + "\n"
+        for row in rows
+    )
+
+
 def _read_csv_records(content: bytes) -> tuple[list[str], list[list[str]]]:
     """Strictly parse CSV bytes into a header list and data records.
 
@@ -1695,12 +1731,10 @@ class Catalog:
             steps.append(step)
 
         # Deterministic serialization: identical source and operations always
-        # produce identical CSV bytes.
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(columns)
-        writer.writerows(rows)
-        content = buffer.getvalue().encode("utf-8")
+        # produce identical CSV bytes. Quoting is explicit so a carriage
+        # return inside a field or renamed header is always quoted and can
+        # never be written out as a record boundary.
+        content = _write_csv_table([columns, *rows]).encode("utf-8")
         content_hash = hashlib.sha256(content).hexdigest()
         # The result blob is stored with the same integrity rules as an
         # import: an existing file is reused only after its bytes verify

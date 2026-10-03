@@ -101,6 +101,38 @@ def legacy_import(catalog: Catalog, dataset: str, contents: str) -> str:
     return content_hash
 
 
+def swap_after_first_read(path: Path, action: object):
+    """Patch ``Path.open`` so *action* runs when *path* finishes its first read.
+
+    The replacement (any callable, e.g. rewriting or deleting the blob)
+    lands after the bytes of that read are captured but before the caller
+    parses anything — exactly the window between "hash the stored file" and
+    "read the CSV again" that a non-snapshot validation could confuse.
+    Returns ``(patcher, swapped)`` where *swapped* records whether the
+    action fired.
+    """
+    target = path.resolve()
+    real_open = Path.open
+    swapped = {"done": False}
+
+    def open_spy(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        if self.resolve() != target or swapped["done"]:
+            return handle
+        real_close = handle.close
+
+        def close_spy():
+            if not swapped["done"]:
+                swapped["done"] = True
+                action()
+            return real_close()
+
+        handle.close = close_spy
+        return handle
+
+    return mock.patch.object(Path, "open", open_spy), swapped
+
+
 class CatalogTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -947,6 +979,61 @@ class ValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.catalog.validate("d", 1)
 
+    def test_report_uses_one_snapshot_when_blob_rewritten_mid_validation(self):
+        # row 2 is out of range in the recorded content but in range in the
+        # replacement, so mixing the old hash with newly read rows would flip
+        # the verdict while keeping the original hash.
+        self.catalog.import_csv("d", self.csv_file("v\n1\n99\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("v\n1\n5\n", encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(swapped["done"])
+        # hash, row count, and violation lines all describe the captured bytes
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        self.assertEqual(report["rowCount"], 2)
+        self.assertEqual(report["results"][0]["violations"], [2])
+        self.assertFalse(report["passed"])
+        # the change that landed after the snapshot is seen on the next call
+        with self.assertRaises(ValueError):
+            self.catalog.validate("d", 1)
+
+    def test_validation_completes_when_blob_deleted_after_snapshot(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "required"}])
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        patcher, swapped = swap_after_first_read(blob, blob.unlink)
+        with patcher:
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(swapped["done"])
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        # and it was persisted from the captured content
+        self.assertEqual(self.catalog.validation_history("d", 1), [report])
+
+    def test_reused_report_still_passes_when_blob_changes_after_recheck(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1\n99\n"))
+        self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 9}])
+        first = self.catalog.validate("d", 1)
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        # the file is replaced only after this invocation's recheck read
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("v\n1\n5\n", encoding="utf-8")
+        )
+        with patcher:
+            second = self.catalog.validate("d", 1)
+        self.assertTrue(swapped["done"])
+        self.assertEqual(second, first)
+        # a change present before the next invocation is checked, not ignored
+        with self.assertRaises(ValueError):
+            self.catalog.validate("d", 1)
+
     def test_missing_blob_raises(self):
         self.catalog.import_csv("d", self.csv_file("v\n1\n"))
         self.catalog.set_rules("d", [{"id": "r", "column": "v", "type": "required"}])
@@ -954,6 +1041,24 @@ class ValidationTest(unittest.TestCase):
         (self.catalog.workspace / record["blob"]).unlink()
         with self.assertRaises(ValueError):
             self.catalog.validate("d", 1)
+
+    def test_plain_validation_keeps_legacy_short_record_leniency(self):
+        # A pre-strictness version may store a short record; plain validation
+        # still reads its missing trailing fields as missing values rather
+        # than rejecting the run.
+        legacy_import(self.catalog, "d", "a,b\n1,2\n3\n")
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "a-req", "column": "a", "type": "required"},
+                {"id": "b-req", "column": "b", "type": "required"},
+            ],
+        )
+        report = self.catalog.validate("d", 1)
+        by_id = {item["id"]: item for item in report["results"]}
+        self.assertEqual(by_id["a-req"]["violations"], [])
+        self.assertEqual(by_id["b-req"]["violations"], [2])
+        self.assertEqual(report["rowCount"], 2)
 
     def test_history_persists_across_restart_in_revision_order(self):
         self.catalog.import_csv("d", self.csv_file("v\n1\n"))
@@ -1407,6 +1512,211 @@ class ReferenceRuleTest(unittest.TestCase):
         # the stored report survived every failed revalidation unchanged
         self.assertEqual(reloaded.validation_history("orders", 1), [first])
         self.assertEqual(reloaded.validate("orders", 1), first)
+
+    def test_reference_target_rewritten_after_snapshot_cannot_change_result(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\nC9,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        record = self.catalog.get("客户", 2)
+        blob = self.catalog.workspace / record["blob"]
+        # the replacement adds the very combination the local row is missing;
+        # re-reading the file after the hash check would therefore clear the
+        # violation while still stamping the original target hash.
+        replacement = "编号,地区,备注\nC1,北,x\nC2,南,y\nC9,北,z\n"
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text(replacement, encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("orders", 1)
+        self.assertTrue(swapped["done"])
+        result = report["results"][0]
+        self.assertEqual(result["violations"], [2])
+        self.assertEqual(
+            result["reference"]["content_sha256"], record["content_sha256"]
+        )
+        self.assertEqual(report["content_sha256"], self.catalog.get("orders", 1)["content_sha256"])
+        self.assertFalse(report["passed"])
+
+    def test_reference_target_deleted_after_snapshot_still_completes(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        blob = self.catalog.workspace / self.catalog.get("客户", 2)["blob"]
+        patcher, swapped = swap_after_first_read(blob, blob.unlink)
+        with patcher:
+            report = self.catalog.validate("orders", 1)
+        self.assertTrue(swapped["done"])
+        self.assertTrue(report["passed"])
+        # the run finished entirely from captured bytes and still persisted
+        self.assertEqual(self.catalog.validation_history("orders", 1), [report])
+
+    def test_reference_side_problem_introduced_after_snapshot_is_not_seen(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        blob = self.catalog.workspace / self.catalog.get("客户", 2)["blob"]
+        # swapped in only after this run's read: an empty referenced value
+        # that must not fail a run which captured the healthy content
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("编号,地区,备注\nC1,,x\n", encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("orders", 1)
+        self.assertTrue(swapped["done"])
+        self.assertTrue(report["passed"])
+
+    def test_local_side_rewritten_after_snapshot_cannot_change_result(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\nC9,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        record = self.catalog.get("orders", 1)
+        blob = self.catalog.workspace / record["blob"]
+        # the replacement makes every captured row match the reference side
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("客户号,地区\nC1,北\nC3,东\n", encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("orders", 1)
+        self.assertTrue(swapped["done"])
+        self.assertEqual(report["results"][0]["violations"], [2])
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        self.assertFalse(report["passed"])
+
+    def test_reused_reference_report_rechecks_target_then_ignores_later_swap(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\nC9,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        first = self.catalog.validate("orders", 1)
+        blob = self.catalog.workspace / self.catalog.get("客户", 2)["blob"]
+        # ragged bytes swapped in only after this invocation's recheck read:
+        # once the healthy bytes were captured the run must finish on them
+        replacement = "编号,地区,备注\nC1,北\n"
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text(replacement, encoding="utf-8")
+        )
+        with patcher:
+            second = self.catalog.validate("orders", 1)
+        self.assertTrue(swapped["done"])
+        self.assertEqual(second, first)
+        # the replacement is present for the next call, so the run fails
+        # rather than silently returning a report for different bytes
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+        # the stored report was neither overwritten nor removed
+        self.assertEqual(self.catalog.validation_history("orders", 1), [first])
+
+    def test_self_reference_uses_one_shared_snapshot_under_swap(self):
+        self.catalog.import_csv("d", self.csv_file("a,b\nX,1\nY,2\n", "d.csv"))
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a", "b"],
+                    "reference": {"dataset": "d", "version": 1, "columns": ["a", "b"]},
+                }
+            ],
+        )
+        record = self.catalog.get("d", 1)
+        blob = self.catalog.workspace / record["blob"]
+        # replacement drops Y,2: a second read for the target side would see
+        # the local row Y,2 as a violation, but both sides share one snapshot
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("a,b\nX,1\n", encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(swapped["done"])
+        self.assertTrue(report["passed"])
+        # the captured content had two rows; the report's hash and row count
+        # must describe that same snapshot rather than the one-row replacement
+        self.assertEqual(report["rowCount"], 2)
+        self.assertEqual(report["content_sha256"], record["content_sha256"])
+        self.assertEqual(
+            report["results"][0]["reference"]["content_sha256"],
+            record["content_sha256"],
+        )
+
+    def test_same_target_used_by_two_rules_shares_one_snapshot(self):
+        self.catalog.import_csv("ref", self.csv_file("a,b\nX,1\nY,2\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d", self.csv_file("a,b,c\nX,1,p\nY,2,q\n", "d.csv")
+        )
+        target = {
+            "type": "reference",
+            "columns": ["a", "b"],
+            "reference": {"dataset": "ref", "version": 1, "columns": ["a", "b"]},
+        }
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "r1", **target},
+                {"id": "r2", **target},
+            ],
+        )
+        blob = self.catalog.workspace / self.catalog.get("ref", 1)["blob"]
+        # replacement removes Y,2 entirely, so a second read of the same
+        # target would turn row 2 into two violations from one captured pass
+        patcher, swapped = swap_after_first_read(
+            blob, lambda: blob.write_text("a,b\nX,1\n", encoding="utf-8")
+        )
+        with patcher:
+            report = self.catalog.validate("d", 1)
+        self.assertTrue(swapped["done"])
+        ref_hash = self.catalog.get("ref", 1)["content_sha256"]
+        self.assertEqual(
+            [item["reference"]["content_sha256"] for item in report["results"]],
+            [ref_hash, ref_hash],
+        )
+        self.assertEqual(report["results"][0]["violations"], [])
+        self.assertEqual(report["results"][1]["violations"], [])
+        self.assertTrue(report["passed"])
+
+    def test_fresh_run_target_hash_mismatch_fails_without_persisting(self):
+        self.import_reference_side()
+        self.catalog.import_csv(
+            "orders", self.csv_file("客户号,地区\nC1,北\n", "orders.csv")
+        )
+        self.catalog.set_rules("orders", [self.reference_rule()])
+        record = self.catalog.get("客户", 2)
+        blob = self.catalog.workspace / record["blob"]
+        blob.write_text("编号,地区,备注\nC1,北,x\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("orders", 1)
+        self.assertIn("客户@2", str(context.exception))
+        self.assertEqual(self.catalog.validation_history("orders", 1), [])
+
+    def test_ragged_local_side_still_fails_reference_run(self):
+        # reference runs keep their strict local-side structural checks
+        self.catalog.import_csv("ref", self.csv_file("a\nX\n", "ref.csv"))
+        legacy_import(self.catalog, "d", "a\nX\nY,Z\n")
+        self.catalog.set_rules(
+            "d",
+            [
+                {
+                    "id": "r",
+                    "type": "reference",
+                    "columns": ["a"],
+                    "reference": {"dataset": "ref", "version": 1, "columns": ["a"]},
+                }
+            ],
+        )
+        with self.assertRaises(ValueError) as context:
+            self.catalog.validate("d", 1)
+        self.assertIn("d@1", str(context.exception))
+        self.assertEqual(self.catalog.validation_history("d", 1), [])
 
     def test_structurally_invalid_side_fails_whole_run(self):
         self.import_reference_side()

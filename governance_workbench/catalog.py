@@ -225,6 +225,25 @@ def _read_csv_records(content: bytes) -> tuple[list[str], list[list[str]]]:
     return header, rows
 
 
+def _read_csv_dict_records(content: bytes) -> tuple[list[str], list[dict[str, str | None]]]:
+    """Parse CSV bytes the lenient way plain validation always has.
+
+    This is the in-memory twin of streaming a stored file through
+    :class:`csv.DictReader`: blank physical lines are not records, a quoted
+    newline stays inside one record, a short record reads as ``None`` for its
+    missing trailing fields, and extra fields are collected under the
+    ``restkey`` entry (never a rule column). Only the snapshot bytes are
+    touched, so the file on disk changing after the snapshot cannot alter the
+    rows judged here. ``csv.Error`` propagates to the caller, matching the
+    streaming path.
+    """
+    text = content.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    header = list(reader.fieldnames or [])
+    rows = [dict(row) for row in reader]
+    return header, rows
+
+
 class _PlainRuleEvaluator:
     """Judge the plain (non-reference) rules of a revision row by row.
 
@@ -1299,146 +1318,135 @@ class Catalog:
         versions = state["datasets"][dataset]
         if not isinstance(version, int) or isinstance(version, bool) or version < 1 or version > len(versions):
             raise ValueError(f"unknown data version: {dataset}@{version}")
-        record = versions[version - 1]
         rule_revision, rules = self._rules_revision(state, dataset, revision)
 
         stored = state["validations"].setdefault(dataset, {})
         existing = stored.get(str(version), {}).get(str(rule_revision))
         has_reference = any(rule["type"] == "reference" for rule in rules)
+
+        # Every file this run depends on is read once and hash-verified
+        # before a single rule runs, so the hash recorded in the report, the
+        # row count, and the violation lines describe the same captured
+        # bytes. Replacing, rewriting, or deleting a blob afterwards cannot
+        # change this run. Reusing a persisted report still goes through
+        # this: each side is re-verified against the catalog record and the
+        # stored report on every invocation. Any failure aborts the whole
+        # run — no partial result and no report write.
+        local_snapshot, reference_snapshots = self._validation_sides(
+            state, dataset, version, rules, existing["report"] if existing else None
+        )
+        local_parsed = None
+        parsed_references: dict[
+            tuple[str, int], tuple[str, list[str], list[list[str]]]
+        ] = {}
+        if has_reference:
+            # Reference runs keep their strict structural checks, run on the
+            # captured bytes rather than re-reading the files.
+            content_hash, content = local_snapshot
+            local_header, local_rows = self._parse_validated_side(
+                content, dataset, version
+            )
+            local_parsed = (content_hash, local_header, local_rows)
+            for rule in rules:
+                if rule["type"] != "reference":
+                    continue
+                reference = rule["reference"]
+                key = (reference["dataset"], reference["version"])
+                if key == (dataset, version):
+                    parsed_references[key] = local_parsed
+                elif key not in parsed_references:
+                    ref_hash, ref_content = reference_snapshots[key]
+                    parsed_references[key] = (
+                        ref_hash,
+                        *self._parse_validated_side(
+                            ref_content, reference["dataset"], reference["version"]
+                        ),
+                    )
+            self._check_validation_columns(
+                rules, dataset, version, local_header, parsed_references
+            )
+
         if existing is not None:
-            if has_reference:
-                # A validation involving reference rules re-verifies every
-                # file it depends on before the stored report is reused:
-                # both sides' existence, hashes (against the catalog records
-                # and the stored report), CSV structure, and rule fields.
-                # Any problem fails the whole run; the stored report is
-                # neither returned partially nor overwritten.
-                self._reference_sides(state, dataset, version, rules, existing["report"])
-            else:
-                # The stored blob hash is re-verified against both the catalog
-                # record and the stored report on every invocation even when
-                # the report itself is reused.
-                blob_path = self.workspace / record["blob"]
-                if not blob_path.exists():
-                    raise ValueError(f"stored data missing for {dataset}@{version}")
-                current_hash = _sha256(blob_path)
-                if current_hash != record["content_sha256"] or current_hash != existing["content_sha256"]:
-                    raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
             return dict(existing["report"])
 
         if has_reference:
-            report, content_hash = self._validate_with_references(
-                state, dataset, version, rules, rule_revision
+            assert local_parsed is not None
+            report = self._reference_report(
+                dataset,
+                version,
+                rules,
+                rule_revision,
+                local_parsed,
+                parsed_references,
             )
-            # Persist only after the full report is built; a write failure
-            # discards this report instead of leaving a partial entry behind.
-            stored.setdefault(str(version), {})[str(rule_revision)] = {
-                "content_sha256": content_hash,
-                "report": report,
-            }
-            self._save(state)
-            return dict(report)
+        else:
+            report = self._plain_report_from_snapshot(
+                dataset, version, rules, rule_revision, local_snapshot
+            )
 
-        blob_path = self.workspace / record["blob"]
-        if not blob_path.exists():
-            raise ValueError(f"stored data missing for {dataset}@{version}")
-        content_hash = _sha256(blob_path)
-        if content_hash != record["content_sha256"]:
-            raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-
-        evaluator = _PlainRuleEvaluator(rules)
-        with blob_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = reader.fieldnames or []
-            for rule in rules:
-                if rule["column"] not in fieldnames:
-                    raise ValueError(
-                        f"missing column {rule['column']!r} for {dataset}@{version}"
-                    )
-            row_number = 0
-            for row in reader:
-                row_number += 1
-                # A short record reads as an empty value for its missing
-                # trailing fields; extra fields are not rule columns.
-                evaluator.scan(
-                    row_number,
-                    lambda column: row[column] if row[column] is not None else "",
-                )
-        evaluator.finish()
-
-        report_results = [
-            _plain_report_entry(rule, evaluator.violations[rule["id"]])
-            for rule in rules
-        ]
-        report = _validation_report(
-            dataset, version, content_hash, rule_revision, row_number, report_results
-        )
-
-        # Persist only after the full report is built; a write failure discards
-        # this report instead of leaving a partial entry behind.
+        # Persist only after the full report is built; a write failure
+        # discards this report instead of leaving a partial entry behind.
         stored.setdefault(str(version), {})[str(rule_revision)] = {
-            "content_sha256": content_hash,
+            "content_sha256": report["content_sha256"],
             "report": report,
         }
         self._save(state)
         return dict(report)
 
-    def _load_verified_side(
+    def _snapshot_version(
         self,
         state: dict[str, Any],
         dataset: str,
         version: int,
         expected_hash: str | None = None,
-    ) -> tuple[str, list[str], list[list[str]]]:
-        """Re-verify and strictly parse one stored version, returning
-        ``(content_hash, header, rows)``.
+    ) -> tuple[str, bytes]:
+        """Read one stored version's blob once and verify its hash.
 
-        Existence, the content hash (against the catalog record and, when
-        given, a previously recorded hash), and the CSV structure are all
-        checked; every error names the dataset and version involved.
+        Returns ``(content_hash, content)`` where *content* are the exact raw
+        bytes hashed against the catalog record and, when given, against a
+        previously recorded hash. Everything the caller afterwards parses or
+        judges derives from these bytes, so replacing, rewriting, or deleting
+        the blob after this point can neither change the hash nor smuggle
+        later records into the run. Every error names the dataset and
+        version involved.
         """
         record = self._version_record(state, dataset, version)
         blob_path = self.workspace / record["blob"]
         if not blob_path.exists():
             raise ValueError(f"stored data missing for {dataset}@{version}")
-        content_hash = _sha256(blob_path)
+        with blob_path.open("rb") as handle:
+            content = handle.read()
+        content_hash = hashlib.sha256(content).hexdigest()
         if content_hash != record["content_sha256"]:
             raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
         if expected_hash is not None and content_hash != expected_hash:
             raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-        try:
-            header, rows = self._read_stored_csv(blob_path, dataset, version)
-        except UnicodeDecodeError as error:
-            raise ValueError(
-                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
-            ) from error
-        except csv.Error as error:
-            raise ValueError(
-                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
-            ) from error
-        return content_hash, header, rows
+        return content_hash, content
 
-    def _reference_sides(
+    def _validation_sides(
         self,
         state: dict[str, Any],
         dataset: str,
         version: int,
         rules: list[dict[str, Any]],
         report: dict[str, Any] | None = None,
-    ) -> tuple[tuple[str, list[str], list[list[str]]], dict[tuple[str, int], tuple[str, list[str], list[list[str]]]]]:
-        """Load and verify the local side and every referenced side.
+    ) -> tuple[
+        tuple[str, bytes],
+        dict[tuple[str, int], tuple[str, bytes]],
+    ]:
+        """Snapshot the local side and every distinct referenced side.
 
-        Returns ``(local, references)`` where ``local`` is the
-        ``(content_hash, header, rows)`` triple of the validated version and
-        ``references`` maps each referenced ``(dataset, version)`` to the
-        same triple. When ``report`` is given (a persisted report being
-        reused), each side's hash is additionally checked against the hash
-        recorded in that report. Field existence is verified on every call:
-        local columns against the selected version, reference columns
-        against their side.
+        All files are read and hash-verified before any rule runs, so the
+        hashes recorded in a report, its row count, and every violation
+        describe the same captured content. A version used by several
+        reference rules, or serving as both the local data and a reference
+        target, is snapshotted once and every rule sees the same bytes.
+        When *report* is given (a persisted report being reused), each
+        side's hash is additionally checked against the hash recorded in
+        that report.
         """
         expected_local = report["content_sha256"] if report is not None else None
-        local = self._load_verified_side(state, dataset, version, expected_local)
+        local = self._snapshot_version(state, dataset, version, expected_local)
         expected_reference: dict[tuple[str, int], str] = {}
         if report is not None:
             for item in report["results"]:
@@ -1447,23 +1455,33 @@ class Catalog:
                     expected_reference[(reference["dataset"], reference["version"])] = (
                         reference["content_sha256"]
                     )
-        references: dict[tuple[str, int], tuple[str, list[str], list[list[str]]]] = {}
+        references: dict[tuple[str, int], tuple[str, bytes]] = {}
         for rule in rules:
             if rule["type"] != "reference":
                 continue
             reference = rule["reference"]
             key = (reference["dataset"], reference["version"])
-            if key in references:
+            # The local side (including a self-reference) is the same snapshot
+            # for every rule; distinct external targets are read once each.
+            if key in references or key == (dataset, version):
                 continue
-            if key == (dataset, version):
-                references[key] = local
-            else:
-                references[key] = self._load_verified_side(
-                    state,
-                    reference["dataset"],
-                    reference["version"],
-                    expected_reference.get(key),
-                )
+            references[key] = self._snapshot_version(
+                state,
+                reference["dataset"],
+                reference["version"],
+                expected_reference.get(key),
+            )
+        return local, references
+
+    @staticmethod
+    def _check_validation_columns(
+        rules: list[dict[str, Any]],
+        dataset: str,
+        version: int,
+        local_header: list[str],
+        references: dict[tuple[str, int], tuple[str, list[str], list[list[str]]]],
+    ) -> None:
+        """Verify every rule column against the parsed side headers."""
         for rule in rules:
             if rule["type"] == "reference":
                 local_names = rule["columns"]
@@ -1476,7 +1494,7 @@ class Catalog:
                 ref_header = []
                 ref_names = []
             for name in local_names:
-                if name not in local[1]:
+                if name not in local_header:
                     raise ValueError(f"missing column {name!r} for {dataset}@{version}")
             for name in ref_names:
                 if name not in ref_header:
@@ -1484,27 +1502,76 @@ class Catalog:
                         f"missing column {name!r} for "
                         f"{reference['dataset']}@{reference['version']}"
                     )
-        return local, references
 
-    def _validate_with_references(
+    def _plain_report_from_snapshot(
         self,
-        state: dict[str, Any],
         dataset: str,
         version: int,
         rules: list[dict[str, Any]],
         rule_revision: int,
-    ) -> tuple[dict[str, Any], str]:
-        """Validate a version against a revision containing reference rules.
+        local_snapshot: tuple[str, bytes],
+    ) -> dict[str, Any]:
+        """Evaluate required/unique/range rules against captured bytes.
 
-        Both sides are strictly parsed. Combinations are matched on raw
-        strings — no trimming, no numeric conversion, and separators inside
-        values have no special meaning. Empty values or duplicate complete
-        combinations on a reference side fail the whole run, even when the
-        local side has no records.
+        Parsing stays the lenient ``DictReader`` regime plain validation has
+        always used — a historical short record reads its missing trailing
+        fields as missing values — but it runs on the snapshot, so the
+        reported hash, row count, and violation lines all come from the same
+        bytes and a later file change cannot mix records in.
         """
-        (content_hash, header, rows), references = self._reference_sides(
-            state, dataset, version, rules
+        content_hash, content = local_snapshot
+        try:
+            fieldnames, dict_rows = _read_csv_dict_records(content)
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
+            ) from error
+        except csv.Error as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
+            ) from error
+        for rule in rules:
+            if rule["column"] not in fieldnames:
+                raise ValueError(
+                    f"missing column {rule['column']!r} for {dataset}@{version}"
+                )
+        evaluator = _PlainRuleEvaluator(rules)
+        for row_number, row in enumerate(dict_rows, start=1):
+            # A short record reads as an empty value for its missing
+            # trailing fields; extra fields are not rule columns.
+            evaluator.scan(
+                row_number,
+                lambda column: row[column] if row[column] is not None else "",
+            )
+        evaluator.finish()
+        report_results = [
+            _plain_report_entry(rule, evaluator.violations[rule["id"]])
+            for rule in rules
+        ]
+        return _validation_report(
+            dataset, version, content_hash, rule_revision, len(dict_rows), report_results
         )
+
+    def _reference_report(
+        self,
+        dataset: str,
+        version: int,
+        rules: list[dict[str, Any]],
+        rule_revision: int,
+        local: tuple[str, list[str], list[list[str]]],
+        references: dict[tuple[str, int], tuple[str, list[str], list[list[str]]]],
+    ) -> dict[str, Any]:
+        """Build the report for a revision containing reference rules.
+
+        Combinations are matched on raw strings — no trimming, no numeric
+        conversion, and separators inside values have no special meaning.
+        Empty values or duplicate complete combinations on a reference side
+        fail the whole run, even when the local side has no records. Every
+        input is a snapshot captured before this method runs, so the
+        reference hashes in the report identify the actual target bytes used
+        for matching.
+        """
+        content_hash, header, rows = local
 
         # Build each referenced combination set before scanning local rows,
         # so reference-side problems surface even with zero local records.
@@ -1587,10 +1654,9 @@ class Catalog:
                 report_results.append(
                     _plain_report_entry(rule, evaluator.violations[rule["id"]])
                 )
-        report = _validation_report(
+        return _validation_report(
             dataset, version, content_hash, rule_revision, len(rows), report_results
         )
-        return report, content_hash
 
     def validation_history(self, dataset: str, version: int) -> list[dict[str, Any]]:
         state = self._load()
@@ -1646,10 +1712,19 @@ class Catalog:
         return normalized
 
     @staticmethod
-    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
-        with blob_path.open("r", encoding="utf-8", newline="") as handle:
-            # Blank physical lines are not data records, matching DictReader.
-            parsed = [row for row in csv.reader(handle) if row != []]
+    def _parse_stored_csv(
+        content: bytes, dataset: str, version: int
+    ) -> tuple[list[str], list[list[str]]]:
+        """Strictly parse one snapshotted stored blob's bytes.
+
+        Mirrors :func:`_read_csv_records` with the stored-data wording: a
+        header row with no empty or duplicate field names, and every data
+        record with exactly as many fields as the header. Blank physical
+        lines are not records. ``UnicodeDecodeError`` and :class:`csv.Error`
+        propagate so callers can name the side involved.
+        """
+        text = content.decode("utf-8")
+        parsed = [row for row in csv.reader(io.StringIO(text, newline="")) if row != []]
         if not parsed:
             raise ValueError(f"stored CSV for {dataset}@{version} has no header")
         header = parsed[0]
@@ -1666,6 +1741,33 @@ class Catalog:
                 )
             rows.append(list(record))
         return header, rows
+
+    @staticmethod
+    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
+        with blob_path.open("rb") as handle:
+            content = handle.read()
+        return Catalog._parse_stored_csv(content, dataset, version)
+
+    @staticmethod
+    def _parse_validated_side(
+        content: bytes, dataset: str, version: int
+    ) -> tuple[list[str], list[list[str]]]:
+        """Strictly parse a snapshotted validation side, naming it on failure.
+
+        Structural problems already carry the dataset and version; decode and
+        csv-engine errors are wrapped the same way so every read failure of a
+        validated side names the data involved.
+        """
+        try:
+            return Catalog._parse_stored_csv(content, dataset, version)
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} is not valid UTF-8: {error.reason}"
+            ) from error
+        except csv.Error as error:
+            raise ValueError(
+                f"stored CSV for {dataset}@{version} could not be parsed: {error}"
+            ) from error
 
     def clean(self, dataset: str, version: int, operations: Any) -> dict[str, Any]:
         """Clean a stored version and append the result as a new immutable version.

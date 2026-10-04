@@ -60,3 +60,14 @@ if (result.ok()) {
 `sha256_file` 遵循与命令行相同的字节和失败规则，只返回结果，不打印、不退出进程。
 也可以直接使用 `branchaudit::Sha256` 类对任意字节流做增量计算（`update()` /
 `final()`）。
+
+## 运行回归测试
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+测试（`tests/test_branchaudit.cpp`）对照独立计算的 SHA-256 标准已知答案，
+覆盖增量接口、文件接口与命令行行为；全部通过时退出码为 0。

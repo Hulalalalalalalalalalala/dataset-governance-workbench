@@ -12,3 +12,15 @@ target_include_directories(branchaudit_core PUBLIC src)
 
 add_executable(branchaudit src/main.cpp)
 target_link_libraries(branchaudit PRIVATE branchaudit_core)
+
+# 回归测试：保护 SHA-256 摘要的公开行为（独立标准已知答案、
+# 增量接口分段等价、文件接口与命令行契约及失败行为）。
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(branchaudit_tests tests/test_branchaudit.cpp)
+    target_link_libraries(branchaudit_tests PRIVATE branchaudit_core)
+    add_test(
+        NAME branchaudit_tests
+        COMMAND branchaudit_tests $<TARGET_FILE:branchaudit>
+    )
+endif()

@@ -452,28 +452,28 @@ class Catalog:
         keys: list[str],
         state: dict[str, Any],
     ) -> dict[str, Any]:
-        # Verify both stored blobs against their version records before any
-        # parsing, including when both sides are the same version.
+        # Snapshot each side once as raw bytes: the hash check against the
+        # version record and the parsed records below both derive from this
+        # same read, so replacing, rewriting, or deleting the stored file
+        # after this point can neither pair a recorded hash with rows from
+        # a different file nor fail this run as missing input. Both sides
+        # are verified before either is parsed, including when both sides
+        # are the same version; sides that share one storage file share one
+        # snapshot, so they always see identical content.
         left_record = self._version_record(state, dataset, left)
         right_record = self._version_record(state, dataset, right)
-        for record, version in ((left_record, left), (right_record, right)):
-            blob_path = self.workspace / record["blob"]
-            if not blob_path.exists():
-                raise ValueError(f"stored data missing for {dataset}@{version}")
-            if _sha256(blob_path) != record["content_sha256"]:
-                raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-        try:
-            left_header, left_rows = self._read_stored_csv(
-                self.workspace / left_record["blob"], dataset, left
+        _, left_content = self._snapshot_blob(state, dataset, left)
+        if right_record["blob"] == left_record["blob"]:
+            right_content = left_content
+        else:
+            _, right_content = self._snapshot_blob(state, dataset, right)
+        left_header, left_rows = self._parse_stored_csv(left_content, dataset, left)
+        if right_record["blob"] == left_record["blob"]:
+            right_header, right_rows = left_header, left_rows
+        else:
+            right_header, right_rows = self._parse_stored_csv(
+                right_content, dataset, right
             )
-            if right_record["blob"] == left_record["blob"]:
-                right_header, right_rows = left_header, left_rows
-            else:
-                right_header, right_rows = self._read_stored_csv(
-                    self.workspace / right_record["blob"], dataset, right
-                )
-        except csv.Error as error:
-            raise ValueError(f"stored CSV could not be parsed: {error}")
 
         for side, header, version in (
             ("left", left_header, left),
@@ -1707,12 +1707,6 @@ class Catalog:
                 )
             rows.append(list(record))
         return header, rows
-
-    @staticmethod
-    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
-        with blob_path.open("rb") as handle:
-            content = handle.read()
-        return Catalog._parse_stored_csv(content, dataset, version)
 
     def clean(self, dataset: str, version: int, operations: Any) -> dict[str, Any]:
         """Clean a stored version and append the result as a new immutable version.

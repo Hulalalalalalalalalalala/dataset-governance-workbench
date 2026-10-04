@@ -901,6 +901,196 @@ class ValidationTest(unittest.TestCase):
         report = self.catalog.validate("r", 1)
         self.assertTrue(report["passed"])
 
+    def test_range_judges_exact_decimal_text_not_float_rounding(self):
+        # Values are judged by the true decimal value the cell text writes,
+        # not by a binary float: the 17th digit past the point must survive
+        # instead of rounding 1.00000000000000001 up to 1, and a value below
+        # the float minimum must not collapse to zero.
+        csv_contents = (
+            "v\n"
+            "1\n"                      # row 1: max endpoint
+            "1.0\n"                    # row 2: same number, different text
+            "1e0\n"                    # row 3: same number
+            "1.00000000000000001\n"    # row 4: just above the max
+            "0.99999999999999999\n"    # row 5: just below 1, still inside
+            "0\n"                      # row 6: min endpoint
+            "-0\n"                     # row 7: negative zero equals zero
+            "-1e-400\n"                # row 8: just below the min
+            "1e-400\n"                 # row 9: above zero, inside
+        )
+        self.catalog.import_csv("d", self.csv_file(csv_contents))
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "max-only", "column": "v", "type": "range", "max": 1},
+                {"id": "min-only", "column": "v", "type": "range", "min": 0},
+                {"id": "both", "column": "v", "type": "range", "min": 0, "max": 1},
+            ],
+        )
+        by_id = {
+            item["id"]: item
+            for item in self.catalog.validate("d", 1)["results"]
+        }
+        self.assertEqual(by_id["max-only"]["violations"], [4])
+        self.assertEqual(by_id["min-only"]["violations"], [8])
+        self.assertEqual(by_id["both"]["violations"], [4, 8])
+        self.assertEqual(by_id["both"]["violationCount"], 2)
+
+    def test_range_large_integer_boundary_keeps_full_precision(self):
+        csv_contents = (
+            "v\n"
+            "9007199254740992\n"      # endpoint itself
+            "9007199254740992.1\n"    # over by a tenth: must not round onto it
+            "9007199254740991.9\n"    # below the endpoint
+            "9007199254740992.0\n"    # the endpoint in decimal text
+            "9.007199254740992e15\n"  # the endpoint in scientific text
+        )
+        expected = [2]
+        for boundary in (9007199254740992, float(9007199254740992)):
+            catalog = Catalog(self.root / f"ws-{type(boundary).__name__}")
+            catalog.import_csv("d", self.csv_file(csv_contents, f"big-{type(boundary).__name__}.csv"))
+            catalog.set_rules(
+                "d", [{"id": "r", "column": "v", "type": "range", "max": boundary}]
+            )
+            report = catalog.validate("d", 1)
+            self.assertEqual(report["results"][0]["violations"], expected)
+            self.assertFalse(report["passed"])
+
+    def test_range_float_boundary_read_as_its_decimal_text(self):
+        # A configured 0.1 means decimal 0.1: the cell text "0.1" is the
+        # endpoint, and the boundary does not inherit binary storage error.
+        csv_contents = (
+            "v\n"
+            "0.1\n"                        # endpoint
+            "0.10000000000000001\n"        # above the decimal boundary
+            "0.09999999999999999\n"        # below it
+            "0.1000000000000000055\n"      # above it, even if float-near
+        )
+        self.catalog.import_csv("d", self.csv_file(csv_contents))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "min": 0.1, "max": 0.1}]
+        )
+        report = self.catalog.validate("d", 1)
+        self.assertEqual(report["results"][0]["violations"], [2, 3, 4])
+
+    def test_range_non_numeric_non_finite_and_overflow_still_violate(self):
+        csv_contents = (
+            "v\n"
+            "0.5\n"        # row 1: inside
+            "abc\n"        # row 2: non-numeric
+            "true\n"       # row 3: boolean text is not a number
+            "False\n"      # row 4: boolean text is not a number
+            "inf\n"        # row 5: non-finite
+            "-Infinity\n"  # row 6: non-finite
+            "nan\n"        # row 7: NaN
+            "NaN\n"       # row 8: NaN
+            " 1\n"         # row 9: leading whitespace is never trimmed
+            "1 \n"         # row 10: trailing whitespace is never trimmed
+            "1e400\n"      # row 11: float overflow, as before a violation
+            "-1e400\n"     # row 12: float overflow in magnitude
+        )
+        self.catalog.import_csv("d", self.csv_file(csv_contents))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 1}]
+        )
+        report = self.catalog.validate("d", 1)
+        self.assertEqual(
+            report["results"][0]["violations"], [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        )
+        self.assertFalse(report["passed"])
+
+    def test_range_empty_string_still_skipped(self):
+        # a single-column blank line is not a record at all, so use two
+        # columns to express a genuine empty-string cell
+        self.catalog.import_csv("d", self.csv_file("id,v\n1,\n2,1\n3,2\n"))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 1}]
+        )
+        report = self.catalog.validate("d", 1)
+        self.assertEqual(report["results"][0]["violations"], [3])
+
+    def test_range_extreme_exponents_do_not_interrupt_validation(self):
+        # A numeric text far outside the decimal context must neither crash
+        # the run nor be rounded to zero: its sign still decides the bound.
+        extreme = "9" * 25  # exponent far beyond the decimal context MAX_EM
+        csv_contents = (
+            "v\n"
+            f"1e-{extreme}\n"      # row 1: nonzero value just above zero
+            f"-1e-{extreme}\n"     # row 2: nonzero value just below zero
+            f"-0e-{extreme}\n"     # row 3: negative zero equals zero
+            f"0e-{extreme}\n"      # row 4: zero
+        )
+        self.catalog.import_csv("d", self.csv_file(csv_contents))
+        self.catalog.set_rules(
+            "d",
+            [
+                {"id": "min0", "column": "v", "type": "range", "min": 0},
+                {"id": "max0", "column": "v", "type": "range", "max": 0},
+                {"id": "both0", "column": "v", "type": "range", "min": 0, "max": 0},
+            ],
+        )
+        by_id = {
+            item["id"]: item
+            for item in self.catalog.validate("d", 1)["results"]
+        }
+        self.assertEqual(by_id["min0"]["violations"], [2])
+        self.assertEqual(by_id["max0"]["violations"], [1])
+        self.assertEqual(by_id["both0"]["violations"], [1, 2])
+
+    def test_range_result_unchanged_when_reference_rule_added(self):
+        self.catalog.import_csv("ref", self.csv_file("code\nA\nB\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d", self.csv_file("c,v\nA,1\nQ,1.00000000000000001\nB,-1e-400\n", "d.csv")
+        )
+        range_rule = {"id": "v-range", "column": "v", "type": "range", "min": 0, "max": 1}
+        reference_rule = {
+            "id": "c-ref",
+            "type": "reference",
+            "columns": ["c"],
+            "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+        }
+        self.catalog.set_rules("d", [range_rule])
+        self.catalog.set_rules("d", [range_rule, reference_rule])
+        plain = self.catalog.validate("d", 1, revision=1)
+        mixed = self.catalog.validate("d", 1, revision=2)
+        self.assertEqual(
+            [item for item in plain["results"] if item["id"] == "v-range"],
+            [item for item in mixed["results"] if item["id"] == "v-range"],
+        )
+        self.assertEqual(mixed["results"][0]["violations"], [2, 3])
+
+    def test_range_existing_report_is_reused_not_recomputed(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1.00000000000000001\n"))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "max": 1}]
+        )
+        first = self.catalog.validate("d", 1)
+        self.assertEqual(first["results"][0]["violations"], [1])
+        second = self.catalog.validate("d", 1)
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.catalog.validation_history("d", 1)), 1)
+
+    def test_range_historical_report_survives_code_change(self):
+        # A report already persisted for a data version/rule revision is
+        # reused as-is: the corrected boundary logic must neither recompute
+        # nor overwrite the historical result.
+        self.catalog.import_csv("d", self.csv_file("v\n1.00000000000000001\n"))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "max": 1}]
+        )
+        self.catalog.validate("d", 1)
+        state = json.loads(self.catalog.state_path.read_text(encoding="utf-8"))
+        stored = state["validations"]["d"]["1"]["1"]
+        entry = stored["report"]["results"][0]
+        entry["violations"] = []
+        entry["violationCount"] = 0
+        stored["report"]["passed"] = True
+        self.catalog.state_path.write_text(json.dumps(state), encoding="utf-8")
+        reused = self.catalog.validate("d", 1)
+        self.assertTrue(reused["passed"])
+        self.assertEqual(reused["results"][0]["violations"], [])
+        self.assertEqual(len(self.catalog.validation_history("d", 1)), 1)
+
     def test_columns_match_verbatim(self):
         self.catalog.import_csv("c", self.csv_file(" id\n1\n"))
         self.catalog.set_rules("c", [{"id": "r", "column": "id", "type": "required"}])
@@ -2334,6 +2524,26 @@ class CliTest(unittest.TestCase):
         result = self.run_cli("validations", "d", "3")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), [])
+
+    def test_validate_range_exact_decimal_boundaries_on_cli(self):
+        decimal_cases = self.root / "decimals.csv"
+        decimal_cases.write_text(
+            "v\n1\n1.00000000000000001\n0\n-1e-400\n", encoding="utf-8"
+        )
+        self.assertEqual(self.run_cli("import", "d", str(decimal_cases)).returncode, 0)
+        rules_path = self.root / "rules.json"
+        rules_path.write_text(json.dumps([
+            {"id": "max1", "column": "v", "type": "range", "max": 1},
+            {"id": "min0", "column": "v", "type": "range", "min": 0},
+        ]), encoding="utf-8")
+        self.assertEqual(self.run_cli("rules", "d", str(rules_path)).returncode, 0)
+        result = self.run_cli("validate", "d", "1")
+        # violations found -> exit 1, with a report rather than an error
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        by_id = {item["id"]: item for item in json.loads(result.stdout)["results"]}
+        self.assertEqual(by_id["max1"]["violations"], [2])
+        self.assertEqual(by_id["min0"]["violations"], [4])
 
     def test_import_strictness_envelope_and_exit_codes(self):
         # success still prints the full record on stdout

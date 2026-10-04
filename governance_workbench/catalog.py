@@ -11,7 +11,7 @@ import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,27 +38,71 @@ def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
 
 
-def _finite_number(value: str) -> int | float | None:
-    """Parse a raw CSV cell as a finite number.
+@dataclass(frozen=True)
+class _SubDecimal:
+    """A finite numeric text whose nonzero magnitude is smaller than the
+    decimal context can materialise (e.g. ``1e-999999999``).
 
-    Whitespace is never stripped, underscores and tokens such as ``inf`` or
-    ``nan`` are rejected, so only literal numeric strings are accepted. Text
-    that denotes an integer — whether written as plain digits or in an
-    equivalent decimal or scientific form such as ``9007199254740992.0`` or
-    ``9.007199254740992e15`` — is returned as an exact ``int`` so integers
-    beyond the float53 range are not rounded into a neighbouring value;
-    anything else is returned as a ``float``. Text whose magnitude overflows
-    a float is still rejected as non-finite.
+    Only a text with an extreme negative exponent can reach this state: a
+    positive extreme exponent overflows a float and is rejected upstream.
+    The value still has a definite sign, so it compares as a signed number
+    arbitrarily close to zero against configured boundaries, which always
+    originate from JSON integers or floats and therefore have magnitudes
+    no smaller than the smallest subnormal float.
+    """
+
+    negative: bool
+
+    def __ge__(self, other: Decimal) -> bool:
+        # -eps >= bound only for negative bounds; +eps >= bound when bound <= 0
+        return other < 0 if self.negative else other <= 0
+
+    def __le__(self, other: Decimal) -> bool:
+        # -eps <= bound when bound >= 0; +eps <= bound only for positive bounds
+        return other >= 0 if self.negative else other > 0
+
+
+def _decimal_number(value: str) -> Decimal | _SubDecimal | None:
+    """Parse a raw CSV cell as the exact finite decimal value it writes.
+
+    Whitespace is never stripped and tokens such as ``inf`` or ``nan`` are
+    rejected, so only literal numeric strings are accepted. The text is
+    parsed as written rather than through a binary float: a value such as
+    ``1.00000000000000001`` keeps its extra digit instead of rounding to
+    ``1``, and a sub-float-minimum value such as ``-1e-400`` stays a small
+    nonzero number instead of collapsing to zero. Text whose magnitude
+    overflows a float is still rejected as non-finite, as before. A value
+    too tiny for the decimal context keeps its sign via ``_SubDecimal``
+    rather than interrupting the validation.
     """
     if not _NUMBER_RE.match(value):
         return None
-    number = float(value)
-    if not math.isfinite(number):
+    if not math.isfinite(float(value)):
         return None
-    exact = Decimal(value)
-    if exact == exact.to_integral_value():
-        return int(exact)
-    return number
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        # The exponent is too extreme for the decimal context. A zero
+        # mantissa is still zero in any sign (positive and negative zero are
+        # equal); a nonzero mantissa is a signed value next to zero.
+        mantissa = re.split(r"[eE]", value, maxsplit=1)[0]
+        if not any(char in "123456789" for char in mantissa):
+            return Decimal(0)
+        return _SubDecimal(value.startswith("-"))
+
+
+def _decimal_bound(bound: int | float) -> Decimal:
+    """Represent a configured range boundary as its intended decimal value.
+
+    An integer boundary keeps its full value instead of being rounded into
+    the float53 grid (e.g. ``9007199254740992`` stays exact). A float
+    boundary is read as the shortest decimal text that round-trips to it
+    (``repr(0.1)`` is ``"0.1"``), so a configured ``0.1`` means decimal
+    0.1 — its binary storage error is not charged to the user's boundary.
+    """
+    if isinstance(bound, int) and not isinstance(bound, bool):
+        return Decimal(bound)
+    return Decimal(repr(bound))
 
 
 def _sha256(path: Path) -> str:
@@ -234,7 +278,9 @@ class _PlainRuleEvaluator:
     rules: ``required`` treats only the empty string as missing (a
     whitespace-only value is present), ``unique`` skips empty strings and
     compares the raw text, and ``range`` skips empty values and accepts
-    only finite numeric text within the inclusive bounds.
+    only finite numeric text within the inclusive bounds. Bounds and cell
+    text are compared by the exact decimal values their text denotes, so a
+    value that oversteps an endpoint by even a tiny fraction is flagged.
     """
 
     def __init__(self, rules: list[dict[str, Any]]):
@@ -244,6 +290,13 @@ class _PlainRuleEvaluator:
         }
         self._seen_unique: dict[str, dict[str, list[int]]] = {
             rule["id"]: {} for rule in self.rules if rule["type"] == "unique"
+        }
+        self._range_bounds: dict[str, dict[str, Decimal]] = {
+            rule["id"]: {
+                key: _decimal_bound(rule[key]) for key in ("min", "max") if key in rule
+            }
+            for rule in self.rules
+            if rule["type"] == "range"
         }
 
     def scan(self, row_number: int, value_of: Callable[[str], str]) -> None:
@@ -260,10 +313,11 @@ class _PlainRuleEvaluator:
             else:  # range
                 if value == "":
                     continue
-                number = _finite_number(value)
+                number = _decimal_number(value)
+                bounds = self._range_bounds[rule["id"]]
                 if number is None or not (
-                    ("min" not in rule or number >= rule["min"])
-                    and ("max" not in rule or number <= rule["max"])
+                    ("min" not in bounds or number >= bounds["min"])
+                    and ("max" not in bounds or number <= bounds["max"])
                 ):
                     self.violations[rule["id"]].append(row_number)
 

@@ -11,7 +11,6 @@ import tempfile
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +27,10 @@ _OPERATION_KEYS = {
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?\Z")
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 
+# Exact finite decimal value as (sign, significant digits, decimal exponent):
+# sign * int(digits) * 10 ** exponent, with zero stored as (1, "", 0).
+_Decimal = tuple[int, str, int]
+
 
 def _is_int(value: Any) -> bool:
     # bool is a subclass of int and is not accepted anywhere integers are.
@@ -38,27 +41,156 @@ def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and bool(_HASH_RE.fullmatch(value))
 
 
-def _finite_number(value: str) -> int | float | None:
-    """Parse a raw CSV cell as a finite number.
+def _int_from_digits(text: str) -> int:
+    """Parse a digit string longer than the int-conversion safety limit.
+
+    The interpreter caps direct ``int``/``str`` decimal conversions at a
+    few thousand digits as a denial-of-service guard; assembling the value
+    from short chunks with ordinary arithmetic is not capped, so an exotic
+    exponent never escapes parsing as an error.
+    """
+    value = 0
+    for start in range(0, len(text), 9):
+        chunk = text[start : start + 9]
+        value = value * (10 ** len(chunk)) + int(chunk)
+    return value
+
+
+def _digits_from_int(value: int) -> str:
+    """Render a nonnegative int's decimal digits past the conversion limit."""
+    if value == 0:
+        return "0"
+    chunks: list[str] = []
+    while value:
+        chunks.append(f"{value % 1_000_000_000:09d}")
+        value //= 1_000_000_000
+    return "".join(reversed(chunks)).lstrip("0")
+
+
+def _parse_decimal_text(value: str) -> _Decimal:
+    """Build the exact decimal value of numeric text as ``(sign, digits, exponent)``.
+
+    The value is ``sign * digits * 10 ** exponent`` with ``sign`` either 1
+    or -1, ``digits`` the significant decimal digits as a string carrying
+    no leading or trailing zeroes, and zero always represented as
+    ``(1, "", 0)``. Keeping the digits as text — instead of converting to
+    a decimal.Decimal (whose context bounds the exponent), a float (which
+    rounds), or one giant int (whose conversion is length-capped) — makes
+    arbitrary-length values such as ``1e-1000000`` or a fraction with tens
+    of thousands of digits both exact and impossible to reject while
+    parsing.
+    """
+    sign = 1
+    text = value
+    if text[0] in "+-":
+        if text[0] == "-":
+            sign = -1
+        text = text[1:]
+    mantissa, _, exponent_text = text.replace("E", "e").partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = (whole + fraction).lstrip("0")
+    if not digits:
+        # A zero mantissa is zero no matter how wild its exponent is, so
+        # that exponent is never even parsed.
+        return (1, "", 0)
+    exponent = -len(fraction)
+    if exponent_text:
+        if exponent_text[0] in "+-":
+            exp_sign = -1 if exponent_text[0] == "-" else 1
+            exponent += exp_sign * _int_from_digits(exponent_text[1:])
+        else:
+            exponent += _int_from_digits(exponent_text)
+    trailing = len(digits) - len(digits.rstrip("0"))
+    if trailing:
+        digits = digits[:-trailing]
+        exponent += trailing
+    return (sign, digits, exponent)
+
+
+def _finite_decimal(value: str) -> _Decimal | None:
+    """Parse a raw CSV cell as the exact finite decimal value its text denotes.
 
     Whitespace is never stripped, underscores and tokens such as ``inf`` or
-    ``nan`` are rejected, so only literal numeric strings are accepted. Text
-    that denotes an integer — whether written as plain digits or in an
-    equivalent decimal or scientific form such as ``9007199254740992.0`` or
-    ``9.007199254740992e15`` — is returned as an exact ``int`` so integers
-    beyond the float53 range are not rounded into a neighbouring value;
-    anything else is returned as a ``float``. Text whose magnitude overflows
-    a float is still rejected as non-finite.
+    ``nan`` are rejected, so only literal numeric strings are accepted. The
+    magnitude is then expressed exactly via :func:`_parse_decimal_text`,
+    which keeps every written digit: ``1.00000000000000001`` is not rounded
+    to ``1``, a subnormal-magnitude text such as ``-1e-400`` (or a far
+    tinier exponent) is not flushed to zero, and an integer beyond the
+    float53 range such as ``9007199254740992`` keeps its full value. Text
+    whose magnitude overflows a binary float is still rejected as
+    non-finite, so such a cell stays a range violation.
     """
     if not _NUMBER_RE.match(value):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        # Some platforms/inputs raise rather than returning an infinite
+        # float; either way the text denotes no finite float value.
+        return None
     if not math.isfinite(number):
         return None
-    exact = Decimal(value)
-    if exact == exact.to_integral_value():
-        return int(exact)
-    return number
+    return _parse_decimal_text(value)
+
+
+def _bound_decimal(bound: int | float) -> _Decimal:
+    """Return the exact decimal value a configured range boundary denotes.
+
+    Integer boundaries keep their complete mathematical value however many
+    digits they have. A float boundary is understood by the shortest
+    decimal text that round-trips to it (``repr``), so configuring ``0.1``
+    means the decimal endpoint ``0.1`` rather than the binary float's
+    stored error, and the cell text ``0.1`` meets that endpoint exactly.
+    """
+    if isinstance(bound, int):
+        sign = -1 if bound < 0 else 1
+        digits = _digits_from_int(abs(bound))
+        if digits == "0":
+            return (1, "", 0)
+        trailing = len(digits) - len(digits.rstrip("0"))
+        if trailing:
+            digits = digits[:-trailing]
+        return (sign, digits, trailing)
+    return _parse_decimal_text(repr(bound))
+
+
+def _compare_decimal(left: _Decimal, right: _Decimal) -> int:
+    """Compare two exact decimal triples; return -1, 0, or 1.
+
+    The place of the most significant digit decides the comparison first,
+    so values with wildly different exponents never align a giant number;
+    equal-magnitude values are aligned by padding the shorter coefficient
+    text with zeroes to equal length, where a lexicographic comparison is
+    an exact numeric one.
+    """
+    sign_a, digits_a, exponent_a = left
+    sign_b, digits_b, exponent_b = right
+    if not digits_a:
+        if not digits_b:
+            return 0
+        return -1 if sign_b > 0 else 1
+    if not digits_b:
+        return 1 if sign_a > 0 else -1
+    if sign_a != sign_b:
+        return 1 if sign_a > 0 else -1
+    magnitude_a = exponent_a + len(digits_a) - 1
+    magnitude_b = exponent_b + len(digits_b) - 1
+    if magnitude_a == magnitude_b:
+        if exponent_a >= exponent_b:
+            aligned_a = digits_a + "0" * (exponent_a - exponent_b)
+            aligned_b = digits_b
+        else:
+            aligned_a = digits_a
+            aligned_b = digits_b + "0" * (exponent_b - exponent_a)
+        if aligned_a == aligned_b:
+            return 0
+        a_greater = aligned_a > aligned_b
+    else:
+        a_greater = magnitude_a > magnitude_b
+    # Both operands share one sign; for negatives the order is reversed.
+    if sign_a < 0:
+        a_greater = not a_greater
+    return 1 if a_greater else -1
 
 
 def _sha256(path: Path) -> str:
@@ -234,7 +366,8 @@ class _PlainRuleEvaluator:
     rules: ``required`` treats only the empty string as missing (a
     whitespace-only value is present), ``unique`` skips empty strings and
     compares the raw text, and ``range`` skips empty values and accepts
-    only finite numeric text within the inclusive bounds.
+    only finite numeric text whose exact decimal value lies within the
+    inclusive bounds.
     """
 
     def __init__(self, rules: list[dict[str, Any]]):
@@ -244,6 +377,20 @@ class _PlainRuleEvaluator:
         }
         self._seen_unique: dict[str, dict[str, list[int]]] = {
             rule["id"]: {} for rule in self.rules if rule["type"] == "unique"
+        }
+        # Turn each configured boundary into the decimal value it denotes
+        # once, up front, so row scanning compares exact decimal values: a
+        # value differing from an endpoint by even the tiniest written
+        # fraction is still out of bounds.
+        self._range_bounds: dict[
+            str, tuple[_Decimal | None, _Decimal | None]
+        ] = {
+            rule["id"]: (
+                _bound_decimal(rule["min"]) if "min" in rule else None,
+                _bound_decimal(rule["max"]) if "max" in rule else None,
+            )
+            for rule in self.rules
+            if rule["type"] == "range"
         }
 
     def scan(self, row_number: int, value_of: Callable[[str], str]) -> None:
@@ -260,10 +407,11 @@ class _PlainRuleEvaluator:
             else:  # range
                 if value == "":
                     continue
-                number = _finite_number(value)
+                number = _finite_decimal(value)
+                lower, upper = self._range_bounds[rule["id"]]
                 if number is None or not (
-                    ("min" not in rule or number >= rule["min"])
-                    and ("max" not in rule or number <= rule["max"])
+                    (lower is None or _compare_decimal(number, lower) >= 0)
+                    and (upper is None or _compare_decimal(number, upper) <= 0)
                 ):
                     self.violations[rule["id"]].append(row_number)
 

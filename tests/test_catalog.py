@@ -901,6 +901,183 @@ class ValidationTest(unittest.TestCase):
         report = self.catalog.validate("r", 1)
         self.assertTrue(report["passed"])
 
+    def test_range_compares_exact_decimal_text_against_bounds(self):
+        # Upper bound 1: a value written just above 1 must violate even
+        # though binary float rounding would make it equal to 1.
+        self.catalog.import_csv(
+            "hi",
+            self.csv_file("v\n1.00000000000000001\n1\n1.0\n1e0\n0.99999999999999999\n"),
+        )
+        self.catalog.set_rules(
+            "hi", [{"id": "r", "column": "v", "type": "range", "max": 1}]
+        )
+        self.assertEqual(
+            self.catalog.validate("hi", 1)["results"][0]["violations"], [1]
+        )
+
+        # Lower bound 0: a tiny negative value must violate even though a
+        # float would flush its magnitude to zero.
+        self.catalog.import_csv(
+            "lo",
+            self.csv_file(
+                "v\n-1e-400\n0\n-0\n+0.0\n1e-400\n0.000000000000000001\n"
+            ),
+        )
+        self.catalog.set_rules(
+            "lo", [{"id": "r", "column": "v", "type": "range", "min": 0}]
+        )
+        self.assertEqual(
+            self.catalog.validate("lo", 1)["results"][0]["violations"], [1]
+        )
+
+        # An integer boundary keeps its full precision beyond float53: the
+        # endpoint passes in every equivalent written form, while a value a
+        # tenth above it violates.
+        big = 9007199254740992
+        self.catalog.import_csv(
+            "big",
+            self.csv_file(
+                "v\n9007199254740992\n9007199254740992.0\n9.007199254740992e15\n"
+                "9007199254740992.1\n9007199254740991\n"
+            ),
+        )
+        self.catalog.set_rules(
+            "big", [{"id": "r", "column": "v", "type": "range", "max": big}]
+        )
+        self.assertEqual(
+            self.catalog.validate("big", 1)["results"][0]["violations"], [4]
+        )
+
+        # A float boundary means the decimal text it usually displays: a
+        # cell "0.1" is the endpoint, not off by the binary storage error.
+        self.catalog.import_csv(
+            "tenth",
+            self.csv_file("v\n0.1\n0.10000000000000001\n0.09999999999999999\n"),
+        )
+        self.catalog.set_rules(
+            "tenth",
+            [{"id": "r", "column": "v", "type": "range", "min": 0.1, "max": 0.1}],
+        )
+        self.assertEqual(
+            self.catalog.validate("tenth", 1)["results"][0]["violations"], [2, 3]
+        )
+
+    def test_range_overflow_non_numeric_and_whitespace_still_violate(self):
+        self.catalog.import_csv(
+            "bad",
+            self.csv_file(
+                "v\n1e309\ninf\n-inf\nnan\ntrue\nfalse\nabc\n 1\n1 \n1_000\n1\n"
+            ),
+        )
+        self.catalog.set_rules(
+            "bad", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 1}]
+        )
+        report = self.catalog.validate("bad", 1)
+        result = report["results"][0]
+        # rows 1-10 violate (float overflow, non-finite, non-numeric,
+        # untrimmed whitespace); row 11 is the endpoint. Empty cells are
+        # covered by test_required_unique_range_semantics.
+        self.assertEqual(result["violations"], list(range(1, 11)))
+        self.assertEqual(result["violationCount"], 10)
+        self.assertEqual(report["rowCount"], 11)
+        self.assertFalse(report["passed"])
+
+    def test_range_persisted_report_is_not_recomputed(self):
+        self.catalog.import_csv("d", self.csv_file("v\n1.00000000000000001\n"))
+        self.catalog.set_rules(
+            "d", [{"id": "r", "column": "v", "type": "range", "max": 1}]
+        )
+        # A fresh run flags the out-of-bounds value.
+        self.assertEqual(self.catalog.validate("d", 1)["results"][0]["violations"], [1])
+        # Simulate a report persisted by an older build (which had rounded
+        # the value to 1 and passed): it must be reused verbatim rather
+        # than recomputed or overwritten.
+        record = self.catalog.get("d", 1)
+        state = self.catalog._load()
+        legacy_report = {
+            "dataset": "d",
+            "version": 1,
+            "content_sha256": record["content_sha256"],
+            "rulesRevision": 1,
+            "rowCount": 1,
+            "passed": True,
+            "results": [
+                {
+                    "id": "r",
+                    "column": "v",
+                    "type": "range",
+                    "violations": [],
+                    "violationCount": 0,
+                }
+            ],
+        }
+        state["validations"]["d"]["1"]["1"] = {
+            "content_sha256": record["content_sha256"],
+            "report": legacy_report,
+        }
+        self.catalog._save(state)
+        reused = self.catalog.validate("d", 1)
+        self.assertTrue(reused["passed"])
+        self.assertEqual(reused["results"][0]["violations"], [])
+        self.assertEqual(self.catalog.validation_history("d", 1), [legacy_report])
+
+    def test_range_exact_decimal_helpers(self):
+        from governance_workbench.catalog import (
+            _bound_decimal,
+            _compare_decimal,
+            _finite_decimal,
+        )
+
+        def order(cell, bound):
+            return _compare_decimal(_finite_decimal(cell), _bound_decimal(bound))
+
+        # equivalent integer writings; signed zeros equal zero
+        for cell in ("1", "1.0", "1e0", "1E0", "+1.00"):
+            self.assertEqual(order(cell, 1), 0)
+        for cell in ("0", "-0", "+0.0", "0.0000", "0e-400"):
+            self.assertEqual(order(cell, 0), 0)
+        # tiny signed deviations decide correctly on both sides
+        self.assertGreater(order("1.00000000000000001", 1), 0)
+        self.assertLess(order("0.99999999999999999", 1), 0)
+        self.assertLess(order("-1e-400", 0), 0)
+        self.assertGreater(order("1e-400", 0), 0)
+        # exact float endpoint via repr normalization
+        self.assertEqual(order("0.1", 0.1), 0)
+        self.assertGreater(order("0.10000000000000001", 0.1), 0)
+        self.assertLess(order("0.09999999999999999", 0.1), 0)
+        # big integer boundary keeps full precision
+        big = 9007199254740992
+        self.assertEqual(order("9007199254740992", big), 0)
+        self.assertEqual(order("9.007199254740992e15", big), 0)
+        self.assertGreater(order("9007199254740992.1", big), 0)
+        self.assertLess(order("9007199254740991.9", big), 0)
+        # non-finite and non-numeric text does not parse
+        for cell in ("inf", "-inf", "nan", "true", " 1", "1 ", "", "1_000", "1e309"):
+            self.assertIsNone(_finite_decimal(cell))
+
+    def test_range_extreme_decimal_text_never_interrupts_validation(self):
+        # Exponents and fractions far beyond float/Decimal limits must be
+        # judged as the exact decimal written, never raise and abort the run.
+        tiny_neg = "-0." + "0" * 5000 + "1"
+        tiny_pos = "0." + "0" * 5000 + "1"
+        huge_exp_zero = "0e" + "9" * 6000
+        huge_exp_tiny = "-1e-" + "9" * 6000
+        self.catalog.import_csv(
+            "x",
+            self.csv_file(
+                "v\n" + "\n".join(
+                    [tiny_neg, tiny_pos, huge_exp_zero, huge_exp_tiny, "0", "1"]
+                )
+                + "\n"
+            ),
+        )
+        self.catalog.set_rules(
+            "x", [{"id": "r", "column": "v", "type": "range", "min": 0, "max": 1}]
+        )
+        # rows 1 and 4 are (tiny) negatives; everything else is within [0, 1]
+        report = self.catalog.validate("x", 1)
+        self.assertEqual(report["results"][0]["violations"], [1, 4])
+
     def test_columns_match_verbatim(self):
         self.catalog.import_csv("c", self.csv_file(" id\n1\n"))
         self.catalog.set_rules("c", [{"id": "r", "column": "id", "type": "required"}])
@@ -1423,6 +1600,45 @@ class ReferenceRuleTest(unittest.TestCase):
         self.assertEqual(by_id["c-ref"]["violations"], [2])
         self.assertEqual(by_id["c-required"]["violations"], [])
         self.assertFalse(report["passed"])
+
+    def test_range_decimal_results_identical_with_or_without_reference(self):
+        self.catalog.import_csv("ref", self.csv_file("code\nA\n", "ref.csv"))
+        self.catalog.import_csv(
+            "d",
+            self.csv_file(
+                "c,v\n"
+                "A,1.00000000000000001\n"  # just above max 1
+                "A,1\n"                    # endpoint
+                "A,-1e-400\n"              # just below min 0
+                "A,0.1\n"                  # endpoint of the float bound
+            ),
+        )
+        range_rule = {
+            "id": "v-range", "column": "v", "type": "range",
+            "min": 0.1, "max": 1,
+        }
+        reference_rule = {
+            "id": "c-ref",
+            "type": "reference",
+            "columns": ["c"],
+            "reference": {"dataset": "ref", "version": 1, "columns": ["code"]},
+        }
+        self.catalog.set_rules("d", [range_rule])
+        self.catalog.set_rules("d", [range_rule, reference_rule])
+
+        plain = self.catalog.validate("d", 1, revision=1)
+        mixed = self.catalog.validate("d", 1, revision=2)
+        plain_range = plain["results"][0]
+        mixed_range = mixed["results"][0]
+        # rows 1 and 3 violate; adding a reference rule changes neither the
+        # range verdict, the row numbering, nor the counts.
+        self.assertEqual(plain_range["violations"], [1, 3])
+        self.assertEqual(
+            {k: mixed_range[k] for k in ("id", "column", "type", "violations", "violationCount")},
+            {k: plain_range[k] for k in ("id", "column", "type", "violations", "violationCount")},
+        )
+        self.assertEqual(mixed["results"][1]["violations"], [])
+        self.assertEqual(plain["passed"], mixed["passed"])
 
     def test_cleaned_versions_work_on_either_side(self):
         self.catalog.import_csv("ref", self.csv_file("code\n A \nB\n", "ref.csv"))
@@ -2334,6 +2550,30 @@ class CliTest(unittest.TestCase):
         result = self.run_cli("validations", "d", "3")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout), [])
+
+    def test_validate_exact_decimal_range_exit_code(self):
+        decimal_csv = self.root / "decimal.csv"
+        decimal_csv.write_text(
+            "v\n1.00000000000000001\n1\n-1e-400\n0.1\n", encoding="utf-8"
+        )
+        result = self.run_cli("import", "d", str(decimal_csv))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        rules_path = self.root / "decimal-rules.json"
+        rules_path.write_text(json.dumps([
+            {"id": "rng", "column": "v", "type": "range", "min": 0.1, "max": 1},
+        ]), encoding="utf-8")
+        result = self.run_cli("rules", "d", str(rules_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        result = self.run_cli("validate", "d", "1")
+        # rows 1 (barely above 1) and 3 (barely below 0.1) violate;
+        # rows 2 (endpoint 1) and 4 (endpoint 0.1) pass.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["results"][0]["violations"], [1, 3])
+        self.assertEqual(report["results"][0]["violationCount"], 2)
 
     def test_import_strictness_envelope_and_exit_codes(self):
         # success still prints the full record on stdout

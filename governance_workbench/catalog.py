@@ -444,6 +444,24 @@ class Catalog:
             raise ValueError("keys must not contain duplicates")
         return list(keys)
 
+    def _verified_row_diff_side(
+        self,
+        state: dict[str, Any],
+        dataset: str,
+        version: int,
+    ) -> tuple[list[str], list[list[str]]]:
+        """Snapshot and strictly parse one side of a keyed comparison.
+
+        Existence, the SHA-256 check against the version record, and the
+        parsed header/rows all derive from a single raw-byte read, so the
+        hash check and the diff describe one and the same content: replacing,
+        rewriting, or deleting the stored file afterwards neither leaks
+        later fields or records into this comparison nor makes a re-read
+        fail. Every error names the dataset and version involved.
+        """
+        _, content = self._snapshot_blob(state, dataset, version)
+        return self._parse_stored_csv(content, dataset, version)
+
     def _row_diff(
         self,
         dataset: str,
@@ -452,28 +470,20 @@ class Catalog:
         keys: list[str],
         state: dict[str, Any],
     ) -> dict[str, Any]:
-        # Verify both stored blobs against their version records before any
-        # parsing, including when both sides are the same version.
+        # Snapshot and verify both stored blobs against their version records
+        # before any diffing, including when both sides are the same version.
         left_record = self._version_record(state, dataset, left)
         right_record = self._version_record(state, dataset, right)
-        for record, version in ((left_record, left), (right_record, right)):
-            blob_path = self.workspace / record["blob"]
-            if not blob_path.exists():
-                raise ValueError(f"stored data missing for {dataset}@{version}")
-            if _sha256(blob_path) != record["content_sha256"]:
-                raise ValueError(f"stored data hash mismatch for {dataset}@{version}")
-        try:
-            left_header, left_rows = self._read_stored_csv(
-                self.workspace / left_record["blob"], dataset, left
+        left_header, left_rows = self._verified_row_diff_side(state, dataset, left)
+        if right_record["blob"] == left_record["blob"]:
+            # Both version records share one content-addressed blob, so both
+            # sides must see the exact same snapshotted content even if the
+            # file changes mid-comparison.
+            right_header, right_rows = left_header, left_rows
+        else:
+            right_header, right_rows = self._verified_row_diff_side(
+                state, dataset, right
             )
-            if right_record["blob"] == left_record["blob"]:
-                right_header, right_rows = left_header, left_rows
-            else:
-                right_header, right_rows = self._read_stored_csv(
-                    self.workspace / right_record["blob"], dataset, right
-                )
-        except csv.Error as error:
-            raise ValueError(f"stored CSV could not be parsed: {error}")
 
         for side, header, version in (
             ("left", left_header, left),
@@ -1707,12 +1717,6 @@ class Catalog:
                 )
             rows.append(list(record))
         return header, rows
-
-    @staticmethod
-    def _read_stored_csv(blob_path: Path, dataset: str, version: int) -> tuple[list[str], list[list[str]]]:
-        with blob_path.open("rb") as handle:
-            content = handle.read()
-        return Catalog._parse_stored_csv(content, dataset, version)
 
     def clean(self, dataset: str, version: int, operations: Any) -> dict[str, Any]:
         """Clean a stored version and append the result as a new immutable version.

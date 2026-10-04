@@ -60,3 +60,20 @@ if (result.ok()) {
 `sha256_file` 遵循与命令行相同的字节和失败规则，只返回结果，不打印、不退出进程。
 也可以直接使用 `branchaudit::Sha256` 类对任意字节流做增量计算（`update()` /
 `final()`）。
+
+## 测试
+
+随仓库提供自动回归测试，覆盖标准测试向量、空文件/文本/二进制内容、分组与
+填充边界长度、增量接口分段一致性、大文件尾部、含空格或中文的路径，以及文件
+不存在和指向目录两种失败行为。预期摘要以独立标准实现（FIPS 180-4 公布向量、
+系统 `sha256sum` 与 Python `hashlib`/OpenSSL）为依据，不与本项目实现互相比较。
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+包含两个测试：`sha256_unit`（C++ 层，直接链接 `branchaudit_core`）和
+`cli_e2e`（Python 端到端，校验命令行退出码与标准输出/错误契约）。
+可通过 `-DBRANCHAUDIT_BUILD_TESTS=OFF` 关闭测试构建。

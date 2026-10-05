@@ -5,6 +5,7 @@ project(branchaudit VERSION 0.1.0 LANGUAGES CXX)
 add_library(branchaudit_core STATIC
     src/sha256.cpp
     src/filehash.cpp
+    src/merkle.cpp
 )
 target_compile_features(branchaudit_core PUBLIC cxx_std_20)
 set_target_properties(branchaudit_core PROPERTIES CXX_EXTENSIONS OFF)
@@ -26,6 +27,11 @@ if(BRANCHAUDIT_BUILD_TESTS)
     target_link_libraries(sha256_test PRIVATE branchaudit_core)
     add_test(NAME sha256_unit COMMAND sha256_test)
     set_tests_properties(sha256_unit PROPERTIES TIMEOUT 30)
+
+    add_executable(merkle_test tests/merkle_test.cpp)
+    target_link_libraries(merkle_test PRIVATE branchaudit_core)
+    add_test(NAME merkle_unit COMMAND merkle_test)
+    set_tests_properties(merkle_unit PROPERTIES TIMEOUT 30)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

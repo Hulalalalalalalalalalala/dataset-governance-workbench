@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""branchaudit 命令行 SHA-256 摘要的端到端回归测试。
+"""branchaudit 命令行文件摘要（hash）与有序批次 Merkle 根（root）的端到端测试。
 
 判定依据独立于本项目：预期摘要全部由 Python hashlib（底层为系统
 OpenSSL 的 SHA-256 实现）计算，不读取、不信任 branchaudit 自身代码，
@@ -35,6 +35,33 @@ def reference(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# ---- Merkle 根的独立参考实现（hashlib / OpenSSL） --------------------------
+
+def leaf_hash(data: bytes) -> bytes:
+    """文件叶子：SHA-256(0x00 || 原始字节)，0x00 是单个原始前缀字节。"""
+    return hashlib.sha256(b"\x00" + data).digest()
+
+
+def parent_hash(left: bytes, right: bytes) -> bytes:
+    """父摘要：SHA-256(0x01 || 左32字节 || 右32字节)，用原始字节而非十六进制。"""
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def merkle_root(contents) -> bytes:
+    """按公开配对规则计算有序批次的根；空批次为 SHA-256(空字节序列)。"""
+    if not contents:
+        return hashlib.sha256(b"").digest()
+    level = [leaf_hash(d) for d in contents]
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level) - (len(level) & 1), 2):
+            nxt.append(parent_hash(level[i], level[i + 1]))
+        if len(level) & 1:  # 奇数：末节点原样提升，不复制、不补零
+            nxt.append(level[-1])
+        level = nxt
+    return level[0]
+
+
 def fill_a(n: int) -> bytes:
     return b"a" * n
 
@@ -49,6 +76,26 @@ def run_cli(exe: str, *args: str, cwd: str | None = None):
         capture_output=True,
         cwd=cwd,
     )
+
+
+def run_root(exe: str, *args: str, cwd: str | None = None):
+    return subprocess.run(
+        [exe, "root", *args],
+        capture_output=True,
+        cwd=cwd,
+    )
+
+
+def expect_root(exe: str, args, contents, label: str):
+    """root 成功契约：退出码 0；stdout 恰为 64 位小写十六进制加换行；stderr 空。"""
+    proc = run_root(exe, *args)
+    expected = (merkle_root(contents).hex() + "\n").encode("ascii")
+    check(proc.returncode == 0, f"{label}: exit code 0 (got {proc.returncode})")
+    check(proc.stdout == expected,
+          f"{label}: stdout must be the 64-hex root + newline "
+          f"(got {proc.stdout!r}, want {expected!r})")
+    check(len(proc.stdout) == 65, f"{label}: stdout length is 65")
+    check(proc.stderr == b"", f"{label}: stderr must be empty (got {proc.stderr!r})")
 
 
 def expect_file_success(exe: str, path: Path, data: bytes, label: str):
@@ -226,6 +273,159 @@ def main() -> int:
         check(b"directory" in proc.stderr,
               f"directory path: stderr states directory reason "
               f"(got {proc.stderr!r})")
+
+        # ==================================================================
+        # root：有序文件批次的 Merkle 根（预期值全部由上方 hashlib 参考
+        # 实现独立计算）
+        # ==================================================================
+        rdir = tmp / "root fixtures"
+        r_empty = rdir / "empty.bin"
+        r_a = rdir / "a.bin"
+        r_abc = rdir / "abc.bin"
+        r_hello = rdir / "hello.bin"
+        write_fixture(r_empty, b"")
+        write_fixture(r_a, b"a")
+        write_fixture(r_abc, b"abc")
+        write_fixture(r_hello, b"hello\n")
+
+        empty_batch_hex = hashlib.sha256(b"").hexdigest()
+        leaf_empty_hex = hashlib.sha256(b"\x00").hexdigest()
+
+        # ---- 零文件：空字节序列的 SHA-256，成功退出 0 -------------------
+        proc = run_root(exe)
+        check(proc.returncode == 0, f"root no files: exit 0 (got {proc.returncode})")
+        check(proc.stdout == (empty_batch_hex + "\n").encode("ascii"),
+              f"root no files: SHA-256 of empty sequence (got {proc.stdout!r})")
+        check(proc.stderr == b"", "root no files: stderr empty")
+
+        # ---- 单个空文件 ≠ 空批次根 --------------------------------------
+        proc = run_root(exe, str(r_empty))
+        check(proc.returncode == 0, "root single empty file: exit 0")
+        check(proc.stdout == (leaf_empty_hex + "\n").encode("ascii"),
+              f"root single empty file is leaf 0x00 (got {proc.stdout!r})")
+        check(proc.stdout != (empty_batch_hex + "\n").encode("ascii"),
+              "single empty file root differs from empty batch root")
+        check(proc.stderr == b"", "root single empty file: stderr empty")
+
+        # ---- 单文件根是叶子，绝不是现有 hash 的结果 ---------------------
+        proc = run_root(exe, str(r_a))
+        hash_a = run_cli(exe, str(r_a)).stdout
+        expect_root(exe, [str(r_a)], [b"a"], "root single file 'a'")
+        check(proc.stdout != hash_a,
+              "root of one file must not equal plain hash of that file")
+
+        # ---- 顺序来自参数：交换顺序根不同 -------------------------------
+        expect_root(exe, [str(r_a), str(r_abc)], [b"a", b"abc"],
+                    "root [a, abc]")
+        expect_root(exe, [str(r_abc), str(r_a)], [b"abc", b"a"],
+                    "root [abc, a]")
+        check(run_root(exe, str(r_a), str(r_abc)).stdout !=
+                  run_root(exe, str(r_abc), str(r_a)).stdout,
+              "root is order-sensitive")
+
+        # ---- 奇数末节点原样提升；重复位置保留 ---------------------------
+        expect_root(exe,
+                    [str(r_a), str(r_abc), str(r_empty)],
+                    [b"a", b"abc", b""],
+                    "root [a, abc, empty] odd promotion")
+        expect_root(exe,
+                    [str(r_a), str(r_abc), str(r_empty), str(r_hello), str(r_a)],
+                    [b"a", b"abc", b"", b"hello\n", b"a"],
+                    "root of 5 files")
+        expect_root(exe, [str(r_a), str(r_a)], [b"a", b"a"],
+                    "same path repeated keeps two positions")
+        r_a_copy = rdir / "copy of a.bin"
+        write_fixture(r_a_copy, b"a")
+        check(run_root(exe, str(r_a), str(r_a_copy)).stdout ==
+                  run_root(exe, str(r_a), str(r_a)).stdout,
+              "equal contents in distinct files equal repeated positions")
+        check(run_root(exe, str(r_a), str(r_a_copy)).stdout !=
+                  run_root(exe, str(r_a)).stdout,
+              "two equal files do not collapse to one position")
+
+        # ---- 路径无关：同序内容移到别处（含空格/中文目录）根一致 --------
+        moved = tmp / "搬到 别处" / "批 次"
+        m_empty = moved / "空.bin"
+        m_a = moved / "a file.dat"
+        m_abc = tmp / "深 路径" / "摘 要.bin"
+        write_fixture(m_empty, b"")
+        write_fixture(m_a, b"a")
+        write_fixture(m_abc, b"abc")
+        check(run_root(exe, str(m_empty), str(m_a), str(m_abc)).stdout ==
+                  run_root(exe, str(r_empty), str(r_a), str(r_abc)).stdout,
+              "moving files elsewhere keeps root for same ordered contents")
+
+        # ---- 含空格/中文路径与相对路径 ----------------------------------
+        spaced_root = run_root(exe, str(m_empty), str(m_a), str(m_abc))
+        check(spaced_root.returncode == 0 and spaced_root.stderr == b"",
+              "root handles paths with spaces and Chinese characters")
+        rel_dir = tmp / "root rel 目录"
+        rel_dir.mkdir(parents=True, exist_ok=True)
+        write_fixture(rel_dir / "r1.bin", b"a")
+        write_fixture(rel_dir / "r2.bin", b"abc")
+        proc = run_root(exe, "r1.bin", "r2.bin", cwd=str(rel_dir))
+        check(proc.returncode == 0 and
+                  proc.stdout ==
+                  (merkle_root([b"a", b"abc"]).hex() + "\n").encode("ascii") and
+                  proc.stderr == b"",
+              "root relative paths resolved from current working directory")
+
+        # ---- 大文件流式 + 尾部敏感 --------------------------------------
+        big1 = fill_a(200000)
+        big2 = pattern(200000)
+        rb1 = rdir / "big1.bin"
+        rb2 = rdir / "big2.bin"
+        write_fixture(rb1, big1)
+        write_fixture(rb2, big2)
+        expect_root(exe, [str(rb1)], [big1], "root single large file")
+        expect_root(exe, [str(rb1), str(rb2)], [big1, big2],
+                    "root two large files")
+        big_tail = bytearray(big1)
+        big_tail[-1] = ord("b")
+        rb_tail = rdir / "big1tail.bin"
+        write_fixture(rb_tail, bytes(big_tail))
+        check(run_root(exe, str(rb_tail)).stdout !=
+                  run_root(exe, str(rb1)).stdout,
+              "root large file: changing last byte changes root")
+
+        # ---- 失败即整次失败：退出 1、stdout 空、stderr 指明路径与原因 ---
+        r_missing = rdir / "root missing 缺失.bin"
+        for label, args in (
+            ("only missing", [str(r_missing)]),
+            ("missing first", [str(r_missing), str(r_a)]),
+            ("missing middle", [str(r_a), str(r_missing), str(r_abc)]),
+            ("missing last", [str(r_a), str(r_missing)]),
+        ):
+            proc = run_root(exe, *args)
+            check(proc.returncode == 1, f"root {label}: exit code 1")
+            check(proc.stdout == b"", f"root {label}: stdout empty")
+            check(proc.stderr != b"", f"root {label}: stderr nonempty")
+            check(str(r_missing).encode() in proc.stderr,
+                  f"root {label}: stderr names failed path "
+                  f"(got {proc.stderr!r})")
+
+        r_dir = rdir / "a root dir 目录"
+        r_dir.mkdir()
+        proc = run_root(exe, str(r_a), str(r_dir))
+        check(proc.returncode == 1, "root directory: exit code 1")
+        check(proc.stdout == b"", "root directory: stdout empty")
+        check(str(r_dir).encode() in proc.stderr and b"directory" in proc.stderr,
+              f"root directory: stderr names path and directory reason "
+              f"(got {proc.stderr!r})")
+
+        # ---- 保留 hash / --version 及用法错误行为 -----------------------
+        check(subprocess.run([exe, "--version"], capture_output=True).stdout ==
+                  b"branchaudit 0.1.0\n",
+              "--version output preserved")
+        proc = subprocess.run([exe, "hash"], capture_output=True)
+        check(proc.returncode == 2 and proc.stdout == b"",
+              "hash with no path remains usage error (exit 2)")
+        proc = subprocess.run([exe, "hash", str(r_a), str(r_abc)],
+                              capture_output=True)
+        check(proc.returncode == 2 and proc.stdout == b"",
+              "hash with extra paths remains usage error (exit 2)")
+        proc = subprocess.run([exe, "bogus"], capture_output=True)
+        check(proc.returncode == 2, "unknown subcommand remains usage error")
 
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} CLI checks failed", file=sys.stderr)

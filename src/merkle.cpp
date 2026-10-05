@@ -1,8 +1,9 @@
 #include "merkle.h"
 
-#include <cerrno>
-#include <cstring>
-#include <fstream>
+#include <utility>
+#include <vector>
+
+#include "file_digest_internal.h"
 
 namespace branchaudit {
 
@@ -31,51 +32,11 @@ Digest merkle_parent(const Digest& left, const Digest& right) {
 namespace {
 
 // 流式计算单个文件的叶子摘要 SHA-256(0x00 || file bytes)。
-// 路径与读取失败规则与 sha256_file 保持一致；失败时 error 非空。
+// 定位、打开、分块读取与失败处理与 sha256_file 共用同一实现：唯一区别是
+// 在文件字节之前加入一次单个 0x00 前缀字节（空文件也存在，且不随分块重复）。
 FileHashResult leaf_file(const std::filesystem::path& path) {
-    FileHashResult result;
-
-    std::error_code ec;
-    if (std::filesystem::is_directory(path, ec)) {
-        result.error = path.string() + ": is a directory";
-        return result;
-    }
-
-    errno = 0;
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": " +
-                       (saved_errno != 0
-                            ? std::strerror(saved_errno)
-                            : "cannot open file");
-        return result;
-    }
-
-    Sha256 sha;
-    const unsigned char prefix = 0x00;
-    sha.update(&prefix, 1);
-    // 固定大小缓冲区流式读取，内存占用不随文件长度增长。
-    char buffer[64 * 1024];
-    while (in) {
-        in.read(buffer, sizeof(buffer));
-        const std::streamsize count = in.gcount();
-        if (count > 0) {
-            sha.update(reinterpret_cast<const unsigned char*>(buffer),
-                       static_cast<std::size_t>(count));
-        }
-    }
-    if (in.bad()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": read error" +
-                       (saved_errno != 0
-                            ? std::string(": ") + std::strerror(saved_errno)
-                            : std::string());
-        return result;
-    }
-
-    result.digest = sha.final();
-    return result;
+    static constexpr unsigned char kLeafPrefix = 0x00;
+    return internal::sha256_file_digest(path, &kLeafPrefix);
 }
 
 }  // namespace

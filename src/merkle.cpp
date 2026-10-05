@@ -1,8 +1,6 @@
 #include "merkle.h"
 
-#include <cerrno>
-#include <cstring>
-#include <fstream>
+#include "filereader.h"
 
 namespace branchaudit {
 
@@ -31,50 +29,15 @@ Digest merkle_parent(const Digest& left, const Digest& right) {
 namespace {
 
 // 流式计算单个文件的叶子摘要 SHA-256(0x00 || file bytes)。
-// 路径与读取失败规则与 sha256_file 保持一致；失败时 error 非空。
+// 路径与读取失败规则与 sha256_file 共用 hash_file_into；失败时 error 非空。
 FileHashResult leaf_file(const std::filesystem::path& path) {
     FileHashResult result;
-
-    std::error_code ec;
-    if (std::filesystem::is_directory(path, ec)) {
-        result.error = path.string() + ": is a directory";
-        return result;
-    }
-
-    errno = 0;
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": " +
-                       (saved_errno != 0
-                            ? std::strerror(saved_errno)
-                            : "cannot open file");
-        return result;
-    }
-
     Sha256 sha;
-    const unsigned char prefix = 0x00;
-    sha.update(&prefix, 1);
-    // 固定大小缓冲区流式读取，内存占用不随文件长度增长。
-    char buffer[64 * 1024];
-    while (in) {
-        in.read(buffer, sizeof(buffer));
-        const std::streamsize count = in.gcount();
-        if (count > 0) {
-            sha.update(reinterpret_cast<const unsigned char*>(buffer),
-                       static_cast<std::size_t>(count));
-        }
+    // with_leaf_prefix=true：0x00 在任何文件字节之前只追加一次（空文件亦然）。
+    result.error = hash_file_into(path, sha, /*with_leaf_prefix=*/true);
+    if (result.error.empty()) {
+        result.digest = sha.final();
     }
-    if (in.bad()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": read error" +
-                       (saved_errno != 0
-                            ? std::string(": ") + std::strerror(saved_errno)
-                            : std::string());
-        return result;
-    }
-
-    result.digest = sha.final();
     return result;
 }
 

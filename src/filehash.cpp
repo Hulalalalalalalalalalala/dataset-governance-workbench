@@ -1,53 +1,18 @@
 #include "filehash.h"
 
-#include <cerrno>
-#include <cstring>
-#include <fstream>
-#include <system_error>
+#include "filereader.h"
 
 namespace branchaudit {
 
 FileHashResult sha256_file(const std::filesystem::path& path) {
     FileHashResult result;
-
-    std::error_code ec;
-    if (std::filesystem::is_directory(path, ec)) {
-        result.error = path.string() + ": is a directory";
-        return result;
-    }
-
-    errno = 0;
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": " +
-                       (saved_errno != 0
-                            ? std::strerror(saved_errno)
-                            : "cannot open file");
-        return result;
-    }
-
     Sha256 sha;
-    // 固定大小缓冲区流式读取，内存占用不随文件长度增长。
-    char buffer[64 * 1024];
-    while (in) {
-        in.read(buffer, sizeof(buffer));
-        const std::streamsize count = in.gcount();
-        if (count > 0) {
-            sha.update(reinterpret_cast<const unsigned char*>(buffer),
-                       static_cast<std::size_t>(count));
-        }
+    // 普通文件摘要：不带 Merkle 叶子前缀，直接对原始字节计算 SHA-256。
+    // 路径检查、打开、分块读取与失败处理与 root 的文件叶子共用同一实现。
+    result.error = hash_file_into(path, sha, /*with_leaf_prefix=*/false);
+    if (result.error.empty()) {
+        result.digest = sha.final();
     }
-    if (in.bad()) {
-        const int saved_errno = errno;
-        result.error = path.string() + ": read error" +
-                       (saved_errno != 0
-                            ? std::string(": ") + std::strerror(saved_errno)
-                            : std::string());
-        return result;
-    }
-
-    result.digest = sha.final();
     return result;
 }
 

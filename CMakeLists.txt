@@ -4,6 +4,7 @@ project(branchaudit VERSION 0.1.0 LANGUAGES CXX)
 # 可复用核心库：其他 C++20 程序可链接 branchaudit_core 并包含 src/ 下的头文件。
 add_library(branchaudit_core STATIC
     src/sha256.cpp
+    src/filereader.cpp
     src/filehash.cpp
     src/merkle.cpp
 )

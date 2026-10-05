@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -429,6 +430,222 @@ void test_hex_format() {
           "to_hex of empty digest matches standard");
 }
 
+// ---- 有序文件批次 Merkle 根 -----------------------------------------------
+//
+// 预期根值的独立依据：由 Python hashlib（系统 OpenSSL 的 SHA-256）按公开
+// 字节规则（叶子 0x00 前缀、父节点 0x01 前缀、摘要按原始字节拼接）另行
+// 计算，不使用本项目代码生成期望值。
+
+std::pair<std::string, std::string> silent_merkle_root(
+    const std::vector<fs::path>& paths, branchaudit::MerkleRootResult* out) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    *out = branchaudit::merkle_root(paths);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    return {cap_out.str(), cap_err.str()};
+}
+
+void test_merkle_root() {
+    TempArea tmp("merkle");
+
+    const std::vector<unsigned char> d0;                       // 空文件
+    const std::vector<unsigned char> d1 = {'a', 'b', 'c'};
+    const std::vector<unsigned char> d2 = {'a', 0x00, 'b', 0xff, ' ',
+                                           'c', '\n', 'd'};
+    const std::vector<unsigned char> d3 = fill_a(65);
+    const std::vector<unsigned char> d4 = pattern(100);
+    const std::vector<unsigned char> d5 = {'x', 'y', 'z'};
+
+    struct Fixture { std::string name; const std::vector<unsigned char>& bytes; };
+    const Fixture fixtures[] = {
+        {"d0.bin", d0}, {"d1.bin", d1}, {"d2.bin", d2},
+        {"d3.bin", d3}, {"d4.bin", d4}, {"d5.bin", d5},
+    };
+    for (const auto& f : fixtures) {
+        write_file(tmp.root / f.name, f.bytes);
+    }
+    auto P = [&](std::string_view name) { return tmp.root / name; };
+    auto roots = [&](const std::vector<std::string>& names) {
+        std::vector<fs::path> paths;
+        for (const auto& n : names) paths.push_back(P(n));
+        branchaudit::MerkleRootResult r;
+        auto captured = silent_merkle_root(paths, &r);
+        check(captured.first.empty() && captured.second.empty(),
+              "merkle: library prints nothing");
+        return r;
+    };
+
+    // 空批次：SHA-256(空字节序列)。
+    {
+        branchaudit::MerkleRootResult r;
+        auto captured = silent_merkle_root({}, &r);
+        check(r.ok(), "merkle empty batch: ok");
+        check(hex_of(r.digest) ==
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "merkle empty batch: sha256 of empty byte sequence");
+        check(captured.first.empty() && captured.second.empty(),
+              "merkle empty batch: no printing");
+    }
+
+    // 单文件：根即叶子 SHA-256(0x00||bytes)，既不是空批次根，也不是
+    // 现有 hash 的无前缀结果。
+    {
+        branchaudit::MerkleRootResult r = roots({"d0.bin"});
+        check(r.ok() &&
+                  hex_of(r.digest) ==
+                      "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+              "merkle single empty file: leaf sha256(0x00)");
+        check(hex_of(r.digest) !=
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "merkle one empty file differs from empty batch");
+    }
+    {
+        branchaudit::MerkleRootResult r = roots({"d1.bin"});
+        check(r.ok() &&
+                  hex_of(r.digest) ==
+                      "609f6e36d2405585188d5cfd761f407c7cc46a7d3f314c88270469dde315fcd1",
+              "merkle single file: leaf sha256(0x00||bytes)");
+        check(hex_of(r.digest) !=
+                  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+              "merkle single-file root is not the plain hash result");
+    }
+
+    // 多层结构：偶数、奇数落单上浮、连续两层落单，期望值取自独立实现。
+    struct Case {
+        std::vector<std::string> names;
+        const char* expected;
+    };
+    const Case cases[] = {
+        {{"d1.bin", "d2.bin"},
+         "c6d138bdc662abe11199e19648059868096570e1c445adfac66612dbdb107005"},
+        {{"d1.bin", "d2.bin", "d3.bin"},
+         "36c5033e94959628b98b157966e65fb3987d2a57a54c0597a37f4ae8b106f43c"},
+        {{"d1.bin", "d2.bin", "d3.bin", "d4.bin"},
+         "92d29cf4ac01d85539da66a2fd5f903856f22fe9c54bf6dedbfbbf5390ea68b7"},
+        {{"d1.bin", "d2.bin", "d3.bin", "d4.bin", "d5.bin"},
+         "37b8a85d21a5ff9f22bd5205837247934b1ba47cab35fdecadbb52572f03ad9f"},
+        // 7 个节点：3->2 层与 2->1 层各有一次落单上浮。
+        {{"d1.bin", "d2.bin", "d3.bin", "d4.bin", "d5.bin", "d0.bin", "d2.bin"},
+         "6b317f3230686394cf676f0279d83101c705301ece8d814d5310d7e2f27bfa2f"},
+    };
+    for (const auto& c : cases) {
+        branchaudit::MerkleRootResult r = roots(c.names);
+        check(r.ok() && hex_of(r.digest) == c.expected,
+              "merkle batch structure: " +
+                  std::to_string(c.names.size()) + " files");
+    }
+
+    // 顺序敏感：交换两个位置必须得到不同根。
+    {
+        branchaudit::MerkleRootResult ab = roots({"d1.bin", "d2.bin"});
+        branchaudit::MerkleRootResult ba = roots({"d2.bin", "d1.bin"});
+        check(hex_of(ab.digest) ==
+                  "c6d138bdc662abe11199e19648059868096570e1c445adfac66612dbdb107005",
+              "merkle order: [d1,d2] reference");
+        check(hex_of(ba.digest) ==
+                  "dd6a8becf6392f435d909b0bd9da4afb032869dc849308b6bbdef8ba3ba22c57",
+              "merkle order: [d2,d1] reference");
+        check(hex_of(ab.digest) != hex_of(ba.digest),
+              "merkle order comes from arguments, never sorted");
+    }
+
+    // 不去重：同一路径重复传入与相同内容文件都保留各自位置。
+    {
+        branchaudit::MerkleRootResult two_same = roots({"d1.bin", "d1.bin"});
+        check(hex_of(two_same.digest) ==
+                  "2affb1ee66535319d17552a1d471be7c6b88b6e0ec4d2764beb6f515ae31de7c",
+              "merkle repeated path keeps two positions: pair");
+        branchaudit::MerkleRootResult one = roots({"d1.bin"});
+        check(hex_of(two_same.digest) != hex_of(one.digest),
+              "merkle repeated path is not collapsed to one position");
+        branchaudit::MerkleRootResult three_same =
+            roots({"d1.bin", "d1.bin", "d1.bin"});
+        check(hex_of(three_same.digest) ==
+                  "05a9ec579a80902f05e079836849295762488fbea6e43547eb3a7e4eb77758a8",
+              "merkle repeated path three times: pair + promoted copy");
+
+        // 内容相同但路径不同的两个文件：不去重，且根与同路径重复一致。
+        const fs::path d1_copy = tmp.root / "sub dir" / "副本 一.bin";
+        write_file(d1_copy, d1);
+        std::vector<fs::path> pp{P("d1.bin"), d1_copy};
+        branchaudit::MerkleRootResult r;
+        silent_merkle_root(pp, &r);
+        check(r.ok() && hex_of(r.digest) == hex_of(two_same.digest),
+              "merkle identical contents at distinct paths keep both positions");
+    }
+
+    // 根只反映各位置的文件内容：改名/移动后同序传入结果一致，
+    // 路径文字（含空格、中文）绝不混入。
+    {
+        const fs::path moved = tmp.root / "别处 目录" / "新 名字.dat";
+        write_file(moved, d1);
+        const fs::path spaced = tmp.root / "spa ce" / "na me.bin";
+        write_file(spaced, d2);
+        std::vector<fs::path> a{P("d1.bin"), P("d2.bin")};
+        std::vector<fs::path> b{moved, spaced};
+        branchaudit::MerkleRootResult ra, rb;
+        silent_merkle_root(a, &ra);
+        silent_merkle_root(b, &rb);
+        check(ra.ok() && rb.ok() && hex_of(ra.digest) == hex_of(rb.digest),
+              "merkle root path-independent when files move, same order");
+        check(hex_of(ra.digest) ==
+                  "c6d138bdc662abe11199e19648059868096570e1c445adfac66612dbdb107005",
+              "merkle moved files still match reference");
+    }
+
+    // 大文件流式参与批次：按公开规则从原始字节重组根进行结构自检。
+    {
+        const std::vector<unsigned char> big = fill_a(200000);
+        write_file(tmp.root / "big.bin", big);
+        branchaudit::MerkleRootResult r = roots({"big.bin", "d5.bin"});
+        check(r.ok(), "merkle large file batch: ok");
+        const unsigned char zero = 0x00;
+        branchaudit::Sha256 sbig;
+        sbig.update(&zero, 1);
+        sbig.update(big.data(), big.size());
+        const auto lbig = sbig.final();
+        branchaudit::Sha256 s5;
+        s5.update(&zero, 1);
+        s5.update(d5.data(), d5.size());
+        const auto l5 = s5.final();
+        const unsigned char one = 0x01;
+        branchaudit::Sha256 spar;
+        spar.update(&one, 1);
+        spar.update(lbig.data(), lbig.size());
+        spar.update(l5.data(), l5.size());
+        check(hex_of(r.digest) == hex_of(spar.final()),
+              "merkle large file batch: structure re-derived from raw bytes");
+    }
+
+    // 失败：任一文件不存在/指向目录都整批失败，error 指向失败路径。
+    {
+        const fs::path missing = tmp.root / "no such 缺失.bin";
+        const fs::path dir = tmp.root / "a dir 目录";
+        fs::create_directories(dir);
+        struct FailCase { std::vector<fs::path> paths; std::string_view label;
+                          fs::path named; };
+        const FailCase fail_cases[] = {
+            {{missing, P("d1.bin")}, "merkle missing first", missing},
+            {{P("d1.bin"), missing, P("d2.bin")}, "merkle missing middle", missing},
+            {{P("d1.bin"), P("d2.bin"), dir}, "merkle directory last", dir},
+            {{dir}, "merkle directory only", dir},
+        };
+        for (const auto& fc : fail_cases) {
+            branchaudit::MerkleRootResult r;
+            auto captured = silent_merkle_root(fc.paths, &r);
+            check(!r.ok(), std::string(fc.label) + ": failure result");
+            check(r.error.find(fc.named.string()) != std::string::npos,
+                  std::string(fc.label) + ": error names failed path");
+            check(!r.error.empty() && r.error.size() > fc.named.string().size() + 2,
+                  std::string(fc.label) + ": error gives a reason");
+            check(captured.first.empty() && captured.second.empty(),
+                  std::string(fc.label) + ": library does not print");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -439,6 +656,7 @@ int main() {
     test_file_hashing();
     test_file_failures();
     test_hex_format();
+    test_merkle_root();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " sha256 regression checks passed\n";

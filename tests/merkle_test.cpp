@@ -14,12 +14,15 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "filehash.h"
 #include "merkle.h"
+#include "test_fault.h"
 
 namespace {
 
@@ -87,6 +90,18 @@ Digest root_of(const std::vector<fs::path>& paths) {
     const branchaudit::FileHashResult r = branchaudit::merkle_root_files(paths);
     check(r.ok(), std::string("merkle_root_files succeeds: ") + r.error);
     return r.digest;
+}
+
+// 调用库接口期间截获标准输出/错误：库只返回结果，不自行打印、不退出。
+std::pair<std::string, std::string> silent_merkle(
+        const std::vector<fs::path>& paths, branchaudit::FileHashResult* out) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    *out = branchaudit::merkle_root_files(paths);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    return {cap_out.str(), cap_err.str()};
 }
 
 // ---- 空批次根 -------------------------------------------------------------
@@ -340,6 +355,150 @@ void test_failures() {
           "directory: error states directory reason");
 }
 
+// ---- 失败：文件存在却打不开 / 叶子读到一半出错 ----------------------------
+//
+// 与“缺失/目录”不同，这两类错误发生在文件真实存在、且读取已经（部分）
+// 开始之后。经随测试预载的故障注入库在 libc 打开/读取接口确定性触发，
+// 覆盖普通摘要与文件叶子共用的同一条文件计算路径。
+
+void test_io_failures() {
+    TempArea tmp("iofail");
+
+    const fs::path good1 = tmp.root / "good1.bin";
+    const fs::path good2 = tmp.root / "good2.bin";
+    const fs::path bad = tmp.root / "present 出错.bin";
+    const fs::path empty = tmp.root / "empty 空.bin";
+    constexpr long kPartial = 40;
+    const auto good_bytes1 = bytes_of("normal-file-one");
+    const auto good_bytes2 = bytes_of("normal-file-two");
+    const auto bad_bytes = pattern(200);
+    write_file(good1, good_bytes1);
+    write_file(good2, good_bytes2);
+    write_file(bad, bad_bytes);
+    write_file(empty, {});
+
+    const Digest good_leaf1 = leaf_bytes(good_bytes1);
+    const Digest good_leaf2 = leaf_bytes(good_bytes2);
+    const Digest bad_partial_leaf =
+        branchaudit::merkle_leaf(bad_bytes.data(),
+                                 static_cast<std::size_t>(kPartial));
+
+    // 夹具在无注入时必须成功，排除“写死错误结果”的可能。
+    check(hex_of(root_of({good1, bad, good2})).size() == 64,
+          "iofail fixtures: batch succeeds without injected fault");
+
+    // ---- 打开失败：唯一位置 --------------------------------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_OPEN_FAIL", bad.string());
+        branchaudit::FileHashResult r;
+        auto captured = silent_merkle({bad}, &r);
+        check(!r.ok(), "unopenable leaf: batch fails");
+        check(r.error.find(bad.string()) != std::string::npos,
+              "unopenable leaf: error names the failed file");
+        check(r.error.find("ermission") != std::string::npos ||
+                  r.error.find("denied") != std::string::npos ||
+                  r.error.find("cces") != std::string::npos,
+              "unopenable leaf: error states open/permission reason");
+        check(captured.first.empty() && captured.second.empty(),
+              "unopenable leaf: library prints nothing, does not exit");
+    }
+
+    // ---- 打开失败：有序批次中出错前已经处理过正常文件 ------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_OPEN_FAIL", bad.string());
+        branchaudit::FileHashResult r;
+        auto captured = silent_merkle({good1, good2, bad}, &r);
+        check(!r.ok(),
+              "open failure after processed good files: whole batch fails");
+        check(r.error.find(bad.string()) != std::string::npos,
+              "open failure in batch: error points at the real failing file");
+        check(r.error.find(good1.string()) == std::string::npos &&
+                  r.error.find(good2.string()) == std::string::npos,
+              "open failure in batch: already-processed files are not blamed");
+        check(captured.first.empty(),
+              "open failure in batch: no root of the processed prefix is printed");
+        check(captured.second.empty(),
+              "open failure in batch: library prints nothing");
+        // 不得给出“仅前两个正常文件”的根。
+        check(r.digest != branchaudit::merkle_parent(good_leaf1, good_leaf2),
+              "open failure: root skipping the failing position is not returned");
+        check(r.digest != good_leaf1,
+              "open failure: a processed leaf is not returned as the root");
+    }
+
+    // ---- 读取失败：叶子取得部分内容后继续读出错 ------------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            bad.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        auto captured = silent_merkle({bad}, &r);
+        check(!r.ok(), "read error mid-leaf: batch fails");
+        check(r.error.find(bad.string()) != std::string::npos,
+              "read failure: error names the failed file");
+        check(r.error.find("read") != std::string::npos,
+              "read failure: error says read failed rather than normal EOF");
+        check(captured.first.empty() && captured.second.empty(),
+              "read failure: library prints nothing");
+        // 已读到的部分内容不能成为成功叶子摘要。
+        check(r.digest != bad_partial_leaf,
+              "read failure: partial leaf digest is not returned as success");
+        check(r.digest != leaf_bytes(bad_bytes),
+              "read failure: full-content leaf is not fabricated either");
+    }
+
+    // ---- 读取失败：出错前正常文件已处理，仍整次失败且指向真正出错文件 --
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            bad.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        auto captured = silent_merkle({good1, bad, good2}, &r);
+        check(!r.ok(),
+              "read error after a good file: whole ordered batch fails");
+        check(r.error.find(bad.string()) != std::string::npos,
+              "batch read failure: error names the truly failing file");
+        check(r.error.find(good1.string()) == std::string::npos &&
+                  r.error.find(good2.string()) == std::string::npos,
+              "batch read failure: good files are not named as the cause");
+        check(captured.first.empty(),
+              "batch read failure: no partial/skipped-position root is emitted");
+        check(captured.second.empty(),
+              "batch read failure: library prints nothing");
+        check(r.digest != good_leaf1,
+              "batch read failure: processed-prefix leaf is not a result");
+    }
+
+    // ---- 空文件叶子在读取故障武装下仍正常读完 --------------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            empty.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        auto captured = silent_merkle({empty}, &r);
+        check(r.ok(),
+              "empty file leaf reads to completion successfully (no content != error)");
+        check(hex_of(r.digest) ==
+                  "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+              "empty file leaf remains SHA-256(0x00)");
+        check(captured.first.empty() && captured.second.empty(),
+              "empty file leaf: library prints nothing");
+    }
+
+    // ---- 故障只作用于指定路径：批次中其他文件不受影响 ------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            bad.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        silent_merkle({good1, good2}, &r);
+        check(r.ok() && r.digest == branchaudit::merkle_parent(good_leaf1, good_leaf2),
+              "fault is path-scoped: batch without the named path is unaffected");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -375,13 +534,16 @@ void test_large_files() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    fault_test::ensure_fault_preloaded(argc, argv);
+
     test_empty_batch();
     test_leaf_rule();
     test_parent_rule();
     test_file_batches();
     test_relative_paths();
     test_failures();
+    test_io_failures();
     test_large_files();
 
     if (g_failures == 0) {

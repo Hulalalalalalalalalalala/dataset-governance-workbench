@@ -23,6 +23,7 @@
 
 #include "filehash.h"
 #include "sha256.h"
+#include "test_fault.h"
 
 namespace {
 
@@ -412,6 +413,117 @@ void test_file_failures() {
     }
 }
 
+// ---- 文件失败行为：存在却打不开 / 部分读取后继续读出错 --------------------
+//
+// 这两类错误无法用“缺失路径/目录”夹具制造：文件真实存在、打开成功，
+// 错误分别发生在 open 与后续 read 上。通过随测试预载的故障注入库在
+// libc 文件访问接口处确定性触发（见 tests/fault_inject.c），因此被测
+// 代码走的是与生产完全相同的“定位 -> 打开 -> 流式读取 -> 错误传播”
+// 路径，而不是构造一个带错误文字的返回值。
+
+void test_file_io_failures() {
+    TempArea tmp("iofail");
+
+    // 打开失败与读取失败共用的夹具：文件确定存在、内容确定。
+    const fs::path existing = tmp.root / "present 存在.bin";
+    constexpr long kPartial = 40;
+    const std::vector<unsigned char> bytes = pattern(200);
+    write_file(existing, bytes);
+
+    // 同一文件不注入时必须成功，证明失败确由文件访问错误引起，而不是
+    // 针对该路径写死的错误结果。
+    {
+        branchaudit::FileHashResult r;
+        auto captured = silent_file_hash(existing, &r);
+        check(r.ok() && hex_of(r.digest) == hash_whole(bytes),
+              "iofail fixture: succeeds without injected fault");
+        check(captured.first.empty() && captured.second.empty(),
+              "iofail fixture: library stays silent on success");
+    }
+
+    // ---- 文件确实存在却不能打开 ----------------------------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_OPEN_FAIL", existing.string());
+        branchaudit::FileHashResult r;
+        auto captured = silent_file_hash(existing, &r);
+        check(!r.ok(), "existing-but-unopenable: failure result");
+        check(r.error.find(existing.string()) != std::string::npos,
+              "open failure: error names the failed path");
+        check(r.error.find("ermission") != std::string::npos ||
+                  r.error.find("denied") != std::string::npos ||
+                  r.error.find("cces") != std::string::npos,
+              "open failure: error states an open/permission reason");
+        check(r.error.size() > existing.string().size() + 2,
+              "open failure: error gives reason beyond the path");
+        check(captured.first.empty() && captured.second.empty(),
+              "open failure: library only returns result, prints nothing");
+    }
+    // 触发变量离开作用域后，同一文件恢复成功。
+    {
+        branchaudit::FileHashResult r;
+        silent_file_hash(existing, &r);
+        check(r.ok(), "open trigger scoped: later access succeeds again");
+    }
+
+    // ---- 文件已打开、取得部分内容后继续读取时出错 ----------------------
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            existing.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        auto captured = silent_file_hash(existing, &r);
+        check(!r.ok(), "read error after partial content: failure result");
+        check(r.error.find(existing.string()) != std::string::npos,
+              "read failure: error names the failed path");
+        check(r.error.find("read") != std::string::npos,
+              "read failure: error states it is a read failure (not EOF)");
+        check(r.error.size() > existing.string().size() + 2,
+              "read failure: error gives reason beyond the path");
+        check(captured.first.empty() && captured.second.empty(),
+              "read failure: library only returns result, prints nothing");
+
+        // 已读到的部分内容绝不能成为成功摘要：既不是完整文件摘要，也不
+        // 是前 kPartial 字节的摘要。
+        const std::string got = hex_of(r.digest);
+        check(got != hash_whole(bytes),
+              "read failure: digest is not the whole-file summary");
+        check(got != hash_whole(std::vector<unsigned char>(
+                      bytes.begin(), bytes.begin() + kPartial)),
+              "read failure: already-read partial content is not a success digest");
+    }
+
+    // ---- 空文件正常读完仍然成功：没有读到内容不等于读错误 --------------
+    const fs::path empty = tmp.root / "empty 空.bin";
+    write_file(empty, {});
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            empty.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        auto captured = silent_file_hash(empty, &r);
+        check(r.ok(), "empty file read to completion: still success under read-fault arm");
+        check(hex_of(r.digest) ==
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "empty file still yields SHA-256 of empty sequence");
+        check(captured.first.empty() && captured.second.empty(),
+              "empty file: library stays silent");
+    }
+
+    // ---- 触发只作用于指定路径：其他文件不受影响 ------------------------
+    const fs::path other = tmp.root / "other.bin";
+    write_file(other, bytes);
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            existing.string() + ":" + std::to_string(kPartial));
+        branchaudit::FileHashResult r;
+        silent_file_hash(other, &r);
+        check(r.ok() && hex_of(r.digest) == hash_whole(bytes),
+              "fault is path-scoped: unrelated file still hashes correctly");
+    }
+}
+
 // ---- to_hex 格式 ----------------------------------------------------------
 
 void test_hex_format() {
@@ -431,13 +543,16 @@ void test_hex_format() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    fault_test::ensure_fault_preloaded(argc, argv);
+
     test_standard_vectors();
     test_byte_semantics();
     test_boundary_lengths();
     test_incremental_splits();
     test_file_hashing();
     test_file_failures();
+    test_file_io_failures();
     test_hex_format();
 
     if (g_failures == 0) {

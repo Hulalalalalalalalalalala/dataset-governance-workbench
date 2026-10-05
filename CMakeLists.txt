@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(branchaudit VERSION 0.1.0 LANGUAGES CXX)
+project(branchaudit VERSION 0.1.0 LANGUAGES CXX C)
 
 # 可复用核心库：其他 C++20 程序可链接 branchaudit_core 并包含 src/ 下的头文件。
 add_library(branchaudit_core STATIC
@@ -23,15 +23,39 @@ option(BRANCHAUDIT_BUILD_TESTS "Build branchaudit regression tests" ON)
 if(BRANCHAUDIT_BUILD_TESTS)
     enable_testing()
 
+    # 测试专用故障注入库（LD_PRELOAD）：让测试在自己安排的条件下稳定
+    # 触发“存在但打不开（EACCES）”与“部分读取后继续读出错（EIO）”两类
+    # 真实文件访问错误。仅测试构建启用，不进入核心库或可执行文件。
+    add_library(branchaudit_fault MODULE tests/fault_inject.c)
+    set_target_properties(branchaudit_fault PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        PREFIX "lib"
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS ON   # _GNU_SOURCE 需要 GNU 扩展支持
+    )
+
     add_executable(sha256_test tests/sha256_test.cpp)
     target_link_libraries(sha256_test PRIVATE branchaudit_core)
+    target_compile_definitions(sha256_test PRIVATE
+        BRANCHAUDIT_FAULT_LIB="$<TARGET_FILE:branchaudit_fault>")
     add_test(NAME sha256_unit COMMAND sha256_test)
-    set_tests_properties(sha256_unit PROPERTIES TIMEOUT 30)
+    set_tests_properties(sha256_unit PROPERTIES
+        TIMEOUT 30
+        # 故障库随测试进程预加载；未设置触发变量时它完全透传，对其余
+        # 检查零影响。测试在具体失败用例附近才设置/清除触发变量。
+        ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:branchaudit_fault>"
+    )
 
     add_executable(merkle_test tests/merkle_test.cpp)
     target_link_libraries(merkle_test PRIVATE branchaudit_core)
+    target_compile_definitions(merkle_test PRIVATE
+        BRANCHAUDIT_FAULT_LIB="$<TARGET_FILE:branchaudit_fault>")
     add_test(NAME merkle_unit COMMAND merkle_test)
-    set_tests_properties(merkle_unit PROPERTIES TIMEOUT 30)
+    set_tests_properties(merkle_unit PROPERTIES
+        TIMEOUT 30
+        ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:branchaudit_fault>"
+    )
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
@@ -40,6 +64,7 @@ if(BRANCHAUDIT_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_test.py
                     $<TARGET_FILE:branchaudit>
+                    $<TARGET_FILE:branchaudit_fault>
         )
         set_tests_properties(cli_e2e PROPERTIES TIMEOUT 30)
     endif()

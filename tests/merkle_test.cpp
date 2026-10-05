@@ -14,10 +14,13 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "fault_fixture.h"
 #include "filehash.h"
 #include "merkle.h"
 
@@ -87,6 +90,18 @@ Digest root_of(const std::vector<fs::path>& paths) {
     const branchaudit::FileHashResult r = branchaudit::merkle_root_files(paths);
     check(r.ok(), std::string("merkle_root_files succeeds: ") + r.error);
     return r.digest;
+}
+
+// 调用库接口期间截获标准输出/错误：库只返回结果，不自行打印、不退出进程。
+std::pair<std::string, std::string> silent_root(
+    const std::vector<fs::path>& paths, branchaudit::FileHashResult* out) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    *out = branchaudit::merkle_root_files(paths);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    return {cap_out.str(), cap_err.str()};
 }
 
 // ---- 空批次根 -------------------------------------------------------------
@@ -340,6 +355,133 @@ void test_failures() {
           "directory: error states directory reason");
 }
 
+// ---- 故障：存在却无法打开 / 部分读取后读出错 -------------------------------
+//
+// 这两种错误都必须从真实文件访问传导到最终批次结果；已处理文件与出错文件
+// 的部分内容都不能成为任何根。这里用测试自身安排的故障节点稳定触发，
+// 不依赖偶发磁盘故障。
+void test_file_access_faults() {
+    if (!fault_fixture::supported()) {
+        std::cerr << "SKIP: open/read fault injection unsupported on this platform\n";
+        return;
+    }
+
+    TempArea tmp("fault");
+    const fs::path good1 = tmp.root / "good1.bin";
+    const fs::path good2 = tmp.root / "good2.bin";
+    write_file(good1, bytes_of("a"));
+    write_file(good2, bytes_of("abc"));
+
+    // 对照：空普通文件读到零字节是正常 EOF，仍然成功——不能把“没读到
+    // 内容”一概当作读错误。
+    const fs::path empty_regular = tmp.root / "empty-regular.bin";
+    write_file(empty_regular, {});
+    {
+        branchaudit::FileHashResult r;
+        auto captured = silent_root({empty_regular}, &r);
+        check(r.ok() && hex_of(r.digest) ==
+                  "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+              "empty regular file read to EOF is still a success");
+        check(captured.first.empty() && captured.second.empty(),
+              "empty regular file: library does not print");
+    }
+
+    // 故障一：叶子路径是真实存在却无法打开的套接字。
+    {
+        fault_fixture::UnopenableSocket sock(tmp.root, "leaf-unopenable.sock");
+        check(sock.ready, "unopenable leaf: fixture node exists as a socket");
+        if (sock.ready) {
+            // 单独作为一个叶子。
+            {
+                branchaudit::FileHashResult r;
+                auto captured = silent_root({sock.path}, &r);
+                check(!r.ok(), "unopenable leaf: batch fails");
+                check(r.error.find(sock.path.string()) != std::string::npos,
+                      "unopenable leaf: error names the failed path");
+                check(r.error.find("read error") == std::string::npos,
+                      "unopenable leaf: failure is at open, not read");
+                check(captured.first.empty() && captured.second.empty(),
+                      "unopenable leaf: library does not print");
+            }
+            // 有序批次：前面的正常文件已处理，仍须整次失败，错误指向套接字；
+            // 库只以 !ok 表达失败（调用方仅在 ok 时才应使用 digest），因此
+            // “不产出已处理文件的根 / 跳过出错位置后的根”在这里即由 !ok 保证；
+            // 对外的 stdout 契约在 CLI 层另外精确断言。
+            {
+                branchaudit::FileHashResult r;
+                auto captured = silent_root({good1, sock.path, good2}, &r);
+                check(!r.ok(), "unopenable leaf after a good file: whole batch fails");
+                check(r.error.find(sock.path.string()) != std::string::npos,
+                      "unopenable leaf mid-batch: error points at the real file");
+                check(captured.first.empty() && captured.second.empty(),
+                      "unopenable leaf mid-batch: library does not print");
+            }
+        }
+    }
+
+    // 故障二：叶子已打开并读到真实内容，随后 read 出错（EIO）。
+    // 每个读取场景使用独立的伪终端：故障节点在一次挂断后即失效。
+
+    // 场景 A：单叶子。确认已读内容不会被当作正常 EOF 而成功。
+    {
+        fault_fixture::PartiallyReadablePty pty;
+        branchaudit::FileHashResult single;
+        std::pair<std::string, std::string> cap_single;
+        pty.start_then_fail_after_real_bytes(
+            [&](const std::string& p) {
+                cap_single = silent_root({fs::path(p)}, &single);
+            });
+
+        check(pty.ready(), "read-fault leaf: fixture opens a pty");
+        check(pty.forced_consumed(),
+              "read-fault leaf premise: kernel proved bytes were read");
+        check(pty.delivered_bytes() > fault_fixture::kForcedBytes,
+              "read-fault leaf premise: substantial content was read first");
+        check(!single.ok(), "read-failing leaf: batch fails");
+        check(single.error.find(pty.path()) != std::string::npos,
+              "read-failing leaf: error names the failed path");
+        check(single.error.find("read error") != std::string::npos,
+              "read-failing leaf: error is a read failure");
+        // forced_consumed 保证读取方真的消费了确定数量的字节；在此前提下仍
+        // !ok，即“已读到的真实内容没有成为成功叶子”。若仅构造一个带错误
+        // 文字的结果而不真正读文件，非阻塞写始终 EAGAIN、forced 不足，前提
+        // 为假，无法蒙混。“不产出部分根”的对外保证在 CLI 层以 stdout 为空
+        // 精确断言。
+        check(cap_single.first.empty() && cap_single.second.empty(),
+              "read-failing leaf: library does not print");
+    }
+
+    // 场景 B：有序批次 [正常文件, 读出错文件]。第一个位置的正常文件已先
+    // 处理完，随后第二个叶子读到真实内容后读出错；整次仍须失败，错误指向
+    // 真正出错的文件（不是笼统的“无法计算”）。
+    {
+        fault_fixture::PartiallyReadablePty pty;
+        branchaudit::FileHashResult batched;
+        std::pair<std::string, std::string> cap_batch;
+        pty.start_then_fail_after_real_bytes(
+            [&](const std::string& p) {
+                cap_batch = silent_root({good1, fs::path(p)}, &batched);
+            });
+
+        check(pty.ready(), "read-fault mid-batch: fixture opens a pty");
+        check(pty.forced_consumed(),
+              "read-fault mid-batch premise: kernel proved bytes were read");
+        check(pty.delivered_bytes() > fault_fixture::kForcedBytes,
+              "read-fault mid-batch premise: substantial content was read first");
+        check(!batched.ok(),
+              "read failure after good file: whole ordered batch fails");
+        check(batched.error.find(pty.path()) != std::string::npos,
+              "read failure mid-batch: error points at the real failing file");
+        check(batched.error.find("read error") != std::string::npos,
+              "read failure mid-batch: error states a read failure");
+        // 在 forced_consumed 已证明故障叶子读到真实字节、且其前的正常文件已按
+        // 顺序处理之后，结果仍必须 !ok：不产出“已处理文件的根 / 跳过出错位置
+        // 的根 / 部分内容根”。对外层面由 CLI 测试以 stdout 为空精确断言。
+        check(cap_batch.first.empty() && cap_batch.second.empty(),
+              "read failure mid-batch: library does not print");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -382,6 +524,7 @@ int main() {
     test_file_batches();
     test_relative_paths();
     test_failures();
+    test_file_access_faults();
     test_large_files();
 
     if (g_failures == 0) {

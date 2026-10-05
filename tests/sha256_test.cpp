@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "fault_fixture.h"
 #include "filehash.h"
 #include "sha256.h"
 
@@ -409,6 +410,74 @@ void test_file_failures() {
               "directory path: error explains it is a directory");
         check(captured.first.empty() && captured.second.empty(),
               "directory path: library does not print");
+    }
+
+    // 故障注入只在支持的平台上触发；不支持时明确报告“跳过”，不能把
+    // “无法触发目标错误”算作通过（见 fault_fixture.h 的说明）。
+    if (!fault_fixture::supported()) {
+        std::cerr << "SKIP: open/read fault injection unsupported on this platform\n";
+        return;
+    }
+
+    // 故障一：文件确实存在（AF_UNIX 套接字），却不能以普通文件打开。
+    // 必须由真实的文件访问路径失败，而不是手工构造带错误文字的结果。
+    {
+        fault_fixture::UnopenableSocket sock(tmp.root, "existing but unopenable.sock");
+        check(sock.ready, "unopenable: fixture node exists as a socket");
+        if (sock.ready) {
+            // 先确认它与“路径不存在”的区别：节点真实存在。
+            std::error_code ec;
+            check(fs::exists(sock.path, ec),
+                  "unopenable: path exists (not a missing path)");
+            check(!fs::is_regular_file(sock.path, ec),
+                  "unopenable: path is not a regular file");
+
+            branchaudit::FileHashResult r;
+            auto captured = silent_file_hash(sock.path, &r);
+            check(!r.ok(), "unopenable existing file: hash fails");
+            check(!r.error.empty(),
+                  "unopenable existing file: error states a reason");
+            check(r.error.find(sock.path.string()) != std::string::npos,
+                  "unopenable existing file: error names the failed path");
+            // 错误来自 open 阶段：不能被误判为“空文件正常读完”。
+            check(r.error.find("read error") == std::string::npos,
+                  "unopenable existing file: failure happens at open, not read");
+            check(captured.first.empty() && captured.second.empty(),
+                  "unopenable existing file: library does not print");
+        }
+    }
+
+    // 故障二：文件已打开、已读到真实内容，随后继续读取出错。
+    // 已读部分不能成为成功摘要，也不能被当作正常到达 EOF。
+    {
+        fault_fixture::PartiallyReadablePty pty;
+        branchaudit::FileHashResult r;
+        std::pair<std::string, std::string> captured;
+        // 在故障线程内执行真实的文件计算（读到确定字节后阻塞，随后读失败）。
+        pty.start_then_fail_after_real_bytes(
+            [&](const std::string& p) {
+                captured = silent_file_hash(fs::path(p), &r);
+            });
+
+        check(pty.ready(), "read-fault fixture opens a pty");
+        check(pty.forced_consumed(),
+              "read-fault premise: kernel proved a fixed number of bytes read");
+        check(pty.delivered_bytes() > fault_fixture::kForcedBytes,
+              "read-fault premise: substantial real content was read first");
+        check(!r.error.empty(),
+              "read failure after real bytes: error states a reason");
+        check(r.error.find(pty.path()) != std::string::npos,
+              "read failure after real bytes: error names the failed path");
+        check(r.error.find("read error") != std::string::npos,
+              "read failure after real bytes: error is a read failure");
+        // 已读到真实字节却仍必须是失败结果（!ok）：这排除把读失败当正常 EOF
+        // （那样会 ok 并产出摘要）。而 forced_consumed 前提保证确实走过真实
+        // 文件读取——仅返回一个带错误文字的结果而不真正读文件，会让非阻塞写
+        // 始终 EAGAIN、该前提为假，从而无法蒙混过关。空普通文件的成功另测。
+        check(!r.ok(),
+              "read failure after real bytes: failure, consumed bytes not a digest");
+        check(captured.first.empty() && captured.second.empty(),
+              "read failure after real bytes: library does not print");
     }
 }
 

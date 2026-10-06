@@ -6,12 +6,15 @@ OpenSSL 的 SHA-256 实现）计算，不读取、不信任 branchaudit 自身�
 因此能与 C++ 层测试共同防止“共用计算代码同时出错”。
 
 用法:
-    python3 cli_test.py <branchaudit 可执行文件路径> <故障注入共享库路径>
+    python3 cli_test.py <branchaudit 可执行文件路径> <故障注入共享库路径|none>
 
 第二个参数为 tests/fault_inject.c 构建出的故障注入共享库（由 CMake
 传入），测试以 LD_PRELOAD 加载它并通过环境变量精确触发“文件存在却
 打不开”和“部分读取后继续读出错”两种真实文件访问错误；不设置触发
-变量时该库完全透传，对其余用例零影响。
+变量时该库完全透传，对其余用例零影响。故障注入是 Linux 专用机制；
+在非 Linux 平台（如 macOS）上 CMake 传入 "none"，此时依赖注入的用例
+以 SKIP 明确跳过（不计入通过数，也不显示为已验证），其余全部用例照常
+执行，失败仍使本测试失败。
 
 成功退出 0；任一检查失败退出非零。
 """
@@ -135,10 +138,13 @@ def main() -> int:
         return 2
     exe = sys.argv[1]
     fault_lib = sys.argv[2]
+    # 故障注入库是 Linux 专用机制；CMake 在非 Linux 平台上传入 "none"。
+    fault_available = fault_lib != "none"
     check(os.path.isfile(exe) and os.access(exe, os.X_OK),
           f"executable exists and is runnable: {exe}")
-    check(os.path.isfile(fault_lib),
-          f"fault injection shared library exists: {fault_lib}")
+    if fault_available:
+        check(os.path.isfile(fault_lib),
+              f"fault injection shared library exists: {fault_lib}")
     if FAILURES:
         return 1
 
@@ -291,88 +297,94 @@ def main() -> int:
               f"directory path: stderr states directory reason "
               f"(got {proc.stderr!r})")
 
-        # ---- 失败：文件确实存在却不能打开 ------------------------------
-        # 经由故障注入库在 libc 打开接口稳定触发 EACCES：文件真实存在，
-        # 不注入时该命令成功，因此这里的失败必须来自打开错误本身。
-        unopenable = tmp / "present 存在.bin"
-        unopenable.write_bytes(pattern(200))
-        unopenable_env = fault_env(
-            fault_lib, BRANCHAUDIT_TEST_OPEN_FAIL=str(unopenable))
+        # ---- 失败：文件确实存在却不能打开 / 部分读取后继续读出错 --------
+        # 依赖 Linux 故障注入；无故障库的平台明确跳过，不计入通过数。
+        if fault_available:
+            # ---- 失败：文件确实存在却不能打开 --------------------------
+            # 经由故障注入库在 libc 打开接口稳定触发 EACCES：文件真实存在，
+            # 不注入时该命令成功，因此这里的失败必须来自打开错误本身。
+            unopenable = tmp / "present 存在.bin"
+            unopenable.write_bytes(pattern(200))
+            unopenable_env = fault_env(
+                fault_lib, BRANCHAUDIT_TEST_OPEN_FAIL=str(unopenable))
 
-        # 基线：同一文件、仅去掉触发变量时必须成功。
-        baseline = run_cli(exe, str(unopenable))
-        check(baseline.returncode == 0 and baseline.stderr == b"",
-              "unopenable fixture: succeeds without injected open fault")
+            # 基线：同一文件、仅去掉触发变量时必须成功。
+            baseline = run_cli(exe, str(unopenable))
+            check(baseline.returncode == 0 and baseline.stderr == b"",
+                  "unopenable fixture: succeeds without injected open fault")
 
-        proc = run_cli(exe, str(unopenable), env=unopenable_env)
-        check(proc.returncode == 1, "open failure: exit code 1")
-        check(proc.stdout == b"", "open failure: stdout empty")
-        check(proc.stderr != b"", "open failure: stderr explains failure")
-        check(str(unopenable).encode() in proc.stderr,
-              f"open failure: stderr names failed path (got {proc.stderr!r})")
-        check(b"Permission denied" in proc.stderr or b"denied" in proc.stderr
-              or b"access" in proc.stderr,
-              f"open failure: stderr states open/permission reason "
-              f"(got {proc.stderr!r})")
-        check(baseline.stdout not in proc.stdout,
-              "open failure: no digest is emitted on stdout")
+            proc = run_cli(exe, str(unopenable), env=unopenable_env)
+            check(proc.returncode == 1, "open failure: exit code 1")
+            check(proc.stdout == b"", "open failure: stdout empty")
+            check(proc.stderr != b"", "open failure: stderr explains failure")
+            check(str(unopenable).encode() in proc.stderr,
+                  f"open failure: stderr names failed path (got {proc.stderr!r})")
+            check(b"Permission denied" in proc.stderr or b"denied" in proc.stderr
+                  or b"access" in proc.stderr,
+                  f"open failure: stderr states open/permission reason "
+                  f"(got {proc.stderr!r})")
+            check(baseline.stdout not in proc.stdout,
+                  "open failure: no digest is emitted on stdout")
 
-        # ---- 失败：文件已打开、取得部分内容后继续读取时出错 ------------
-        # 前 PARTIAL 字节正常交付，下一次读取 EIO；既不能被当作正常 EOF，
-        # 已读内容的摘要也不能出现在 stdout。
-        read_bad = tmp / "readable then error 数据.bin"
-        read_data = pattern(200)
-        read_bad.write_bytes(read_data)
-        PARTIAL = 40
-        read_fail_env = fault_env(
-            fault_lib,
-            BRANCHAUDIT_TEST_READ_FAIL=f"{read_bad}:{PARTIAL}")
+            # ---- 失败：文件已打开、取得部分内容后继续读取时出错 --------
+            # 前 PARTIAL 字节正常交付，下一次读取 EIO；既不能被当作正常 EOF，
+            # 已读内容的摘要也不能出现在 stdout。
+            read_bad = tmp / "readable then error 数据.bin"
+            read_data = pattern(200)
+            read_bad.write_bytes(read_data)
+            PARTIAL = 40
+            read_fail_env = fault_env(
+                fault_lib,
+                BRANCHAUDIT_TEST_READ_FAIL=f"{read_bad}:{PARTIAL}")
 
-        baseline = run_cli(exe, str(read_bad))
-        check(baseline.returncode == 0 and
-                  baseline.stdout == (reference(read_data) + "\n").encode(),
-              "read-failure fixture: full-file success without injected fault")
+            baseline = run_cli(exe, str(read_bad))
+            check(baseline.returncode == 0 and
+                      baseline.stdout == (reference(read_data) + "\n").encode(),
+                  "read-failure fixture: full-file success without injected fault")
 
-        proc = run_cli(exe, str(read_bad), env=read_fail_env)
-        check(proc.returncode == 1, "read failure: exit code 1")
-        check(proc.stdout == b"", "read failure: stdout empty")
-        check(proc.stderr != b"", "read failure: stderr explains failure")
-        check(str(read_bad).encode() in proc.stderr,
-              f"read failure: stderr names failed path (got {proc.stderr!r})")
-        check(b"read" in proc.stderr,
-              f"read failure: stderr states read failure rather than EOF "
-              f"(got {proc.stderr!r})")
-        partial_hex = reference(read_data[:PARTIAL])
-        full_hex = reference(read_data)
-        check((partial_hex + "\n").encode() not in proc.stdout,
-              "read failure: already-read partial content is not a success digest")
-        check((full_hex + "\n").encode() not in proc.stdout,
-              "read failure: full-file digest is not fabricated")
-        # 不能被误判为成功：stdout 绝不是 64 位十六进制加换行。
-        check(not (len(proc.stdout) == 65 and proc.stdout.endswith(b"\n")),
-              "read failure: stdout is not any success-shaped digest line")
+            proc = run_cli(exe, str(read_bad), env=read_fail_env)
+            check(proc.returncode == 1, "read failure: exit code 1")
+            check(proc.stdout == b"", "read failure: stdout empty")
+            check(proc.stderr != b"", "read failure: stderr explains failure")
+            check(str(read_bad).encode() in proc.stderr,
+                  f"read failure: stderr names failed path (got {proc.stderr!r})")
+            check(b"read" in proc.stderr,
+                  f"read failure: stderr states read failure rather than EOF "
+                  f"(got {proc.stderr!r})")
+            partial_hex = reference(read_data[:PARTIAL])
+            full_hex = reference(read_data)
+            check((partial_hex + "\n").encode() not in proc.stdout,
+                  "read failure: already-read partial content is not a success digest")
+            check((full_hex + "\n").encode() not in proc.stdout,
+                  "read failure: full-file digest is not fabricated")
+            # 不能被误判为成功：stdout 绝不是 64 位十六进制加换行。
+            check(not (len(proc.stdout) == 65 and proc.stdout.endswith(b"\n")),
+                  "read failure: stdout is not any success-shaped digest line")
 
-        # ---- 空文件正常读完仍成功：没读到内容不等于读错误 --------------
-        empty_io = tmp / "empty under read fault.bin"
-        empty_io.write_bytes(b"")
-        proc = run_cli(exe, str(empty_io), env=fault_env(
-            fault_lib,
-            BRANCHAUDIT_TEST_READ_FAIL=f"{empty_io}:{PARTIAL}"))
-        check(proc.returncode == 0, "empty file under read-fault arm: exit 0")
-        check(proc.stdout == (
-                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                  + "\n").encode(),
-              f"empty file still hashes to SHA-256 of empty (got {proc.stdout!r})")
-        check(proc.stderr == b"", "empty file under read-fault arm: stderr empty")
+            # ---- 空文件正常读完仍成功：没读到内容不等于读错误 ----------
+            empty_io = tmp / "empty under read fault.bin"
+            empty_io.write_bytes(b"")
+            proc = run_cli(exe, str(empty_io), env=fault_env(
+                fault_lib,
+                BRANCHAUDIT_TEST_READ_FAIL=f"{empty_io}:{PARTIAL}"))
+            check(proc.returncode == 0, "empty file under read-fault arm: exit 0")
+            check(proc.stdout == (
+                      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                      + "\n").encode(),
+                  f"empty file still hashes to SHA-256 of empty (got {proc.stdout!r})")
+            check(proc.stderr == b"", "empty file under read-fault arm: stderr empty")
 
-        # ---- 触发只作用于指定路径：其他文件不受影响 --------------------
-        bystander = tmp / "bystander.bin"
-        bystander.write_bytes(read_data)
-        proc = run_cli(exe, str(bystander), env=read_fail_env)
-        check(proc.returncode == 0 and
-                  proc.stdout == (reference(read_data) + "\n").encode() and
-                  proc.stderr == b"",
-              "read fault is path-scoped: unrelated file stays correct")
+            # ---- 触发只作用于指定路径：其他文件不受影响 ----------------
+            bystander = tmp / "bystander.bin"
+            bystander.write_bytes(read_data)
+            proc = run_cli(exe, str(bystander), env=read_fail_env)
+            check(proc.returncode == 0 and
+                      proc.stdout == (reference(read_data) + "\n").encode() and
+                      proc.stderr == b"",
+                  "read fault is path-scoped: unrelated file stays correct")
+        else:
+            print("SKIP: 存在却打不开 / 部分读取后继续读出错（hash）：依赖 "
+                  "Linux LD_PRELOAD 故障注入，本平台不适用，未执行也未计入通过数")
 
         # ==================================================================
         # root：有序文件批次的 Merkle 根（预期值全部由上方 hashlib 参考
@@ -513,89 +525,95 @@ def main() -> int:
               f"root directory: stderr names path and directory reason "
               f"(got {proc.stderr!r})")
 
-        # ---- 文件存在却打不开：root 整次失败 ----------------------------
-        r_unopenable = rdir / "present unopenable 存在.bin"
-        r_unopenable.write_bytes(pattern(200))
-        for label, args in (
-            ("open fail only", [str(r_unopenable)]),
-            ("open fail after good", [str(r_a), str(r_abc), str(r_unopenable)]),
-        ):
-            proc = run_root(exe, *args, env=fault_env(
-                fault_lib, BRANCHAUDIT_TEST_OPEN_FAIL=str(r_unopenable)))
-            check(proc.returncode == 1, f"root {label}: exit code 1")
-            check(proc.stdout == b"", f"root {label}: stdout empty")
-            check(str(r_unopenable).encode() in proc.stderr,
-                  f"root {label}: stderr names the truly failing file "
+        # ---- 文件存在却打不开 / 叶子部分读取后出错：整次失败 ------------
+        # 依赖 Linux 故障注入；无故障库的平台明确跳过，不计入通过数。
+        if fault_available:
+            # ---- 文件存在却打不开：root 整次失败 ------------------------
+            r_unopenable = rdir / "present unopenable 存在.bin"
+            r_unopenable.write_bytes(pattern(200))
+            for label, args in (
+                ("open fail only", [str(r_unopenable)]),
+                ("open fail after good", [str(r_a), str(r_abc), str(r_unopenable)]),
+            ):
+                proc = run_root(exe, *args, env=fault_env(
+                    fault_lib, BRANCHAUDIT_TEST_OPEN_FAIL=str(r_unopenable)))
+                check(proc.returncode == 1, f"root {label}: exit code 1")
+                check(proc.stdout == b"", f"root {label}: stdout empty")
+                check(str(r_unopenable).encode() in proc.stderr,
+                      f"root {label}: stderr names the truly failing file "
+                      f"(got {proc.stderr!r})")
+                check((b"denied" in proc.stderr or b"access" in proc.stderr),
+                      f"root {label}: stderr states open/permission reason "
+                      f"(got {proc.stderr!r})")
+
+            # ---- 有序批次：正常文件已处理，随后叶子部分读取后出错 -------
+            # 顺序为 [正常, 读出错]：第一个文件必须已被真实处理（否则无法
+            # 验证“出错前处理过正常文件仍整次失败”），但最终不得输出：
+            #   - 已处理文件的根；
+            #   - 出错文件的部分内容叶子/根；
+            #   - 跳过出错位置后的根。
+            r_read_bad = rdir / "readable then error 数据.bin"
+            r_bad_data = pattern(200)
+            r_read_bad.write_bytes(r_bad_data)
+            r_bad_env = fault_env(
+                fault_lib,
+                BRANCHAUDIT_TEST_READ_FAIL=f"{r_read_bad}:{PARTIAL}")
+
+            # 基线：去掉触发，同一批次必须成功，得到参考根。
+            expect_root(exe, [str(r_a), str(r_read_bad)], [b"a", r_bad_data],
+                        "root [good, read-bad] baseline without fault")
+
+            proc = run_root(exe, str(r_a), str(r_read_bad), env=r_bad_env)
+            check(proc.returncode == 1,
+                  "root [good, read-error]: exit code 1 despite earlier good file")
+            check(proc.stdout == b"",
+                  "root [good, read-error]: no partial root on stdout")
+            check(str(r_read_bad).encode() in proc.stderr,
+                  f"root [good, read-error]: stderr names the truly failing file "
                   f"(got {proc.stderr!r})")
-            check((b"denied" in proc.stderr or b"access" in proc.stderr),
-                  f"root {label}: stderr states open/permission reason "
+            check(str(r_a).encode() not in proc.stderr,
+                  f"root [good, read-error]: already-processed good file not blamed "
+                  f"(got {proc.stderr!r})")
+            check(b"read" in proc.stderr,
+                  f"root [good, read-error]: stderr states read failure not EOF "
                   f"(got {proc.stderr!r})")
 
-        # ---- 有序批次：正常文件已处理，随后叶子部分读取后出错 -----------
-        # 顺序为 [正常, 读出错]：第一个文件必须已被真实处理（否则无法
-        # 验证“出错前处理过正常文件仍整次失败”），但最终不得输出：
-        #   - 已处理文件的根；
-        #   - 出错文件的部分内容叶子/根；
-        #   - 跳过出错位置后的根。
-        r_read_bad = rdir / "readable then error 数据.bin"
-        r_bad_data = pattern(200)
-        r_read_bad.write_bytes(r_bad_data)
-        r_bad_env = fault_env(
-            fault_lib,
-            BRANCHAUDIT_TEST_READ_FAIL=f"{r_read_bad}:{PARTIAL}")
+            # 各类“看起来像结果”的根都不得出现。
+            leaf_good = leaf_hash(b"a")
+            partial_bad_leaf = leaf_hash(r_bad_data[:PARTIAL])
+            full_bad_leaf = leaf_hash(r_bad_data)
+            forbidden_roots = {
+                "processed good leaf": leaf_good.hex(),
+                "partial-content leaf": partial_bad_leaf.hex(),
+                "full-bad leaf": full_bad_leaf.hex(),
+                "root skipping failing position": leaf_good.hex(),  # 单位置即其叶
+                "root with partial content":
+                    parent_hash(leaf_good, partial_bad_leaf).hex(),
+                "root with full content":
+                    parent_hash(leaf_good, full_bad_leaf).hex(),
+                "empty-batch root": hashlib.sha256(b"").hexdigest(),
+            }
+            for label, hexroot in forbidden_roots.items():
+                check((hexroot + "\n").encode() not in proc.stdout,
+                      f"root [good, read-error]: must not emit {label}")
 
-        # 基线：去掉触发，同一批次必须成功，得到参考根。
-        expect_root(exe, [str(r_a), str(r_read_bad)], [b"a", r_bad_data],
-                    "root [good, read-bad] baseline without fault")
+            # 出错文件位于正常文件之间：报错仍指向它，且无任何根输出。
+            proc = run_root(exe, str(r_a), str(r_read_bad), str(r_abc),
+                            env=r_bad_env)
+            check(proc.returncode == 1 and proc.stdout == b"",
+                  "root [good, read-error, good]: whole batch fails, no stdout")
+            check(str(r_read_bad).encode() in proc.stderr and
+                      str(r_a).encode() not in proc.stderr and
+                      str(r_abc).encode() not in proc.stderr,
+                  f"root middle read error names only the failing file "
+                  f"(got {proc.stderr!r})")
 
-        proc = run_root(exe, str(r_a), str(r_read_bad), env=r_bad_env)
-        check(proc.returncode == 1,
-              "root [good, read-error]: exit code 1 despite earlier good file")
-        check(proc.stdout == b"",
-              "root [good, read-error]: no partial root on stdout")
-        check(str(r_read_bad).encode() in proc.stderr,
-              f"root [good, read-error]: stderr names the truly failing file "
-              f"(got {proc.stderr!r})")
-        check(str(r_a).encode() not in proc.stderr,
-              f"root [good, read-error]: already-processed good file not blamed "
-              f"(got {proc.stderr!r})")
-        check(b"read" in proc.stderr,
-              f"root [good, read-error]: stderr states read failure not EOF "
-              f"(got {proc.stderr!r})")
-
-        # 各类“看起来像结果”的根都不得出现。
-        leaf_good = leaf_hash(b"a")
-        partial_bad_leaf = leaf_hash(r_bad_data[:PARTIAL])
-        full_bad_leaf = leaf_hash(r_bad_data)
-        forbidden_roots = {
-            "processed good leaf": leaf_good.hex(),
-            "partial-content leaf": partial_bad_leaf.hex(),
-            "full-bad leaf": full_bad_leaf.hex(),
-            "root skipping failing position": leaf_good.hex(),  # 单位置即其叶
-            "root with partial content":
-                parent_hash(leaf_good, partial_bad_leaf).hex(),
-            "root with full content":
-                parent_hash(leaf_good, full_bad_leaf).hex(),
-            "empty-batch root": hashlib.sha256(b"").hexdigest(),
-        }
-        for label, hexroot in forbidden_roots.items():
-            check((hexroot + "\n").encode() not in proc.stdout,
-                  f"root [good, read-error]: must not emit {label}")
-
-        # 出错文件位于正常文件之间：报错仍指向它，且无任何根输出。
-        proc = run_root(exe, str(r_a), str(r_read_bad), str(r_abc),
-                        env=r_bad_env)
-        check(proc.returncode == 1 and proc.stdout == b"",
-              "root [good, read-error, good]: whole batch fails, no stdout")
-        check(str(r_read_bad).encode() in proc.stderr and
-                  str(r_a).encode() not in proc.stderr and
-                  str(r_abc).encode() not in proc.stderr,
-              f"root middle read error names only the failing file "
-              f"(got {proc.stderr!r})")
-
-        # 批次中不含被武装路径时，预载故障库不改变成功结果。
-        expect_root(exe, [str(r_a), str(r_abc)], [b"a", b"abc"],
-                    "root fault preload inert without a targeted path")
+            # 批次中不含被武装路径时，预载故障库不改变成功结果。
+            expect_root(exe, [str(r_a), str(r_abc)], [b"a", b"abc"],
+                        "root fault preload inert without a targeted path")
+        else:
+            print("SKIP: 存在却打不开 / 叶子部分读取后出错（root）：依赖 "
+                  "Linux LD_PRELOAD 故障注入，本平台不适用，未执行也未计入通过数")
 
         # ---- 保留 hash / --version 及用法错误行为 -----------------------
         check(subprocess.run([exe, "--version"], capture_output=True).stdout ==

@@ -93,6 +93,8 @@ Digest root_of(const std::vector<fs::path>& paths) {
 }
 
 // 调用库接口期间截获标准输出/错误：库只返回结果，不自行打印、不退出。
+// 仅在故障注入检查组中使用；无注入机制的平台该组被跳过，故允许未使用。
+[[maybe_unused]]
 std::pair<std::string, std::string> silent_merkle(
         const std::vector<fs::path>& paths, branchaudit::FileHashResult* out) {
     std::stringstream cap_out, cap_err;
@@ -360,8 +362,13 @@ void test_failures() {
 // 与“缺失/目录”不同，这两类错误发生在文件真实存在、且读取已经（部分）
 // 开始之后。经随测试预载的故障注入库在 libc 打开/读取接口确定性触发，
 // 覆盖普通摘要与文件叶子共用的同一条文件计算路径。
+//
+// 故障注入是 Linux 专用机制（LD_PRELOAD + /proc）。其他平台（如 macOS）
+// 跳过本组检查并明确输出 SKIP：不计入通过数，也不显示为已验证；其余
+// 各组检查照常执行。
 
 void test_io_failures() {
+#ifdef BRANCHAUDIT_HAVE_FAULT_INJECTION
     TempArea tmp("iofail");
 
     const fs::path good1 = tmp.root / "good1.bin";
@@ -497,6 +504,10 @@ void test_io_failures() {
         check(r.ok() && r.digest == branchaudit::merkle_parent(good_leaf1, good_leaf2),
               "fault is path-scoped: batch without the named path is unaffected");
     }
+#else
+    std::cout << "SKIP: 存在却打不开 / 叶子部分读取后出错（依赖 Linux "
+                 "LD_PRELOAD 故障注入，本平台不适用，未执行也未计入通过数）\n";
+#endif
 }
 
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------

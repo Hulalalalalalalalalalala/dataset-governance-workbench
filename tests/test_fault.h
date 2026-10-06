@@ -2,15 +2,23 @@
 //
 // C++ 回归套件在本进程内直接调用 branchaudit_core 的文件计算接口，因此
 // “打不开 / 中途读出错”需要故障注入共享库（tests/fault_inject.c）随本
-// 进程一起预载：
+// 进程一起预载。该机制依赖 Linux 专有的 LD_PRELOAD 与 /proc 进程文件
+// 信息，CMake 仅在 Linux 上构建故障库并定义
+// BRANCHAUDIT_HAVE_FAULT_INJECTION：
 //
 //   * ctest 已通过 ENVIRONMENT 设置 LD_PRELOAD，正常运行时无需任何动作；
 //   * 直接手工执行测试二进制时，ensure_fault_preloaded() 会在发现注入库
 //     未加载时，带上 LD_PRELOAD 重新执行自身一次；
 //   * 具体失败用例用 FaultTrigger 在作用域内设置精确路径触发变量，退出
 //     作用域立即清除；其他路径与其余用例不受影响。
+//
+// 非 Linux 平台（如 macOS）不定义该宏：本头文件退化为空操作，依赖注入
+// 的检查由测试用例以 SKIP 明确标注为平台不适用，不计入通过数；其余检查
+// 照常执行，失败仍使回归失败。
 
 #pragma once
+
+#ifdef BRANCHAUDIT_HAVE_FAULT_INJECTION
 
 #include <cstdlib>
 #include <cstring>
@@ -89,3 +97,14 @@ private:
 };
 
 }  // namespace fault_test
+
+#else  // !BRANCHAUDIT_HAVE_FAULT_INJECTION
+
+namespace fault_test {
+
+// 本平台无故障注入机制（非 Linux）：无需预载，直接返回。
+inline void ensure_fault_preloaded(int, char **) {}
+
+}  // namespace fault_test
+
+#endif  // BRANCHAUDIT_HAVE_FAULT_INJECTION

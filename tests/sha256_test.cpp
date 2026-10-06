@@ -420,8 +420,13 @@ void test_file_failures() {
 // libc 文件访问接口处确定性触发（见 tests/fault_inject.c），因此被测
 // 代码走的是与生产完全相同的“定位 -> 打开 -> 流式读取 -> 错误传播”
 // 路径，而不是构造一个带错误文字的返回值。
+//
+// 故障注入是 Linux 专用机制（LD_PRELOAD + /proc）。其他平台（如 macOS）
+// 跳过本组检查并明确输出 SKIP：不计入通过数，也不显示为已验证；其余
+// 各组检查照常执行。
 
 void test_file_io_failures() {
+#ifdef BRANCHAUDIT_HAVE_FAULT_INJECTION
     TempArea tmp("iofail");
 
     // 打开失败与读取失败共用的夹具：文件确定存在、内容确定。
@@ -522,6 +527,10 @@ void test_file_io_failures() {
         check(r.ok() && hex_of(r.digest) == hash_whole(bytes),
               "fault is path-scoped: unrelated file still hashes correctly");
     }
+#else
+    std::cout << "SKIP: 存在却打不开 / 部分读取后继续读出错（依赖 Linux "
+                 "LD_PRELOAD 故障注入，本平台不适用，未执行也未计入通过数）\n";
+#endif
 }
 
 // ---- to_hex 格式 ----------------------------------------------------------

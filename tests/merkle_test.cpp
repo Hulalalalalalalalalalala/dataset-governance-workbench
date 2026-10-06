@@ -1,4 +1,5 @@
-// branchaudit 有序文件批次 Merkle 根回归测试（无第三方依赖，链接 branchaudit_core）。
+// branchaudit 有序文件批次 Merkle 根与单文件成员证明回归测试
+//（无第三方依赖，链接 branchaudit_core）。
 //
 // 预期摘要的独立依据：全部常量由 Python hashlib（底层系统 OpenSSL 的
 // SHA-256）按公开字节规则（叶子 SHA-256(0x00||data)、父节点
@@ -500,6 +501,191 @@ void test_io_failures() {
     }
 }
 
+// ---- 成员证明：结构、兄弟侧向、奇数提升、失败 ------------------------------
+
+// 用证明中的兄弟从叶子向根折叠，应回到证明给出的根。
+Digest fold_proof(const branchaudit::MerkleProof& p) {
+    Digest d = p.leaf;
+    for (const branchaudit::MerkleSibling& s : p.siblings) {
+        d = (s.side == branchaudit::MerkleSibling::Side::left)
+                ? branchaudit::merkle_parent(s.digest, d)
+                : branchaudit::merkle_parent(d, s.digest);
+    }
+    return d;
+}
+
+void test_proofs() {
+    TempArea tmp("proofs");
+
+    const auto empty = bytes_of("");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto hello = bytes_of("hello\n");
+
+    const fs::path f_empty = tmp.root / "empty.bin";
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_hello = tmp.root / "hello.bin";
+    write_file(f_empty, empty);
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_hello, hello);
+
+    const Digest la = leaf_bytes(a);
+    const Digest labc = leaf_bytes(abc);
+    const Digest lempty = leaf_bytes(empty);
+
+    // 单文件批次：siblings 为空，root 等于 leaf。
+    {
+        const branchaudit::MerkleProofResult r =
+            branchaudit::merkle_proof_file({f_a}, 0);
+        check(r.ok(), "proof single file: succeeds");
+        check(r.proof.leaf_count == 1 && r.proof.leaf_index == 0,
+              "proof single file: count/index");
+        check(r.proof.siblings.empty(), "proof single file: no siblings");
+        check(r.proof.root == r.proof.leaf && r.proof.leaf == la,
+              "proof single file: root equals leaf");
+    }
+    // 单个空文件同样如此。
+    {
+        const branchaudit::MerkleProofResult r =
+            branchaudit::merkle_proof_file({f_empty}, 0);
+        check(r.ok() && r.proof.siblings.empty() &&
+                  r.proof.root == r.proof.leaf && r.proof.leaf == lempty,
+              "proof single empty file: root equals leaf SHA-256(0x00)");
+    }
+
+    // 两文件：兄弟侧向正确。
+    {
+        const branchaudit::MerkleProofResult r0 =
+            branchaudit::merkle_proof_file({f_a, f_abc}, 0);
+        check(r0.ok() && r0.proof.siblings.size() == 1,
+              "proof [a, abc] index 0: one sibling");
+        check(r0.proof.siblings[0].side == branchaudit::MerkleSibling::Side::right &&
+                  r0.proof.siblings[0].digest == labc,
+              "proof [a, abc] index 0: sibling on the right");
+        check(r0.proof.root == branchaudit::merkle_parent(la, labc),
+              "proof [a, abc] index 0: root matches pairing");
+        const branchaudit::MerkleProofResult r1 =
+            branchaudit::merkle_proof_file({f_a, f_abc}, 1);
+        check(r1.ok() && r1.proof.siblings.size() == 1 &&
+                  r1.proof.siblings[0].side == branchaudit::MerkleSibling::Side::left &&
+                  r1.proof.siblings[0].digest == la,
+              "proof [a, abc] index 1: sibling on the left");
+        check(r1.proof.root == r0.proof.root,
+              "proof root is identical for every position of the batch");
+    }
+
+    // 三文件（奇数提升）：末位置的第一层没有兄弟记录。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+        const Digest p = branchaudit::merkle_parent(la, labc);
+        const Digest expected_root = branchaudit::merkle_parent(p, lempty);
+        check(root_of(batch) == expected_root, "proof fixture: 3-file root");
+
+        const branchaudit::MerkleProofResult r2 =
+            branchaudit::merkle_proof_file(batch, 2);
+        check(r2.ok() && r2.proof.leaf_count == 3 && r2.proof.leaf_index == 2,
+              "proof [a, abc, empty] index 2: count/index");
+        check(r2.proof.leaf == lempty, "proof index 2: leaf is SHA-256(0x00)");
+        // 奇数末节点原样提升的层不添加记录：只有上层一个左侧兄弟。
+        check(r2.proof.siblings.size() == 1 &&
+                  r2.proof.siblings[0].side == branchaudit::MerkleSibling::Side::left &&
+                  r2.proof.siblings[0].digest == p,
+              "proof index 2: promoted level records no sibling");
+        check(r2.proof.root == expected_root &&
+                  fold_proof(r2.proof) == expected_root,
+              "proof index 2: siblings fold back to the root");
+
+        const branchaudit::MerkleProofResult r0 =
+            branchaudit::merkle_proof_file(batch, 0);
+        check(r0.ok() && r0.proof.siblings.size() == 2 &&
+                  r0.proof.siblings[0].side == branchaudit::MerkleSibling::Side::right &&
+                  r0.proof.siblings[0].digest == labc &&
+                  r0.proof.siblings[1].side == branchaudit::MerkleSibling::Side::right &&
+                  r0.proof.siblings[1].digest == lempty,
+              "proof index 0: siblings ordered from leaf to root");
+        check(fold_proof(r0.proof) == r0.proof.root &&
+                  r0.proof.root == expected_root,
+              "proof index 0: folds to the same root");
+    }
+
+    // 五文件（跨层奇数提升）：每个位置的证明都折回同一根，且根与
+    // merkle_root_files 一致；中间被提升的层不记录兄弟。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty, f_hello, f_a};
+        const Digest root = root_of(batch);
+        check(hex_of(root) ==
+                  "685686ca622026c4537dfdb49e8f9dac110c553f1d21aee96633e12fa47a7c47",
+              "proof fixture: 5-file root matches independent value");
+        // 各层节点数 5 -> 3 -> 2 -> 1：位置 4 连续两次原样提升，
+        // 只在最后一层记录一个左侧兄弟。
+        const std::size_t expected_siblings[5] = {3, 3, 3, 3, 1};
+        for (std::uint64_t i = 0; i < 5; ++i) {
+            const branchaudit::MerkleProofResult r =
+                branchaudit::merkle_proof_file(batch, i);
+            check(r.ok(), "proof 5-file index " + std::to_string(i) + ": ok");
+            check(r.proof.leaf_count == 5 && r.proof.leaf_index == i,
+                  "proof 5-file: count/index echoed");
+            check(r.proof.root == root,
+                  "proof 5-file: root equals merkle_root_files result");
+            check(r.proof.siblings.size() == expected_siblings[i],
+                  "proof 5-file index " + std::to_string(i) +
+                      ": sibling count matches tree shape");
+            check(fold_proof(r.proof) == r.proof.root,
+                  "proof 5-file index " + std::to_string(i) +
+                      ": siblings fold back to root");
+        }
+        // 位置 4 的唯一兄弟是左侧的 parent(parent(La,Labc), parent(Lempty,Lhello))。
+        const branchaudit::MerkleProofResult r4 =
+            branchaudit::merkle_proof_file(batch, 4);
+        const Digest left_subtree = branchaudit::merkle_parent(
+            branchaudit::merkle_parent(la, labc),
+            branchaudit::merkle_parent(lempty, leaf_bytes(hello)));
+        check(r4.proof.siblings.size() == 1 &&
+                  r4.proof.siblings[0].side == branchaudit::MerkleSibling::Side::left &&
+                  r4.proof.siblings[0].digest == left_subtree,
+              "proof index 4: promoted twice, single left sibling at the top");
+    }
+
+    // 重复路径与相同内容各占独立位置，证明按位置区分。
+    {
+        const std::vector<fs::path> batch{f_a, f_a};
+        const branchaudit::MerkleProofResult r0 =
+            branchaudit::merkle_proof_file(batch, 0);
+        const branchaudit::MerkleProofResult r1 =
+            branchaudit::merkle_proof_file(batch, 1);
+        check(r0.ok() && r1.ok() && r0.proof.root == r1.proof.root &&
+                  r0.proof.leaf == r1.proof.leaf &&
+                  r0.proof.siblings[0].side == branchaudit::MerkleSibling::Side::right &&
+                  r1.proof.siblings[0].side == branchaudit::MerkleSibling::Side::left,
+              "proof repeated path: two positions, mirrored sibling sides");
+        check(r0.proof.root == root_of(batch),
+              "proof repeated path: root matches root command semantics");
+    }
+
+    // 库接口失败：位置越界（含空批次）、文件失败；不打印、不退出。
+    {
+        branchaudit::MerkleProofResult r =
+            branchaudit::merkle_proof_file({f_a}, 1);
+        check(!r.ok(), "proof index out of range: fails");
+        r = branchaudit::merkle_proof_file({}, 0);
+        check(!r.ok(), "proof empty batch: no valid position");
+        const fs::path missing = tmp.root / "missing 缺失.bin";
+        std::stringstream cap_out, cap_err;
+        auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+        auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+        r = branchaudit::merkle_proof_file({f_a, missing, f_abc}, 0);
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        check(!r.ok(), "proof with a failing file: whole operation fails");
+        check(r.error.find(missing.string()) != std::string::npos,
+              "proof file failure: error names the failed path");
+        check(cap_out.str().empty() && cap_err.str().empty(),
+              "proof library: prints nothing, does not exit");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -554,6 +740,7 @@ int main(int argc, char** argv) {
                      "(fault injection not supported on this platform)\n";
     }
     test_large_files();
+    test_proofs();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

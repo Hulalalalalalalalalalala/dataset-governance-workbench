@@ -1,7 +1,10 @@
+#include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "filehash.h"
@@ -47,10 +50,32 @@ void print_root_usage() {
     std::cerr << "Usage: branchaudit root [--] [<file>...]\n";
 }
 
+void print_prove_usage() {
+    std::cerr << "Usage: branchaudit prove <index> [--] <file>...\n";
+}
+
 void print_usage() {
     std::cerr << "Usage: branchaudit --version\n"
                  "       branchaudit hash [--] <file>\n"
-                 "       branchaudit root [--] [<file>...]\n";
+                 "       branchaudit root [--] [<file>...]\n"
+                 "       branchaudit prove <index> [--] <file>...\n";
+}
+
+// 解析 prove 的位置参数：只接受十进制数字（至少一位），且必须落在
+// 可表示范围内；空串、含任何非数字字符或数值溢出都判为无效。
+bool parse_index(const char* text, std::uint64_t& out) {
+    const std::string_view sv{text};
+    if (sv.empty()) {
+        return false;
+    }
+    for (const char c : sv) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    const auto res =
+        std::from_chars(sv.data(), sv.data() + sv.size(), out);
+    return res.ec == std::errc{} && res.ptr == sv.data() + sv.size();
 }
 
 }  // namespace
@@ -103,6 +128,66 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::cout << branchaudit::to_hex(result.digest) << '\n';
+        return 0;
+    }
+
+    if (argc >= 2 && std::string_view(argv[1]) == "prove") {
+        // 位置是第一个参数：缺失、含非数字或超出可表示范围都是用法错误。
+        if (argc < 3) {
+            std::cerr << "branchaudit prove: missing leaf index\n";
+            print_prove_usage();
+            return 2;
+        }
+        std::uint64_t index = 0;
+        if (!parse_index(argv[2], index)) {
+            std::cerr << "branchaudit prove: invalid leaf index '" << argv[2]
+                      << "' (expected a decimal number)\n";
+            print_prove_usage();
+            return 2;
+        }
+        // 文件参数与 root 共用同一套定位与 "--" 规则：不排序、不去重。
+        const FileArgs args = parse_file_args(argv, 3, argc);
+        if (!args.unsupported.empty()) {
+            std::cerr << "branchaudit prove: unsupported option '"
+                      << args.unsupported << "'\n";
+            print_prove_usage();
+            return 2;
+        }
+        // 位置必须落在批次内；空批次没有合法位置。
+        if (index >= args.files.size()) {
+            std::cerr << "branchaudit prove: leaf index " << index
+                      << " out of range for batch of " << args.files.size()
+                      << " file(s)\n";
+            print_prove_usage();
+            return 2;
+        }
+        const branchaudit::MerkleProofResult result =
+            branchaudit::merkle_proof_file(args.files, index);
+        if (!result.ok()) {
+            std::cerr << "branchaudit: " << result.error << '\n';
+            return 1;
+        }
+        // 单个 JSON 对象加换行；摘要均为 64 个小写十六进制字符。
+        const branchaudit::MerkleProof& proof = result.proof;
+        std::cout << "{\"version\":1"
+                  << ",\"root\":\"" << branchaudit::to_hex(proof.root) << "\""
+                  << ",\"leaf_count\":" << proof.leaf_count
+                  << ",\"leaf_index\":" << proof.leaf_index
+                  << ",\"leaf\":\"" << branchaudit::to_hex(proof.leaf) << "\""
+                  << ",\"siblings\":[";
+        for (std::size_t i = 0; i < proof.siblings.size(); ++i) {
+            if (i != 0) {
+                std::cout << ',';
+            }
+            const branchaudit::MerkleSibling& s = proof.siblings[i];
+            std::cout << "{\"side\":\""
+                      << (s.side == branchaudit::MerkleSibling::Side::left
+                              ? "left"
+                              : "right")
+                      << "\",\"digest\":\"" << branchaudit::to_hex(s.digest)
+                      << "\"}";
+        }
+        std::cout << "]}\n";
         return 0;
     }
 

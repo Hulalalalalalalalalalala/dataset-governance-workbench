@@ -39,6 +39,22 @@ FileHashResult leaf_file(const std::filesystem::path& path) {
     return internal::sha256_file_digest(path, &kLeafPrefix);
 }
 
+// 计算有序批次的叶子层。严格按 paths 下标顺序：不排序、不去重。
+// 任一文件失败立即返回该错误，不读取也不使用其后的任何文件。
+std::string leaf_level(const std::vector<std::filesystem::path>& paths,
+                       std::vector<Digest>& level) {
+    level.clear();
+    level.reserve(paths.size());
+    for (const std::filesystem::path& path : paths) {
+        FileHashResult leaf = leaf_file(path);
+        if (!leaf.ok()) {
+            return std::move(leaf.error);
+        }
+        level.push_back(leaf.digest);
+    }
+    return {};
+}
+
 }  // namespace
 
 FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths) {
@@ -50,17 +66,11 @@ FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths
         return result;
     }
 
-    // 叶子层。严格按 paths 下标顺序处理：不排序、不去重。
-    // 任一文件失败立即返回，不读取也不使用其后的任何文件。
+    // 叶子层。
     std::vector<Digest> level;
-    level.reserve(paths.size());
-    for (const std::filesystem::path& path : paths) {
-        FileHashResult leaf = leaf_file(path);
-        if (!leaf.ok()) {
-            result.error = std::move(leaf.error);
-            return result;
-        }
-        level.push_back(leaf.digest);
+    result.error = leaf_level(paths, level);
+    if (!result.ok()) {
+        return result;
     }
 
     // 逐层相邻配对：先左后右；奇数个时末节点原样提升（不复制、不补零）。
@@ -78,6 +88,63 @@ FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths
     }
 
     result.digest = level.front();
+    return result;
+}
+
+MerkleProofResult merkle_proof_file(
+        const std::vector<std::filesystem::path>& paths,
+        std::uint64_t leaf_index) {
+    MerkleProofResult result;
+
+    // 位置必须落在批次内；空批次没有任何合法位置。
+    if (leaf_index >= paths.size()) {
+        result.error = "leaf index " + std::to_string(leaf_index) +
+                       " out of range for batch of " +
+                       std::to_string(paths.size()) + " file(s)";
+        return result;
+    }
+
+    // 叶子层：与 merkle_root_files 完全相同的文件与顺序规则。
+    std::vector<Digest> level;
+    result.error = leaf_level(paths, level);
+    if (!result.ok()) {
+        return result;
+    }
+
+    MerkleProof& proof = result.proof;
+    proof.leaf_count = paths.size();
+    proof.leaf_index = leaf_index;
+    proof.leaf = level[static_cast<std::size_t>(leaf_index)];
+
+    // 沿被选位置逐层向上：每层只记录实际存在的兄弟；奇数末节点原样
+    // 提升的层没有兄弟，不添加记录（不复制末节点、不补零）。
+    std::size_t idx = static_cast<std::size_t>(leaf_index);
+    while (level.size() > 1) {
+        if (idx % 2 == 0) {
+            if (idx + 1 < level.size()) {
+                proof.siblings.push_back(
+                    {MerkleSibling::Side::right, level[idx + 1]});
+            }
+            // idx 是奇数层的末节点：原样提升，无兄弟记录。
+        } else {
+            proof.siblings.push_back(
+                {MerkleSibling::Side::left, level[idx - 1]});
+        }
+
+        std::vector<Digest> next;
+        const bool odd = (level.size() % 2) != 0;
+        next.reserve(level.size() / 2 + (odd ? 1 : 0));
+        for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
+            next.push_back(merkle_parent(level[i], level[i + 1]));
+        }
+        if (odd) {
+            next.push_back(level.back());
+        }
+        idx /= 2;
+        level = std::move(next);
+    }
+
+    proof.root = level.front();
     return result;
 }
 

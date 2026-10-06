@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #include "filehash.h"
@@ -42,5 +43,46 @@ Digest merkle_parent(const Digest& left, const Digest& right);
 // 指向目录、无法打开或读取失败时，整次计算失败：返回 error 非空的结果，
 // 说明失败的路径和原因，不用其余文件产出部分结果。不打印、不退出进程。
 FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths);
+
+// 证明路径上的一个兄弟节点：side 指明兄弟位于当前节点的哪一侧，
+// digest 是该兄弟的摘要（32 个原始字节）。
+struct MerkleSibling {
+    enum class Side { left, right };
+    Side side;
+    Digest digest;
+};
+
+// 单个文件位置的成员证明。root 与 merkle_root_files 对同一有序批次的
+// 结果一致；leaf 是被选文件带 0x00 前缀的叶子摘要；siblings 从叶子向根
+// 逐层排列，只记录实际存在的兄弟——奇数末节点原样提升的层不添加记录，
+// 不复制末节点、不补零。证明不含文件内容与路径。
+struct MerkleProof {
+    Digest root{};
+    std::uint64_t leaf_count = 0;
+    std::uint64_t leaf_index = 0;
+    Digest leaf{};
+    std::vector<MerkleSibling> siblings;
+};
+
+// merkle_proof_file 的结果：成功时 error 为空、proof 有效；
+// 失败时 error 说明原因。
+struct MerkleProofResult {
+    MerkleProof proof;
+    std::string error;
+
+    bool ok() const { return error.empty(); }
+};
+
+// 为有序批次中位于 leaf_index（从 0 开始）的文件生成成员证明。
+//
+// 批次规则与 merkle_root_files 完全相同：位置顺序取自 paths 下标，
+// 不排序、不去重，同一路径重复出现各占一个位置；叶子按流式计算，
+// 内存占用与文件大小无关。
+//
+// leaf_index 不落在批次内（paths 为空时没有任何合法位置）时返回 error
+// 非空的结果；任一文件不存在、指向目录、无法打开或读取失败时整次失败，
+// 返回 error 说明失败的路径和原因，不产出部分证明。不打印、不退出进程。
+MerkleProofResult merkle_proof_file(
+    const std::vector<std::filesystem::path>& paths, std::uint64_t leaf_index);
 
 }  // namespace branchaudit

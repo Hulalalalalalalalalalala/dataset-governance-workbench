@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""branchaudit 命令行文件摘要（hash）与有序批次 Merkle 根（root）的端到端测试。
+"""branchaudit 命令行文件摘要（hash）、有序批次 Merkle 根（root）与
+单文件成员证明（prove）的端到端测试。
 
 判定依据独立于本项目：预期摘要全部由 Python hashlib（底层为系统
 OpenSSL 的 SHA-256 实现）计算，不读取、不信任 branchaudit 自身代码，
@@ -20,6 +21,7 @@ macOS）上 CMake 不传该参数，本脚本明确跳过这两类检查（报�
 """
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -76,6 +78,41 @@ def merkle_root(contents) -> bytes:
             nxt.append(level[-1])
         level = nxt
     return level[0]
+
+
+def merkle_proof(contents, index: int):
+    """独立参考的单文件证明：返回 (叶子摘要, [(side, 兄弟摘要), ...])。
+
+    与 merkle_root 使用同一配对规则：奇数层末节点原样提升的层不产生
+    兄弟记录。side 为兄弟位于当前节点的一侧（"left"/"right"）。
+    """
+    level = [leaf_hash(d) for d in contents]
+    current = index
+    siblings = []
+    while len(level) > 1:
+        odd = len(level) & 1
+        unpaired_last = odd and current == len(level) - 1
+        if not unpaired_last:
+            if current % 2 == 0:
+                siblings.append(("right", level[current + 1]))
+            else:
+                siblings.append(("left", level[current - 1]))
+        nxt = [parent_hash(level[i], level[i + 1])
+               for i in range(0, len(level) - odd, 2)]
+        if odd:
+            nxt.append(level[-1])
+        level = nxt
+        current //= 2
+    return leaf_hash(contents[index]), siblings
+
+
+def apply_proof(leaf: bytes, siblings) -> bytes:
+    """按证明从叶子向根重建根，校验 side 语义。"""
+    current = leaf
+    for side, digest in siblings:
+        current = (parent_hash(digest, current) if side == "left"
+                   else parent_hash(current, digest))
+    return current
 
 
 def fill_a(n: int) -> bytes:
@@ -165,6 +202,15 @@ def run_root(exe: str, *args: str, cwd: str | None = None, env=None):
     )
 
 
+def run_prove(exe: str, *args: str, cwd: str | None = None, env=None):
+    return subprocess.run(
+        [exe, "prove", *args],
+        capture_output=True,
+        cwd=cwd,
+        env=env,
+    )
+
+
 def fault_env(fault_lib: str, **triggers) -> dict:
     """构造预载故障库并设置精确触发变量的子进程环境。"""
     env = dict(os.environ, LD_PRELOAD=fault_lib)
@@ -182,6 +228,75 @@ def expect_root(exe: str, args, contents, label: str):
           f"(got {proc.stdout!r}, want {expected!r})")
     check(len(proc.stdout) == 65, f"{label}: stdout length is 65")
     check(proc.stderr == b"", f"{label}: stderr must be empty (got {proc.stderr!r})")
+
+
+def expect_proof(exe, args, contents, index: int, label: str, proc=None):
+    """prove 成功契约：退出 0、stderr 空；stdout 是唯一一份证明 JSON + 换行。
+
+    期望全部由 hashlib 独立参考（merkle_proof / apply_proof / merkle_root）
+    给出，不读取被测程序以外的任何计算结果。返回解析后的对象。
+    """
+    if proc is None:
+        proc = run_prove(exe, *args)
+    check(proc.returncode == 0, f"{label}: exit code 0 (got {proc.returncode})")
+    check(proc.stderr == b"", f"{label}: stderr must be empty (got {proc.stderr!r})")
+    check(proc.stdout.endswith(b"\n") and proc.stdout.count(b"\n") == 1,
+          f"{label}: stdout is exactly one line ending with newline "
+          f"(got {proc.stdout!r})")
+    body = proc.stdout[:-1]
+    try:
+        obj = json.loads(body.decode("ascii"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        check(False, f"{label}: stdout body is a single JSON object ({exc})")
+        return None
+
+    check(set(obj.keys()) ==
+              {"version", "root", "leaf_count", "leaf_index", "leaf",
+               "siblings"},
+          f"{label}: JSON has exactly the documented keys (got {set(obj.keys())})")
+    check(obj["version"] == 1 and isinstance(obj["version"], int),
+          f"{label}: version is the integer 1")
+    check(isinstance(obj["leaf_count"], int) and obj["leaf_count"] == len(contents),
+          f"{label}: leaf_count is the integer batch size")
+    check(isinstance(obj["leaf_index"], int) and obj["leaf_index"] == index,
+          f"{label}: leaf_index is the selected integer position")
+
+    expected_leaf, expected_siblings = merkle_proof(contents, index)
+    root_hex = merkle_root(contents).hex()
+    check(obj["root"] == root_hex,
+          f"{label}: root equals root of the same ordered batch")
+    check(obj["leaf"] == expected_leaf.hex(),
+          f"{label}: leaf is the 0x00-prefixed leaf of the selected file")
+
+    for name in ("root", "leaf"):
+        s = obj[name]
+        check(isinstance(s, str) and len(s) == 64 and
+                  all(c in "0123456789abcdef" for c in s),
+              f"{label}: {name} is 64 lowercase hex characters")
+
+    check(isinstance(obj["siblings"], list) and
+              len(obj["siblings"]) == len(expected_siblings),
+          f"{label}: sibling count matches the reference "
+          f"(got {len(obj['siblings'])}, want {len(expected_siblings)})")
+    for i, (item, (side, digest)) in enumerate(
+            zip(obj["siblings"], expected_siblings)):
+        check(set(item.keys()) == {"side", "digest"},
+              f"{label}: sibling {i} has only side and digest")
+        check(item["side"] == side,
+              f"{label}: sibling {i} side is {side} (got {item['side']!r})")
+        check(item["digest"] == digest.hex(),
+              f"{label}: sibling {i} digest matches independent reference")
+        check(item["side"] in ("left", "right"),
+              f"{label}: sibling {i} side uses left/right")
+
+    # 用兄弟重建根，端到端验证整份证明。
+    rebuilt = apply_proof(bytes.fromhex(obj["leaf"]),
+                          [(s["side"], bytes.fromhex(s["digest"]))
+                           for s in obj["siblings"]])
+    check(rebuilt.hex() == obj["root"],
+          f"{label}: proof reconstructs leaf up to root")
+    return obj
+
 
 
 def expect_file_success(exe: str, path: Path, data: bytes, label: str):
@@ -931,6 +1046,227 @@ def main() -> int:
         check(run_root(exe, "--", str(r_a), str(r_a)).stdout
                   == run_root(exe, str(r_a), str(r_a)).stdout,
               "root end marker keeps repeated path positions")
+
+        # ==================================================================
+        # prove：单文件成员证明（预期全部由上方 hashlib 参考实现独立给出）
+        # ==================================================================
+        pdir = tmp / "prove fixtures"
+        pdir.mkdir(parents=True)
+        p_contents = [pattern(1 + i * 13) for i in range(8)]
+        p_paths = []
+        for i, data in enumerate(p_contents):
+            p = pdir / f"p{i}.bin"
+            write_fixture(p, data)
+            p_paths.append(p)
+
+        # ---- 各批次规模、每个位置：结构、重建、root 一致 -----------------
+        for size in range(1, 9):
+            paths = [str(p) for p in p_paths[:size]]
+            contents = p_contents[:size]
+            for idx in range(size):
+                expect_proof(exe, [str(idx), *paths], contents, idx,
+                             f"prove size {size} index {idx}")
+
+        # ---- 单个空文件：siblings 空，root 等于叶子，不是空批次根 --------
+        p_empty = pdir / "p-empty.bin"
+        write_fixture(p_empty, b"")
+        obj = expect_proof(exe, ["0", str(p_empty)], [b""], 0,
+                           "prove single empty file")
+        check(obj["siblings"] == [] and obj["root"] == obj["leaf"],
+              "prove single empty file: root == leaf, no siblings")
+        check(obj["root"] == leaf_empty_hex and obj["root"] != empty_batch_hex,
+              "prove single empty file: leaf 0x00, not empty batch root")
+
+        # ---- 三文件奇数提升：末位置在叶子层没有兄弟记录 ------------------
+        three_paths = [str(r_a), str(r_abc), str(r_empty)]
+        three_contents = [b"a", b"abc", b""]
+        obj = expect_proof(exe, ["2", *three_paths], three_contents, 2,
+                           "prove 3-file last index (promoted at leaf level)")
+        check([s["side"] for s in obj["siblings"]] == ["left"],
+              "3-file last index: only one sibling, at the upper level")
+        check(obj["siblings"][0]["digest"]
+              == parent_hash(leaf_hash(b"a"), leaf_hash(b"abc")).hex(),
+              "3-file last index: sibling is the upper-level left pair")
+        obj0 = expect_proof(exe, ["0", *three_paths], three_contents, 0,
+                            "prove 3-file index 0")
+        check([s["side"] for s in obj0["siblings"]] == ["right", "right"],
+              "3-file index 0: right sibling at leaf level and at promotion")
+        check(obj0["siblings"][1]["digest"] == leaf_hash(b"").hex(),
+              "3-file index 0: promoted odd node appears as a real sibling")
+
+        # ---- 重复路径、相同内容各占一个位置 ------------------------------
+        expect_proof(exe, ["0", str(r_a), str(r_a)], [b"a", b"a"], 0,
+                     "prove repeated same path idx0")
+        expect_proof(exe, ["1", str(r_a), str(r_a)], [b"a", b"a"], 1,
+                     "prove repeated same path idx1")
+        expect_proof(exe, ["1", str(r_a), str(r_a_copy)], [b"a", b"a"], 1,
+                     "prove equal-content distinct files")
+
+        # ---- root 必须等于同批次 root 的结果 -----------------------------
+        for size in (1, 2, 3, 5, 7, 8):
+            paths = [str(p) for p in p_paths[:size]]
+            proof_root = json.loads(
+                run_prove(exe, "0", *paths).stdout)["root"]
+            root_out = run_root(exe, *paths).stdout.decode().strip()
+            check(proof_root == root_out,
+                  f"prove root equals root subcommand for size {size}")
+
+        # ---- 空格/中文路径与相对路径 -------------------------------------
+        sp_paths = [str(m_empty), str(m_a), str(m_abc)]
+        sp_contents = [b"", b"a", b"abc"]
+        expect_proof(exe, ["1", *sp_paths], sp_contents, 1,
+                     "prove paths with spaces and Chinese")
+        proc = run_prove(exe, "0", "r1.bin", "r2.bin", cwd=str(rel_dir))
+        expect_proof(exe, None, [b"a", b"abc"], 0,
+                     "prove relative paths", proc=proc)
+
+        # ---- 证明中不含路径文字（stdout 仅 JSON，且路径串不出现） --------
+        unique = tmp / "prove 路径 唯一片段" / "成员 文件.bin"
+        write_fixture(unique, b"batch member content\n")
+        proc = run_prove(exe, "0", str(unique))
+        check(proc.returncode == 0 and
+                  "唯一片段".encode() not in proc.stdout and
+                  b"member content" not in proc.stdout,
+              "proof stdout carries no path text or file content")
+
+        # ---- 结束标记的各种位置给出完全相同的 JSON -----------------------
+        plain = run_prove(exe, "0", str(r_a), str(r_abc)).stdout
+        for label, args in (
+            ("marker first", ["--", "0", str(r_a), str(r_abc)]),
+            ("marker middle", ["0", "--", str(r_a), str(r_abc)]),
+            ("marker last", ["0", str(r_a), str(r_abc), "--"]),
+        ):
+            proc = run_prove(exe, *args)
+            check(proc.returncode == 0 and proc.stdout == plain,
+                  f"prove end-marker placement changes nothing: {label}")
+
+        # ---- 标记之后的连字符名字是真实文件 ------------------------------
+        proc = run_prove(exe, "0", "--", "-notes.bin", "--version",
+                         cwd=str(odir))
+        expect_proof(exe, None, [opt_dash, opt_ver], 0,
+                     "prove -- dashed filenames are real batch files",
+                     proc=proc)
+        proc = run_prove(exe, "1", "--", "-notes.bin", "--",
+                         cwd=str(odir))
+        expect_proof(exe, None, [opt_dash, opt_dd], 1,
+                     "prove -- repeated '--' is a file path", proc=proc)
+        proc = run_prove(exe, "--", "1", "--version", "-", cwd=str(odir))
+        expect_proof(exe, None, [opt_ver, opt_sd], 1,
+                     "prove -- marker before position works", proc=proc)
+        check(run_prove(exe, "0", "--", "--version", cwd=str(odir)).stdout
+                  != b"branchaudit 0.1.0\n",
+              "prove -- --version must not trigger the version query")
+        proc = run_prove(exe, "0", "--", "-missing.bin", cwd=str(odir))
+        check(proc.returncode == 1 and proc.stdout == b"" and
+                      b"-missing.bin" in proc.stderr,
+              "prove post-marker missing hyphen name is a file error (exit 1)")
+
+        # ---- 用法错误：退出 2、stdout 空、stderr 指出问题并给用法 --------
+        def expect_prove_usage(args, label, needle=None):
+            proc = run_prove(exe, *args)
+            check(proc.returncode == 2,
+                  f"{label}: exit code 2 (got {proc.returncode})")
+            check(proc.stdout == b"", f"{label}: stdout empty")
+            check(proc.stderr != b"", f"{label}: stderr nonempty")
+            check(b"Usage: branchaudit prove" in proc.stderr,
+                  f"{label}: stderr gives prove usage (got {proc.stderr!r})")
+            if needle is not None:
+                check(needle.encode() in proc.stderr,
+                      f"{label}: stderr contains {needle!r} "
+                      f"(got {proc.stderr!r})")
+
+        expect_prove_usage([], "prove no arguments", "missing position")
+        expect_prove_usage(["--"], "prove only the marker", "missing position")
+        expect_prove_usage(["x", str(r_a)], "prove non-numeric position", "x")
+        expect_prove_usage(["1a", str(r_a)], "prove trailing non-digit", "1a")
+        expect_prove_usage(["+0", str(r_a)], "prove leading plus", "+0")
+        expect_prove_usage(["0x1", str(r_a)], "prove hex-looking position",
+                           "0x1")
+        expect_prove_usage([" 0", str(r_a)], "prove leading space", " 0")
+        expect_prove_usage(["0 ", str(r_a)], "prove trailing space", "0 ")
+        expect_prove_usage(["", str(r_a)], "prove empty-string position")
+        # 以连字符开头的写法按选项解释，不触发版本查询。
+        expect_prove_usage(["-1", str(r_a)], "prove minus one", "-1")
+        expect_prove_usage(["--version", "0", str(r_a)],
+                           "prove --version is an unsupported option",
+                           "--version")
+        expect_prove_usage(["0", str(r_a), "--bad"],
+                           "prove unsupported option among files", "--bad")
+        # 空批次没有合法位置（即使位置数字本身合法）。
+        expect_prove_usage(["0"], "prove position on empty batch")
+        expect_prove_usage(["--", "0"], "prove marker then position, no files")
+        # 越界与边界。
+        expect_prove_usage(["1", str(r_a)], "prove index == batch size")
+        expect_prove_usage(["2", str(r_a), str(r_abc)], "prove index past batch")
+        expect_prove_usage(["9999999999999999999999999999", str(r_a)],
+                           "prove position beyond representable range")
+        # 前导零仍是十进制数字：按十进制值解释。
+        proc = run_prove(exe, "00", str(r_a))
+        check(proc.returncode == 0, "prove '00' is decimal zero")
+        proc = run_prove(exe, "01", str(r_a), str(r_abc))
+        check(proc.returncode == 0, "prove '01' is decimal one")
+        # 最后一个合法位置成功。
+        check(run_prove(exe, "1", str(r_a), str(r_abc)).returncode == 0,
+              "prove last valid index succeeds")
+
+        # ---- 文件错误：退出 1、stdout 空、stderr 指出路径与原因 ----------
+        p_missing = pdir / "prove missing 缺失.bin"
+        for label, args in (
+            ("selected missing", ["0", str(p_missing)]),
+            ("missing after selected", ["0", str(r_a), str(p_missing)]),
+            ("missing before selected", ["1", str(p_missing), str(r_a)]),
+        ):
+            proc = run_prove(exe, *args)
+            check(proc.returncode == 1, f"prove {label}: exit code 1")
+            check(proc.stdout == b"", f"prove {label}: stdout empty")
+            check(str(p_missing).encode() in proc.stderr,
+                  f"prove {label}: stderr names failed path "
+                  f"(got {proc.stderr!r})")
+
+        p_dir = pdir / "a prove dir 目录"
+        p_dir.mkdir()
+        proc = run_prove(exe, "0", str(p_dir))
+        check(proc.returncode == 1 and proc.stdout == b"" and
+                      str(p_dir).encode() in proc.stderr and
+                      b"directory" in proc.stderr,
+              f"prove directory: exit 1, names path and directory reason "
+              f"(got {proc.stderr!r})")
+
+        # ---- 故障注入：打不开 / 读到一半出错，均无部分证明 --------------
+        p_bad = pdir / "present unopenable 存在.bin"
+        p_bad.write_bytes(pattern(200))
+        if fault_lib is not None:
+            for label, args in (
+                ("open fail selected", ["0", str(p_bad)]),
+                ("open fail after good",
+                 ["0", str(r_a), str(r_abc), str(p_bad)]),
+            ):
+                proc = run_prove(exe, *args, env=fault_env(
+                    fault_lib, BRANCHAUDIT_TEST_OPEN_FAIL=str(p_bad)))
+                check(proc.returncode == 1, f"prove {label}: exit code 1")
+                check(proc.stdout == b"", f"prove {label}: stdout empty")
+                check(str(p_bad).encode() in proc.stderr,
+                      f"prove {label}: stderr names the real failing file")
+
+            # 被选叶子读到一半出错：stdout 空，绝不出现部分/完整叶子。
+            read_env = fault_env(
+                fault_lib,
+                BRANCHAUDIT_TEST_READ_FAIL=f"{p_bad}:{PARTIAL}")
+            proc = run_prove(exe, "0", str(r_a), str(p_bad), env=read_env)
+            check(proc.returncode == 1 and proc.stdout == b"",
+                  "prove selected leaf read error: exit 1, no JSON")
+            check(str(p_bad).encode() in proc.stderr and b"read" in proc.stderr,
+                  f"prove read error names file and read failure "
+                  f"(got {proc.stderr!r})")
+            proc = run_prove(exe, "0", str(p_bad), env=read_env)
+            check(proc.returncode == 1 and proc.stdout == b"",
+                  "prove read error on the only selected file: no partial proof")
+            # 不含坏文件的批次在预载下照常成功。
+            expect_proof(exe, ["0", str(r_a), str(r_abc)], [b"a", b"abc"], 0,
+                         "prove fault preload inert without targeted path")
+        else:
+            skip_group("prove: 文件存在却打不开与叶子部分读取后出错"
+                       "（此平台无故障注入支持，未验证）")
 
         # ---- 保留 hash / --version 及用法错误行为 -----------------------
         check(subprocess.run([exe, "--version"], capture_output=True).stdout ==

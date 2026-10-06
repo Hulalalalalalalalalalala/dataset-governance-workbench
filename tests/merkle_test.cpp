@@ -105,6 +105,55 @@ std::pair<std::string, std::string> silent_merkle(
     return {cap_out.str(), cap_err.str()};
 }
 
+// 用证明中从叶子向根的兄弟逐层配对，重建根：
+// side == left 表示兄弟在当前节点左侧 -> parent(sibling, current)，反之亦然。
+Digest reconstruct(const branchaudit::MerkleProof& proof) {
+    Digest current = proof.leaf;
+    for (const branchaudit::ProofSibling& sibling : proof.siblings) {
+        current = (sibling.side == branchaudit::ProofSide::kLeft)
+                      ? branchaudit::merkle_parent(sibling.digest, current)
+                      : branchaudit::merkle_parent(current, sibling.digest);
+    }
+    return current;
+}
+
+branchaudit::MerkleProof proof_of(const std::vector<fs::path>& paths,
+                                  std::size_t index) {
+    const branchaudit::MerkleProofResult r =
+        branchaudit::merkle_proof_files(paths, index);
+    check(r.ok(), std::string("merkle_proof_files succeeds: ") + r.error);
+    return r.proof;
+}
+
+// 对一批大小逐一检查每个位置：证明自洽（重建得到 root）且与 root 接口一致。
+void check_all_indices(const std::vector<fs::path>& paths,
+                       std::string_view label) {
+    const Digest root = root_of(paths);
+    for (std::size_t idx = 0; idx < paths.size(); ++idx) {
+        const branchaudit::MerkleProof proof = proof_of(paths, idx);
+        check(proof.leaf_count == paths.size(),
+              std::string(label) + ": leaf_count equals batch size");
+        check(proof.leaf_index == idx,
+              std::string(label) + ": leaf_index echoed");
+        check(proof.root == root,
+              std::string(label) + ": proof root equals root-of-same-batch");
+        check(reconstruct(proof) == root,
+              std::string(label) + ": proof reconstructs to root");
+    }
+}
+
+std::pair<std::string, std::string> silent_proof(
+        const std::vector<fs::path>& paths, std::size_t index,
+        branchaudit::MerkleProofResult* out) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    *out = branchaudit::merkle_proof_files(paths, index);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    return {cap_out.str(), cap_err.str()};
+}
+
 // ---- 空批次根 -------------------------------------------------------------
 
 void test_empty_batch() {
@@ -533,6 +582,271 @@ void test_large_files() {
           "large file: tail change is detected");
 }
 
+// ---- 单文件成员证明 -------------------------------------------------------
+
+void test_proof() {
+    TempArea tmp("proof");
+
+    const auto empty = bytes_of("");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto hello = bytes_of("hello\n");
+
+    const fs::path f_empty = tmp.root / "empty.bin";
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_hello = tmp.root / "hello.bin";
+    write_file(f_empty, empty);
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_hello, hello);
+
+    // 单文件批次：siblings 为空，root 即叶子（单个空文件也如此）。
+    {
+        const branchaudit::MerkleProof proof = proof_of({f_a}, 0);
+        check(proof.leaf_count == 1 && proof.leaf_index == 0,
+              "single-file proof counts/index");
+        check(proof.leaf == leaf_bytes(a), "single-file proof leaf");
+        check(proof.root == leaf_bytes(a), "single-file proof root equals leaf");
+        check(proof.siblings.empty(), "single-file proof has no siblings");
+    }
+    {
+        const branchaudit::MerkleProof proof = proof_of({f_empty}, 0);
+        check(proof.leaf == leaf_bytes(empty) && proof.root == leaf_bytes(empty),
+              "single empty file proof: root equals its 0x00-prefixed leaf");
+        check(proof.siblings.empty(),
+              "single empty file proof has no siblings");
+        check(proof.root != branchaudit::merkle_empty_root(),
+              "single empty file proof root differs from empty batch root");
+    }
+
+    // 两文件：一个右兄弟；被选位置在右侧时兄弟在左。
+    {
+        const branchaudit::MerkleProof p0 = proof_of({f_a, f_abc}, 0);
+        check(p0.siblings.size() == 1, "2-file idx0: one sibling");
+        check(p0.siblings[0].side == branchaudit::ProofSide::kRight,
+              "2-file idx0: sibling on the right");
+        check(p0.siblings[0].digest == leaf_bytes(abc),
+              "2-file idx0: sibling is the other leaf");
+        check(reconstruct(p0) == p0.root, "2-file idx0 reconstructs");
+
+        const branchaudit::MerkleProof p1 = proof_of({f_a, f_abc}, 1);
+        check(p1.siblings.size() == 1 &&
+                  p1.siblings[0].side == branchaudit::ProofSide::kLeft &&
+                  p1.siblings[0].digest == leaf_bytes(a),
+              "2-file idx1: one sibling on the left");
+        check(reconstruct(p1) == p1.root, "2-file idx1 reconstructs");
+        check(p0.root == p1.root &&
+                  p0.root == branchaudit::merkle_parent(
+                                  leaf_bytes(a), leaf_bytes(abc)),
+              "both proofs share the independently-defined root");
+    }
+
+    // 三文件（末节点在叶子层原样提升）：
+    //   idx0：右兄弟 Lbc，再右兄弟 Lempty（提升上来的同一摘要）；
+    //   idx2（末位置）：叶子层无兄弟（原样提升），上一层有左兄弟
+    //         parent(La,Lbc)——提升层不得产生记录。
+    {
+        const Digest la = leaf_bytes(a);
+        const Digest lbc = leaf_bytes(abc);
+        const Digest le = leaf_bytes(empty);
+        const Digest pair = branchaudit::merkle_parent(la, lbc);
+
+        const branchaudit::MerkleProof p0 =
+            proof_of({f_a, f_abc, f_empty}, 0);
+        check(p0.siblings.size() == 2, "3-file idx0: two siblings");
+        check(p0.siblings[0].side == branchaudit::ProofSide::kRight &&
+                  p0.siblings[0].digest == lbc,
+              "3-file idx0 sibling 0 is right leaf('abc')");
+        check(p0.siblings[1].side == branchaudit::ProofSide::kRight &&
+                  p0.siblings[1].digest == le,
+              "3-file idx0 sibling 1 is the promoted leaf('')");
+        check(reconstruct(p0) == p0.root, "3-file idx0 reconstructs");
+
+        const branchaudit::MerkleProof p2 =
+            proof_of({f_a, f_abc, f_empty}, 2);
+        check(p2.siblings.size() == 1,
+              "3-file idx2: promoted level adds no sibling record");
+        check(p2.siblings[0].side == branchaudit::ProofSide::kLeft &&
+                  p2.siblings[0].digest == pair,
+              "3-file idx2: sole sibling is the left pair at the upper level");
+        check(reconstruct(p2) == p2.root, "3-file idx2 reconstructs");
+        check(p0.root == p2.root, "3-file: proofs for both indices share root");
+    }
+
+    // 多种规模（含 4~8 与重复路径/相同内容）：每个位置逐一重建并核对根。
+    const std::vector<fs::path> batch5 = {
+        f_a, f_abc, f_empty, f_hello, f_a};
+    check_all_indices(batch5, "5-file batch");
+    check_all_indices({f_a, f_abc, f_empty, f_hello}, "4-file batch");
+
+    std::array<fs::path, 8> eight;
+    for (std::size_t i = 0; i < eight.size(); ++i) {
+        eight[i] = tmp.root / ("eight" + std::to_string(i) + ".bin");
+        write_file(eight[i], pattern(1 + i * 13));
+    }
+    check_all_indices({eight.begin(), eight.end()}, "8-file batch");
+    // 七文件：跨多层奇数提升；末位置的提升层必须全部跳过。
+    check_all_indices({eight.begin(), eight.begin() + 7}, "7-file batch");
+    // 六文件：不同位置在中间层成为奇数末节点。
+    check_all_indices({eight.begin(), eight.begin() + 6}, "6-file batch");
+
+    // 重复路径、相同内容各占独立位置：证明按位置区分，不去重。
+    check_all_indices({f_a, f_a}, "repeated same path");
+    {
+        const fs::path f_a_copy = tmp.root / "copy of a.bin";
+        write_file(f_a_copy, a);
+        const branchaudit::MerkleProof p0 = proof_of({f_a, f_a_copy}, 0);
+        const branchaudit::MerkleProof p1 = proof_of({f_a, f_a_copy}, 1);
+        check(p0.leaf == p1.leaf && p0.siblings[0].digest == p1.leaf,
+              "identical contents: proof still carries a real sibling position");
+        check(reconstruct(p0) == root_of({f_a, f_a}),
+              "equal-content batch root matches repeated-path root");
+    }
+
+    // 证明不含路径文字：无法直接检查摘要内容，但同序内容换路径后证明
+    // （leaf/root/siblings）完全一致。
+    {
+        const fs::path alt_dir = tmp.root / "子 目录";
+        const fs::path g0 = alt_dir / "空.bin";
+        const fs::path g1 = alt_dir / "a file.dat";
+        const fs::path g2 = tmp.root / "深 路径" / "文 件.bin";
+        write_file(g0, empty);
+        write_file(g1, a);
+        write_file(g2, abc);
+        for (std::size_t idx = 0; idx < 3; ++idx) {
+            const branchaudit::MerkleProof p1 =
+                proof_of({f_empty, f_a, f_abc}, idx);
+            const branchaudit::MerkleProof p2 = proof_of({g0, g1, g2}, idx);
+            check(p1.leaf == p2.leaf && p1.root == p2.root &&
+                      p1.siblings.size() == p2.siblings.size(),
+                  "proof is path-independent: same ordered contents, other paths");
+            for (std::size_t s = 0; s < p1.siblings.size(); ++s) {
+                check(p1.siblings[s].side == p2.siblings[s].side &&
+                          p1.siblings[s].digest == p2.siblings[s].digest,
+                      "proof siblings are path-independent");
+            }
+        }
+    }
+}
+
+// ---- 证明：空批次、越界位置 -----------------------------------------------
+
+void test_proof_bad_index() {
+    TempArea tmp("proofidx");
+    const fs::path f_a = tmp.root / "a.bin";
+    write_file(f_a, bytes_of("a"));
+
+    branchaudit::MerkleProofResult r =
+        branchaudit::merkle_proof_files({}, 0);
+    check(!r.ok(), "empty batch: no valid position, proof fails");
+    check(r.proof.siblings.empty(), "empty batch failure: no partial proof");
+
+    r = branchaudit::merkle_proof_files({f_a}, 1);
+    check(!r.ok(), "index == batch size is out of range");
+    r = branchaudit::merkle_proof_files({f_a}, 128);
+    check(!r.ok(), "index beyond batch size is out of range");
+
+    // 成功路径仍然正常（错误返回不污染）。
+    r = branchaudit::merkle_proof_files({f_a}, 0);
+    check(r.ok(), "in-range index succeeds");
+}
+
+// ---- 证明：文件失败即整次失败、不输出部分证明、库保持静默 -----------------
+
+void test_proof_failures() {
+    TempArea tmp("prooffail");
+    const fs::path good1 = tmp.root / "good1.bin";
+    const fs::path good2 = tmp.root / "good2.bin";
+    write_file(good1, bytes_of("a"));
+    write_file(good2, bytes_of("abc"));
+
+    const fs::path missing = tmp.root / "does not exist 缺失.bin";
+    const fs::path dir = tmp.root / "a dir 目录";
+    fs::create_directories(dir);
+
+    for (std::size_t chosen : {0u, 1u}) {
+        // 被选位置是正常文件，但批次中另有缺失：仍整次失败。
+        branchaudit::MerkleProofResult r =
+            branchaudit::merkle_proof_files({good1, missing}, chosen);
+        check(!r.ok(), "missing file among batch: proof fails");
+        check(r.error.find(missing.string()) != std::string::npos,
+              "missing file: error names the failed path");
+        check(r.proof.siblings.empty() &&
+                  r.proof.leaf_count == 0 && r.proof.leaf_index == 0,
+              "missing file: no partial proof fields are populated");
+
+        r = branchaudit::merkle_proof_files({good1, dir, good2}, chosen);
+        check(!r.ok() && r.error.find(dir.string()) != std::string::npos,
+              "directory among files: proof fails and names the directory");
+    }
+
+    // 库接口不打印、不退出：即使失败也没有任何 stdout/stderr。
+    {
+        branchaudit::MerkleProofResult r;
+        auto captured = silent_proof({good1, missing}, 0, &r);
+        check(!r.ok() && captured.first.empty() && captured.second.empty(),
+              "proof failure: library prints nothing, does not exit");
+    }
+    {
+        branchaudit::MerkleProofResult r;
+        auto captured = silent_proof({good1, good2}, 0, &r);
+        check(r.ok() && captured.first.empty() && captured.second.empty(),
+              "proof success: library prints nothing");
+    }
+}
+
+// ---- 证明：打开失败 / 读取中途失败的故障注入 ------------------------------
+
+void test_proof_io_failures() {
+    TempArea tmp("proofio");
+    const fs::path good1 = tmp.root / "good1.bin";
+    const fs::path good2 = tmp.root / "good2.bin";
+    const fs::path bad = tmp.root / "present 出错.bin";
+    constexpr long kPartial = 40;
+    write_file(good1, bytes_of("normal-file-one"));
+    write_file(good2, bytes_of("normal-file-two"));
+    write_file(bad, pattern(200));
+
+    // 无注入时基线成功。
+    check(proof_of({good1, bad, good2}, 0).siblings.size() == 2,
+          "proof iofail fixtures succeed without injected fault");
+
+    // 打开失败：被选位置正常、坏文件在其后，仍整次失败且无部分证明。
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_OPEN_FAIL", bad.string());
+        branchaudit::MerkleProofResult r;
+        auto captured = silent_proof({good1, good2, bad}, 0, &r);
+        check(!r.ok(), "proof: open failure makes whole batch fail");
+        check(r.error.find(bad.string()) != std::string::npos,
+              "proof open failure names the real failing file");
+        check(r.proof.siblings.empty(),
+              "proof open failure returns no partial proof");
+        check(captured.first.empty() && captured.second.empty(),
+              "proof open failure: library prints nothing");
+    }
+
+    // 读取中途失败：被选叶子本身读到一半出错，部分叶子不得成为结果。
+    {
+        fault_test::FaultTrigger trigger(
+            "BRANCHAUDIT_TEST_READ_FAIL",
+            bad.string() + ":" + std::to_string(kPartial));
+        branchaudit::MerkleProofResult r;
+        auto captured = silent_proof({good1, bad}, 1, &r);
+        check(!r.ok(), "proof: mid-read failure on selected leaf fails");
+        check(r.error.find(bad.string()) != std::string::npos &&
+                  r.error.find("read") != std::string::npos,
+              "proof read failure names file and states read error");
+        const Digest partial = branchaudit::merkle_leaf(
+            pattern(200).data(), static_cast<std::size_t>(kPartial));
+        check(r.proof.leaf != partial && r.proof.siblings.empty(),
+              "proof read failure: partial leaf is not returned");
+        check(captured.first.empty() && captured.second.empty(),
+              "proof read failure: library prints nothing");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -544,8 +858,12 @@ int main(int argc, char** argv) {
     test_file_batches();
     test_relative_paths();
     test_failures();
+    test_proof();
+    test_proof_bad_index();
+    test_proof_failures();
     if (fault_test::kFaultInjectionAvailable) {
         test_io_failures();
+        test_proof_io_failures();
     } else {
         // 平台无 LD_PRELOAD//proc 故障注入支持（如 macOS）：明确报告
         // 跳过，不计入已通过检查。

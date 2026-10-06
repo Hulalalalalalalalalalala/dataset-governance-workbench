@@ -8,6 +8,7 @@
 //
 // 运行成功返回 0；任一断言失败返回非零。
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +80,168 @@ std::vector<unsigned char> pattern(std::size_t n) {
 void expect_digest(std::string_view label, const std::vector<unsigned char>& data,
                    std::string_view expected) {
     check(hash_whole(data) == expected, label);
+}
+
+// ---- 超长消息：2^32 比特长度编码边界（512 MiB） ---------------------------
+//
+// SHA-256 在最后一个分组里以 8 字节大端写入消息的【比特】长度。输入字节数
+// 越过 2^32/8 = 536870912（512 MiB）后，该长度字段的高 32 位不再为零。
+// 若实现只保留长度的低 32 位、让总长度回绕、或把字节数直接当作比特数，
+// 越过边界后的摘要都会改变：
+//   - 长度按 32 位回绕时，2^29 字节（恰 2^32 比特）的编码与空消息相同，
+//     2^29+1 字节的编码与 1 字节相同；
+//   - 字节数误当比特数时，2^29 字节的编码相当于 64 MiB 消息。
+// 下面的标准答案能区分这些错误。
+//
+// 期望值的独立依据：均由系统 coreutils sha256sum 与 Python hashlib
+// （OpenSSL）对同一份真实字节分别计算、交叉核对一致，不使用本项目代码
+// 生成；两者与被测实现互不共用代码。
+//
+// 内存有界：最长输入也只反复复用小块缓冲喂入增量接口，绝不把整份消息
+// 一次装入内存；消息总长度只来自实际 update() 的全部字节。
+
+constexpr std::uint64_t kLargeBoundaryBytes = 1uLL << 29;  // 2^29 字节 = 2^32 比特
+
+// 用固定大小缓冲把 n 个 fill 字节流式追加进 sha；内存占用与 n 无关。
+void feed_fill(branchaudit::Sha256& sha, std::uint64_t n,
+               unsigned char fill, std::size_t chunk) {
+    std::vector<unsigned char> block(chunk, fill);
+    while (n > 0) {
+        const std::size_t take =
+            static_cast<std::size_t>(std::min<std::uint64_t>(chunk, n));
+        sha.update(block.data(), take);
+        n -= take;
+    }
+}
+
+// 全 'a' 消息按指定块大小逐段提交的摘要。
+std::string hash_fill_stream(std::uint64_t n, std::size_t chunk) {
+    branchaudit::Sha256 sha;
+    feed_fill(sha, n, 'a', chunk);
+    return hex_of(sha.final());
+}
+
+void test_large_length_encoding() {
+    struct LongCase {
+        std::uint64_t n;
+        const char* hex;
+        const char* meaning;
+    };
+    const LongCase long_cases[] = {
+        {kLargeBoundaryBytes - 1,
+         "1f97811a3a059e582b3753e94d8852bd89740248c5f35911f8e70afdd57f9842",
+         "boundary minus one: bit length still fits in low 32 bits"},
+        {kLargeBoundaryBytes,
+         "b9045a713caed5dff3d3b783e98d1ce5778d8bc331ee4119d707072312af06a7",
+         "exactly 2^32 bits: length high word is 1, low word is 0"},
+        {kLargeBoundaryBytes + 1,
+         "bf6084769b780af4396e058ef0eaf9ca59366db146ca86ebfcaf58cbf7a35669",
+         "boundary plus one: bits above the low 32 must affect digest"},
+    };
+
+    // 三种长度各自经增量接口（1 MiB 分段）匹配独立标准摘要；摘要对象
+    // 各只完整扫描一次并复用于后续比较。
+    std::string before_digest, exact_digest, over_digest;
+    for (const auto& c : long_cases) {
+        const std::string got = hash_fill_stream(c.n, 1u << 20);
+        check(got == c.hex,
+              std::string("long message n=") + std::to_string(c.n) +
+              " bytes via incremental API (1 MiB chunks): " + c.meaning);
+        if (c.n == kLargeBoundaryBytes - 1) before_digest = got;
+        if (c.n == kLargeBoundaryBytes) exact_digest = got;
+        if (c.n == kLargeBoundaryBytes + 1) over_digest = got;
+    }
+
+    // 三个长度的摘要必须两两不同：长度字段的高、低 32 位都真实参与了
+    // 最终摘要（回绕到空消息/1 字节长度的错误会被这里和上面的精确匹配抓住）。
+    check(before_digest != exact_digest && exact_digest != over_digest &&
+              before_digest != over_digest,
+          "long messages n=536870911/536870912/536870913 have distinct digests "
+          "(length word, including its high 32 bits, affects the digest)");
+    check(exact_digest !=
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "n=536870912 must not wrap to the empty-message length encoding");
+    {
+        branchaudit::Sha256 one;
+        const unsigned char a = 'a';
+        one.update(&a, 1);
+        check(over_digest != hex_of(one.final()),
+              "n=536870913 must not wrap to the 1-byte length encoding");
+    }
+
+    // 越过边界的同一份消息：在边界附近采用不同分段，必须得到同一个标准
+    // 摘要。边界点 2^29 相对 64 字节分组余 0（2^29 = 64*2^23），其前后
+    // 一字节分别落在相邻分组，故切分点选在 2^29-1、2^29 会把跨边界分组
+    // 逐字节拆开。
+    const std::string expected_over =
+        "bf6084769b780af4396e058ef0eaf9ca59366db146ca86ebfcaf58cbf7a35669";
+
+    // 变体 A：(2^29-1) + 1 + 1 —— 边界前后两个字节各自单独提交。
+    {
+        branchaudit::Sha256 sha;
+        feed_fill(sha, kLargeBoundaryBytes - 1, 'a', 1u << 20);
+        const unsigned char b1 = 'a', b2 = 'a';
+        sha.update(&b1, 1);
+        sha.update(&b2, 1);
+        check(hex_of(sha.final()) == expected_over,
+              "over-boundary n=536870913 split (2^29-1)+1+1 via incremental API");
+    }
+
+    // 变体 B：边界前后共 193 字节全部逐字节提交，跨边界的分组被拆成
+    // 多次 1 字节 update；前面的海量字节仍以 1 MiB 分段提交。
+    {
+        constexpr std::uint64_t kTail = 193;  // 3*64+1，覆盖字节 2^29
+        branchaudit::Sha256 sha;
+        feed_fill(sha, kLargeBoundaryBytes + 1 - kTail, 'a', 1u << 20);
+        for (std::uint64_t i = 0; i < kTail; ++i) {
+            const unsigned char b = 'a';
+            sha.update(&b, 1);
+        }
+        check(hex_of(sha.final()) == expected_over,
+              "over-boundary n=536870913 with last 193 bytes fed one at a time");
+    }
+
+    // 变体 C：从边界前 4096 字节起（含边界字节 2^29，共 4097 字节）按
+    // 63 字节错位块提交（每次 update 都横跨 64 字节分组边界，最后一块
+    // 恰好把字节 2^29-1、2^29 一起交付，跨过边界所在分组），其余字节
+    // 仍 1 MiB 流式；缓冲只分配一次。
+    {
+        constexpr std::uint64_t kStraddle = 4096;
+        constexpr std::uint64_t kRegion = kStraddle + 1;  // 字节 2^29-4096 .. 2^29
+        branchaudit::Sha256 sha;
+        feed_fill(sha, kLargeBoundaryBytes - kStraddle, 'a', 1u << 20);
+        const std::vector<unsigned char> mis(63, 'a');
+        std::uint64_t remaining = kRegion;
+        while (remaining >= mis.size()) {
+            sha.update(mis.data(), mis.size());
+            remaining -= mis.size();
+        }
+        if (remaining > 0) {
+            sha.update(mis.data(), static_cast<std::size_t>(remaining));
+        }
+        check(hex_of(sha.final()) == expected_over,
+              "over-boundary n=536870913 with 63-byte misaligned chunks "
+              "straddling the boundary");
+    }
+
+    // 最后一段属于输入：越过边界的消息把末字节改为 'b'，必须得到另一个
+    // 独立标准摘要；它既不同于全 'a' 结果，也不是前 2^29 字节（恰好
+    // 2^32 比特）的摘要。
+    {
+        branchaudit::Sha256 sha;
+        feed_fill(sha, kLargeBoundaryBytes, 'a', 1u << 20);
+        const unsigned char tail = 'b';
+        sha.update(&tail, 1);
+        const std::string tail_digest = hex_of(sha.final());
+        check(tail_digest ==
+                  "91d4098afec4bb6731e4dba873b3c9a9c581cd4800086ac2fbb4175c21992375",
+              "over-boundary n=536870913 last byte 'b' matches independent standard");
+        check(tail_digest != expected_over,
+              "over-boundary: last segment is part of the input, not omitted "
+              "(digest differs from all-'a')");
+        check(tail_digest != exact_digest,
+              "over-boundary: digest is not that of the first 2^29 bytes only");
+    }
 }
 
 // ---- 标准已知答案向量 -----------------------------------------------------
@@ -551,6 +714,7 @@ int main(int argc, char** argv) {
     test_byte_semantics();
     test_boundary_lengths();
     test_incremental_splits();
+    test_large_length_encoding();
     test_file_hashing();
     test_file_failures();
     if (fault_test::kFaultInjectionAvailable) {

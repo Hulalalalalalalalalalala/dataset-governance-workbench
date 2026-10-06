@@ -21,6 +21,8 @@ macOS）上 CMake 不传该参数，本脚本明确跳过这两类检查（报�
 
 import hashlib
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -83,6 +85,73 @@ def fill_a(n: int) -> bytes:
 
 def pattern(n: int) -> bytes:
     return bytes((i * 31 + 7) % 256 for i in range(n))
+
+
+# ---- 2^32 比特长度编码边界（512 MiB）回归 ----------------------------------
+#
+# SHA-256 在最终分组写入 8 字节大端【比特】长度。字节数越过
+# 2^32/8 = 536870912 后，该长度字段的高 32 位不再为零。下列三个长度分别
+# 覆盖边界之前、恰好达到 2^32 比特、越过边界。
+#
+# 预期摘要的独立依据：由 coreutils sha256sum 与本文件使用的
+# hashlib（OpenSSL）对同一份真实字节分别计算、交叉核对一致；两者与
+# branchaudit 互不共用代码，因此能发现“同一计算过程共有的错误”。
+# 这里不读取、不信任 branchaudit 自身结果来生成期望值。
+BITLEN32_BOUNDARY = 1 << 29  # 2^29 字节 = 2^32 比特
+BIG_LENGTHS = (
+    BITLEN32_BOUNDARY - 1,
+    BITLEN32_BOUNDARY,
+    BITLEN32_BOUNDARY + 1,
+)
+# 长度 -> 全 'a' 消息的标准摘要（sha256sum × hashlib 交叉确认）。
+BIG_A_DIGESTS = {
+    BITLEN32_BOUNDARY - 1:
+        "1f97811a3a059e582b3753e94d8852bd89740248c5f35911f8e70afdd57f9842",
+    BITLEN32_BOUNDARY:
+        "b9045a713caed5dff3d3b783e98d1ce5778d8bc331ee4119d707072312af06a7",
+    BITLEN32_BOUNDARY + 1:
+        "bf6084769b780af4396e058ef0eaf9ca59366db146ca86ebfcaf58cbf7a35669",
+}
+# 越过边界：2^29 个 'a' 后追加一个 'b'（总长 2^29+1）的标准摘要。
+BIG_TAIL_B_DIGEST = (
+    "91d4098afec4bb6731e4dba873b3c9a9c581cd4800086ac2fbb4175c21992375"
+)
+BIG_WRITE_CHUNK = 4 << 20  # 4 MiB：准备过程内存有界，与消息总长无关
+
+
+def streaming_digest(fill_byte: int, n: int, tail: bytes = b"") -> str:
+    """独立参考：仅用小块缓冲流式更新 hashlib，不装入整份消息。
+
+    消息为 n 个 fill_byte，之后追加 tail；长度只来自实际更新的全部字节。
+    """
+    h = hashlib.sha256()
+    mv = memoryview(bytes([fill_byte]) * BIG_WRITE_CHUNK)
+    full, rem = divmod(n, BIG_WRITE_CHUNK)
+    for _ in range(full):
+        h.update(mv)
+    if rem:
+        h.update(mv[:rem])
+    h.update(tail)
+    return h.hexdigest()
+
+
+def write_fill_file(path: Path, n: int, fill_byte: int, tail: bytes = b""):
+    """分块写 n 个 fill_byte 加 tail，峰值内存固定，不一次性构造整份内容。"""
+    block = bytes([fill_byte]) * BIG_WRITE_CHUNK
+    with open(path, "wb") as f:
+        full, rem = divmod(n, BIG_WRITE_CHUNK)
+        for _ in range(full):
+            f.write(block)
+        if rem:
+            f.write(block[:rem])
+        if tail:
+            f.write(tail)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def fs_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
 
 
 def run_cli(exe: str, *args: str, cwd: str | None = None, env=None):
@@ -235,6 +304,98 @@ def main() -> int:
         pp = tmp / "pattern200000.bin"
         write_fixture(pp, big_pattern)
         expect_file_success(exe, pp, big_pattern, "large binary pattern")
+
+        # ==================================================================
+        # 越过 2^32 比特长度编码边界（512 MiB）的真实文件端到端回归
+        #
+        # 三个长度 2^29-1 / 2^29 / 2^29+1 字节分别对应“边界之前、恰好
+        # 达到 2^32 比特、越过边界”。逐一流式写成真实文件（磁盘上同时
+        # 只保留一个，约 512 MiB；Python 侧峰值内存为小块缓冲，与消息
+        # 总长无关），再走现有 `branchaudit hash` 命令完成计算。
+        #
+        # 期望值独立于 branchaudit，且有双重交叉：
+        #   1) 硬编码常量由 coreutils sha256sum 与 hashlib 交叉确认；
+        #   2) 运行时再用 hashlib（OpenSSL）流式重算，并先断言它与硬编码
+        #      常量一致，才拿来校验命令行。这样即使常量与脚本参考恰好
+        #      同源出错，也会在此失败，而不会被算作通过。
+        # ==================================================================
+        big_dir = tmp / "big"
+        big_dir.mkdir(parents=True, exist_ok=True)
+        # 只保留一份文件，但留出 64 MiB 余量应对文件系统计费/临时开销。
+        big_space_need = (BITLEN32_BOUNDARY + 1) + 64 * 1024 * 1024
+        if fs_free_bytes(big_dir) < big_space_need:
+            skip_group(
+                f"hash: 2^32 比特长度边界大文件组（临时目录可用空间不足 "
+                f"{big_space_need} 字节，未执行、未验证）")
+        else:
+            for n in BIG_LENGTHS:
+                p = big_dir / f"a{n}.bin"
+                write_fill_file(p, n, ord("a"))
+                check(p.stat().st_size == n,
+                      f"long file n={n}: fixture holds exactly {n} real bytes "
+                      f"(got {p.stat().st_size})")
+
+                # 先取得并核对独立预期：流式 hashlib 必须等于 sha256sum
+                # 交叉确认过的硬编码常量；不一致则下面的命令行检查没有
+                # 独立依据，直接记失败而不是当作通过。
+                ref_hex = streaming_digest(ord("a"), n)
+                check(ref_hex == BIG_A_DIGESTS[n],
+                      f"long file n={n}: independent references agree "
+                      f"(hashlib streaming vs sha256sum-derived constant)")
+
+                proc = run_cli(exe, str(p))
+                expected_stdout = (BIG_A_DIGESTS[n] + "\n").encode("ascii")
+                check(proc.returncode == 0,
+                      f"long file n={n} via `hash` command: exit code 0 "
+                      f"(got {proc.returncode})")
+                check(proc.stdout == expected_stdout,
+                      f"long file n={n} via `hash` command: digest matches "
+                      f"independent standard (got {proc.stdout!r})")
+                check(re.fullmatch(rb"[0-9a-f]{64}\n", proc.stdout) is not None,
+                      f"long file n={n}: stdout is exactly one line of 64 "
+                      f"lowercase hex chars + newline (got {proc.stdout!r})")
+                check(proc.stderr == b"",
+                      f"long file n={n} via `hash` command: stderr empty "
+                      f"(got {proc.stderr!r})")
+                try:
+                    p.unlink()  # 磁盘占用有界：同时只保留一份大文件
+                except OSError:
+                    pass
+
+            # 越过边界消息的最后一段属于输入：2^29 个 'a' 后追加一个
+            # 'b'（总长 2^29+1），不能只返回前 2^29 字节（恰 2^32 比特）
+            # 的摘要。同样先交叉确认独立预期，再校验 hash 命令契约。
+            n_tail = BITLEN32_BOUNDARY + 1
+            p_tail = big_dir / "a_tail_b.bin"
+            write_fill_file(p_tail, n_tail - 1, ord("a"), tail=b"b")
+            check(p_tail.stat().st_size == n_tail,
+                  f"long file n={n_tail} tail variant: exact real size "
+                  f"(got {p_tail.stat().st_size})")
+            ref_tail = streaming_digest(ord("a"), n_tail - 1, tail=b"b")
+            check(ref_tail == BIG_TAIL_B_DIGEST,
+                  f"long file n={n_tail} tail variant: independent references "
+                  f"agree (hashlib streaming vs sha256sum-derived constant)")
+            proc_tail = run_cli(exe, str(p_tail))
+            check(proc_tail.returncode == 0,
+                  f"long file n={n_tail} tail variant via `hash`: exit 0 "
+                  f"(got {proc_tail.returncode})")
+            check(proc_tail.stdout ==
+                      (BIG_TAIL_B_DIGEST + "\n").encode("ascii"),
+                  f"long file n={n_tail} tail variant: digest matches "
+                  f"independent standard; last segment is hashed "
+                  f"(got {proc_tail.stdout!r})")
+            check(re.fullmatch(rb"[0-9a-f]{64}\n", proc_tail.stdout) is not None,
+                  f"long file n={n_tail} tail variant: stdout is 64 lowercase "
+                  f"hex + newline (got {proc_tail.stdout!r})")
+            check(proc_tail.stderr == b"",
+                  f"long file n={n_tail} tail variant: stderr empty "
+                  f"(got {proc_tail.stderr!r})")
+            check(BIG_TAIL_B_DIGEST != BIG_A_DIGESTS[n_tail],
+                  f"long file n={n_tail}: tail-byte variant differs from "
+                  f"all-'a' message")
+            check(BIG_TAIL_B_DIGEST != BIG_A_DIGESTS[BITLEN32_BOUNDARY],
+                  f"long file n={n_tail}: digest is not that of the first "
+                  f"2^29 bytes only")
 
         # ---- 相同字节、不同文件名/目录：摘要一致且不含路径文字 ----------
         shared = b"a\x00b\xff c\nd"

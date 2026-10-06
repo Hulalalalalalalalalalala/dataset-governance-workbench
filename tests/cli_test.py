@@ -755,6 +755,164 @@ def main() -> int:
         else:
             skip_group("root: 叶子部分读取后出错（此平台无故障注入支持，未验证）")
 
+        # ---- 选项判定：第一个单独 -- 之前以连字符开头的参数都是选项 ----
+        # hash/root 不支持任何选项：命中即用法错误（退出 2、stdout 空、
+        # stderr 指出该参数并给出对应命令用法），即使该文字对应可读文件、
+        # 即使批次中另有正常文件也不产出摘要。
+        def expect_usage_error(proc, command: str, arg: str, label: str):
+            check(proc.returncode == 2,
+                  f"{label}: exit code 2 (got {proc.returncode})")
+            check(proc.stdout == b"", f"{label}: stdout must be empty")
+            check(arg.encode() in proc.stderr,
+                  f"{label}: stderr names the offending argument {arg!r} "
+                  f"(got {proc.stderr!r})")
+            check(command.encode() in proc.stderr and b"Usage" in proc.stderr,
+                  f"{label}: stderr gives {command} usage "
+                  f"(got {proc.stderr!r})")
+
+        hyphen_dir = tmp / "hyphen names 目录"
+        hyphen_dir.mkdir(parents=True)
+        dash_notes = hyphen_dir / "-notes.bin"
+        dash_single = hyphen_dir / "-"
+        dash_version = hyphen_dir / "--version"
+        dash_dash = hyphen_dir / "--"
+        dash_unknown = hyphen_dir / "--unknown"
+        write_fixture(dash_notes, pattern(50))
+        write_fixture(dash_single, pattern(30))
+        write_fixture(dash_version, pattern(40))
+        write_fixture(dash_dash, pattern(60))
+        write_fixture(dash_unknown, pattern(70))  # 同名文件确实存在且可读
+
+        # 结束标记前：一律按选项拒绝，同名可读文件也不例外。
+        for arg in ("--unknown", "-x", "-", "--version"):
+            expect_usage_error(run_cli(exe, arg), "hash", arg,
+                               f"hash option {arg}")
+        # 结束标记前：一律按选项拒绝。即使当前目录确有同名可读文件，仅凭
+        # 参数原文 "--unknown" 以连字符开头也必须报用法错误（不读文件）。
+        def hash_cwd(*a):
+            return subprocess.run([exe, "hash", *a], cwd=str(hyphen_dir),
+                                  capture_output=True)
+
+        def root_cwd(*a):
+            return subprocess.run([exe, "root", *a], cwd=str(hyphen_dir),
+                                  capture_output=True)
+
+        expect_usage_error(hash_cwd("--unknown"), "hash", "--unknown",
+                           "hash --unknown when a readable same-named file exists")
+        # 批次中另有正常文件也不能输出摘要。
+        expect_usage_error(
+            subprocess.run([exe, "hash", "--unknown", str(r_a)],
+                           cwd=str(hyphen_dir), capture_output=True),
+            "hash", "--unknown", "hash bad option alongside valid file")
+        for arg in ("--unknown", "-x", "-", "--version"):
+            expect_usage_error(root_cwd(arg), "root", arg,
+                               f"root option {arg}")
+        expect_usage_error(
+            subprocess.run([exe, "root", str(r_a), str(r_abc), "--unknown"],
+                           cwd=str(hyphen_dir), capture_output=True),
+            "root", "--unknown",
+            "root --unknown names a readable file among good files")
+        expect_usage_error(
+            subprocess.run([exe, "root", str(r_a), "--unknown", str(r_abc)],
+                           cwd=str(hyphen_dir), capture_output=True),
+            "root", "--unknown", "root bad option between valid files")
+
+        # hash 扣除结束标记后仍须恰好一个文件。
+        proc = subprocess.run([exe, "hash", "--"], capture_output=True)
+        check(proc.returncode == 2 and proc.stdout == b"" and
+                  b"Usage" in proc.stderr,
+              "hash -- with no file is the missing-file usage error (exit 2)")
+        proc = subprocess.run([exe, "hash", "--", str(r_a), str(r_abc)],
+                              capture_output=True)
+        check(proc.returncode == 2 and proc.stdout == b"",
+              "hash -- with two files remains usage error")
+        proc = subprocess.run([exe, "hash", "--", "--", "extra"],
+                              cwd=str(hyphen_dir), capture_output=True)
+        check(proc.returncode == 2 and proc.stdout == b"",
+              "hash -- -- extra: two files after marker is usage error")
+
+        # 结束标记后：所有参数都是字面路径，不作为选项/标记/标准输入解释。
+        def hash_in_dir(name: str, data: bytes, label: str):
+            proc = subprocess.run([exe, "hash", "--", name],
+                                  cwd=str(hyphen_dir), capture_output=True)
+            check(proc.returncode == 0 and
+                      proc.stdout == (reference(data) + "\n").encode() and
+                      proc.stderr == b"",
+                  f"{label}: literal filename after -- hashes raw bytes")
+
+        hash_in_dir("-notes.bin", pattern(50), "hash -- -notes.bin")
+        hash_in_dir("-", pattern(30), "hash -- - (file, not stdin)")
+        hash_in_dir("--version", pattern(40), "hash -- --version (file)")
+        hash_in_dir("--", pattern(60), "hash -- -- (file, not a second marker)")
+
+        # 直接的 ./-notes.bin 形式无需结束标记。
+        proc = subprocess.run([exe, "hash", "./-notes.bin"],
+                              cwd=str(hyphen_dir), capture_output=True)
+        check(proc.returncode == 0 and
+                  proc.stdout == (reference(pattern(50)) + "\n").encode(),
+              "hash ./-notes.bin works without -- (arg does not start with -)")
+
+        # 中间位置的连字符不触发选项判定；不存在时仍是文件错误（退出 1）。
+        proc = subprocess.run([exe, "hash", "notes-2026-missing.bin"],
+                              cwd=str(hyphen_dir), capture_output=True)
+        check(proc.returncode == 1 and proc.stdout == b"",
+              "mid-argument hyphen is a path: missing file exits 1 not 2")
+
+        # root：仅结束标记等价于空批次根；标记不改变相同有序文件的根。
+        empty_root = (hashlib.sha256(b"").hexdigest() + "\n").encode()
+        proc = subprocess.run([exe, "root", "--"], capture_output=True)
+        check(proc.returncode == 0 and proc.stdout == empty_root and
+                  proc.stderr == b"",
+              "root -- is the original empty-batch root")
+        marker_cases = [
+            [str(r_a)],
+            [str(r_a), str(r_abc)],
+            [str(r_a), str(r_abc)],
+            [str(r_a), str(r_abc)],
+        ]
+        marker_positions = [
+            ["--", str(r_a)],
+            ["--", str(r_a), str(r_abc)],
+            [str(r_a), "--", str(r_abc)],
+            [str(r_a), str(r_abc), "--"],
+        ]
+        for plain, with_marker in zip(marker_cases, marker_positions):
+            plain_out = run_root(exe, *plain)
+            proc = run_root(exe, *with_marker)
+            check(proc.returncode == 0 and
+                      proc.stdout == plain_out.stdout and
+                      proc.stderr == b"" and plain_out.returncode == 0,
+                  f"root marker does not change ordered-file root: {with_marker}")
+
+        # 标记后的 - 与再次出现的 -- 是真实文件，按实际顺序占据位置。
+        def root_in_dir(names, contents, label):
+            proc = subprocess.run([exe, "root", "--", *names],
+                                  cwd=str(hyphen_dir), capture_output=True)
+            expected = (merkle_root(contents).hex() + "\n").encode()
+            check(proc.returncode == 0 and proc.stdout == expected and
+                      proc.stderr == b"",
+                  f"{label}: post-marker literal names occupy real positions")
+
+        root_in_dir(["-"], [pattern(30)], "root -- -")
+        root_in_dir(["--version"], [pattern(40)], "root -- --version")
+        root_in_dir(["--"], [pattern(60)], "root -- -- (file at one position)")
+        root_in_dir(["-", "--"], [pattern(30), pattern(60)],
+                    "root -- - -- (two distinct file positions)")
+        root_in_dir(["--", "-", "--"],
+                    [pattern(60), pattern(30), pattern(60)],
+                    "root -- -- - -- (second -- is a file, not marker)")
+
+        # 标记后的合法参数若路径出错，仍是文件错误（退出 1）而非用法错误。
+        proc = subprocess.run([exe, "root", "--", "missing-after-dash.bin"],
+                              capture_output=True)
+        check(proc.returncode == 1 and proc.stdout == b"" and
+                  b"missing-after-dash.bin" in proc.stderr,
+              "missing file after -- is exit 1 with named path")
+        proc = subprocess.run([exe, "hash", "--", str(directory)],
+                              capture_output=True)
+        check(proc.returncode == 1 and proc.stdout == b"",
+              "directory after -- is still a file error (exit 1)")
+
         # ---- 保留 hash / --version 及用法错误行为 -----------------------
         check(subprocess.run([exe, "--version"], capture_output=True).stdout ==
                   b"branchaudit 0.1.0\n",

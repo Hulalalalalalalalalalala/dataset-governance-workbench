@@ -29,6 +29,7 @@ namespace {
 
 int g_failures = 0;
 int g_checks = 0;
+int g_skipped = 0;
 
 void check(bool condition, std::string_view what) {
     ++g_checks;
@@ -552,11 +553,24 @@ int main(int argc, char** argv) {
     test_incremental_splits();
     test_file_hashing();
     test_file_failures();
-    test_file_io_failures();
+    if (fault_test::kFaultInjectionAvailable) {
+        test_file_io_failures();
+    } else {
+        // 平台无 LD_PRELOAD//proc 故障注入支持（如 macOS）：明确报告
+        // 跳过，不计入已通过检查。
+        ++g_skipped;
+        std::cout << "SKIP: existing-but-unopenable and mid-read-error "
+                     "checks (fault injection not supported on this platform)\n";
+    }
     test_hex_format();
 
     if (g_failures == 0) {
-        std::cout << "all " << g_checks << " sha256 regression checks passed\n";
+        std::cout << "all " << g_checks << " sha256 regression checks passed";
+        if (g_skipped > 0) {
+            std::cout << " (" << g_skipped << " platform-specific check group"
+                         " skipped, not verified)";
+        }
+        std::cout << '\n';
         return 0;
     }
     std::cerr << g_failures << " of " << g_checks << " checks failed\n";

@@ -2,23 +2,45 @@
 //
 // C++ 回归套件在本进程内直接调用 branchaudit_core 的文件计算接口，因此
 // “打不开 / 中途读出错”需要故障注入共享库（tests/fault_inject.c）随本
-// 进程一起预载：
+// 进程一起预载。该机制依赖 Linux 专有的 LD_PRELOAD 符号介入与
+// /proc/self 进程文件信息：
 //
-//   * ctest 已通过 ENVIRONMENT 设置 LD_PRELOAD，正常运行时无需任何动作；
-//   * 直接手工执行测试二进制时，ensure_fault_preloaded() 会在发现注入库
-//     未加载时，带上 LD_PRELOAD 重新执行自身一次；
+//   * 仅在 Linux 且 CMake 定义 BRANCHAUDIT_FAULT_INJECTION=1 时可用，
+//     此时 kFaultInjectionAvailable 为 true；
+//   * 其他平台（如 macOS）上 kFaultInjectionAvailable 为 false，
+//     ensure_fault_preloaded() 为空操作，调用方应跳过依赖注入的用例
+//     并明确报告跳过，而不是把它们当作已通过；
+//   * 可用时：ctest 已通过 ENVIRONMENT 设置 LD_PRELOAD，正常运行时无需
+//     任何动作；直接手工执行测试二进制时，ensure_fault_preloaded() 会在
+//     发现注入库未加载时，带上 LD_PRELOAD 重新执行自身一次；
 //   * 具体失败用例用 FaultTrigger 在作用域内设置精确路径触发变量，退出
 //     作用域立即清除；其他路径与其余用例不受影响。
 
 #pragma once
 
 #include <cstdlib>
+#include <string>
+
+#if defined(__linux__) && defined(BRANCHAUDIT_FAULT_INJECTION) && \
+    BRANCHAUDIT_FAULT_INJECTION
+#define BRANCHAUDIT_FAULT_TEST_AVAILABLE 1
+#else
+#define BRANCHAUDIT_FAULT_TEST_AVAILABLE 0
+#endif
+
+#if BRANCHAUDIT_FAULT_TEST_AVAILABLE
 #include <cstring>
 #include <fstream>
-#include <string>
 #include <unistd.h>
+#endif
 
 namespace fault_test {
+
+// 当前平台/构建是否支持故障注入检查。
+inline constexpr bool kFaultInjectionAvailable =
+    BRANCHAUDIT_FAULT_TEST_AVAILABLE != 0;
+
+#if BRANCHAUDIT_FAULT_TEST_AVAILABLE
 
 // 由 CMake 以编译定义注入故障库绝对路径；直接运行且无定义时退回环境变量。
 inline const char *fault_lib_path() {
@@ -72,6 +94,14 @@ inline void ensure_fault_preloaded(int argc, char **argv) {
     execv(exe.c_str(), argv);
     // execv 失败则继续原进程；失败用例会如实报告未触发。
 }
+
+#else  // !BRANCHAUDIT_FAULT_TEST_AVAILABLE
+
+// 无故障注入支持的平台：空操作，调用方据 kFaultInjectionAvailable 跳过
+// 依赖注入的用例。
+inline void ensure_fault_preloaded(int, char **) {}
+
+#endif  // BRANCHAUDIT_FAULT_TEST_AVAILABLE
 
 // 作用域内设置故障触发环境变量，退出作用域清除。
 class FaultTrigger {

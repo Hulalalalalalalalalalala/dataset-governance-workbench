@@ -755,6 +755,183 @@ def main() -> int:
         else:
             skip_group("root: 叶子部分读取后出错（此平台无故障注入支持，未验证）")
 
+        # ==================================================================
+        # 选项与文件参数的区分（hash/root 共用同一条规则）：
+        #   * 第一个单独的 "--" 结束选项识别，它本身不算文件；
+        #   * 结束标记之前，以连字符开头的参数都按选项解释，而这两个命令
+        #     不支持任何选项 -> 用法错误（退出 2、stdout 空），即使同名
+        #     文件可读、即使批次里还有正常文件；
+        #   * 标记之后的参数一律按字面当作文件路径：-notes.bin、--version、
+        #     单独的 "-" 与再次出现的 "--" 都定位真实文件——不触发版本查询、
+        #     不作为另一个标记丢弃、"-" 也不表示标准输入。
+        # ==================================================================
+        odir = tmp / "option parsing"
+        odir.mkdir(parents=True)
+        opt_dash = b"dashed file content\n"
+        opt_ver = b"this file is named --version\n"
+        opt_dd = b"this file is named --\n"
+        opt_sd = b"this file is named -\n"
+        opt_mid = b"hyphen in the middle\n"
+        opt_named_like_option = b"a readable file named like an option\n"
+        opt_normal = b"normal batch file\n"
+        write_fixture(odir / "-notes.bin", opt_dash)
+        write_fixture(odir / "--version", opt_ver)
+        write_fixture(odir / "--", opt_dd)
+        write_fixture(odir / "-", opt_sd)
+        write_fixture(odir / "a-b.bin", opt_mid)
+        write_fixture(odir / "--unknown", opt_named_like_option)
+        write_fixture(odir / "normal.bin", opt_normal)
+
+        def expect_usage_error(proc, command, arg_text, label):
+            """用法错误契约：退出 2、stdout 空、stderr 指出参数并给出该命令用法。"""
+            check(proc.returncode == 2,
+                  f"{label}: exit code 2 (got {proc.returncode})")
+            check(proc.stdout == b"",
+                  f"{label}: stdout must be empty (got {proc.stdout!r})")
+            check(proc.stderr != b"", f"{label}: stderr must be nonempty")
+            check(arg_text.encode() in proc.stderr,
+                  f"{label}: stderr names the offending argument {arg_text!r} "
+                  f"(got {proc.stderr!r})")
+            check(b"Usage" in proc.stderr and
+                      (b"branchaudit " + command.encode() + b" ") in proc.stderr,
+                  f"{label}: stderr gives the {command} usage line "
+                  f"(got {proc.stderr!r})")
+
+        # ---- hash：不支持的选项 -----------------------------------------
+        expect_usage_error(run_cli(exe, "--unknown"),
+                           "hash", "--unknown",
+                           "hash --unknown with no such file")
+        # 即使当前目录真有同名可读文件，也必须报用法错误，绝不输出其摘要。
+        proc = run_cli(exe, "--unknown", cwd=str(odir))
+        expect_usage_error(proc, "hash", "--unknown",
+                           "hash --unknown with a readable same-named file")
+        check((reference(opt_named_like_option) + "\n").encode()
+                  not in proc.stdout,
+              "hash --unknown: digest of the readable same-named file never printed")
+        # 子命令后的 --version 是不支持的选项，不触发顶层版本查询。
+        expect_usage_error(run_cli(exe, "--version"),
+                           "hash", "--version",
+                           "hash --version is an unsupported option")
+        # 标记之前的单独 "-" 同样按选项解释（即使名为 "-" 的文件存在）。
+        expect_usage_error(run_cli(exe, "-", cwd=str(odir)),
+                           "hash", "-",
+                           "hash - with a file named '-' is still a usage error")
+        # 批次中混入不支持选项：旁边有正常文件也不能产出摘要。
+        expect_usage_error(
+            run_cli(exe, "normal.bin", "--unknown", cwd=str(odir)),
+            "hash", "--unknown",
+            "hash normal file alongside unsupported option")
+
+        # ---- hash：结束标记之后全部是真实文件路径 -----------------------
+        def expect_hash_in_odir(arg, data, label):
+            proc = run_cli(exe, "--", arg, cwd=str(odir))
+            check(proc.returncode == 0 and proc.stderr == b"" and
+                      proc.stdout == (reference(data) + "\n").encode("ascii"),
+                  f"{label}: post-marker name locates the real file "
+                  f"(got rc={proc.returncode}, stdout={proc.stdout!r}, "
+                  f"stderr={proc.stderr!r})")
+
+        expect_hash_in_odir("-notes.bin", opt_dash, "hash -- -notes.bin")
+        expect_hash_in_odir("--version", opt_ver, "hash -- --version")
+        expect_hash_in_odir("-", opt_sd, "hash -- -")
+        expect_hash_in_odir("--", opt_dd, "hash -- -- (repeated marker is a file)")
+        check(run_cli(exe, "--", "--version", cwd=str(odir)).stdout
+                  != b"branchaudit 0.1.0\n",
+              "hash -- --version must not trigger the version query")
+        # 标记之后不存在的连字符名字是文件错误（退出 1），不是被丢弃的标记。
+        proc = run_cli(exe, "--", "-missing.bin", cwd=str(odir))
+        check(proc.returncode == 1 and proc.stdout == b"" and
+                      b"-missing.bin" in proc.stderr,
+              "hash -- -missing.bin: unknown post-marker name is a file error")
+
+        # ---- hash：./ 前缀与路径中间的连字符 ----------------------------
+        proc = run_cli(exe, "./-notes.bin", cwd=str(odir))
+        check(proc.returncode == 0 and proc.stderr == b"" and
+                      proc.stdout == (reference(opt_dash) + "\n").encode("ascii"),
+              "hash ./-notes.bin needs no end marker")
+        proc = run_cli(exe, "a-b.bin", cwd=str(odir))
+        check(proc.returncode == 0 and
+                      proc.stdout == (reference(opt_mid) + "\n").encode("ascii"),
+              "hash a-b.bin: a hyphen in the middle of the name needs no marker")
+        proc = run_cli(exe, "--", str(chinese))
+        check(proc.returncode == 0 and
+                      proc.stdout == (reference(fill_a(65)) + "\n").encode("ascii"),
+              "hash -- also works with spaced/Chinese paths")
+
+        # ---- hash：扣除结束标记后仍须恰好一个文件 -----------------------
+        proc = run_cli(exe, "--")
+        check(proc.returncode == 2 and proc.stdout == b"" and
+                      b"branchaudit hash" in proc.stderr,
+              "hash -- with no file remains a usage error")
+        proc = run_cli(exe, "--", "normal.bin", "a-b.bin", cwd=str(odir))
+        check(proc.returncode == 2 and proc.stdout == b"",
+              "hash -- with two files is a usage error even if both exist")
+
+        # ---- root：不支持的选项 -----------------------------------------
+        expect_usage_error(run_root(exe, "--unknown"),
+                           "root", "--unknown",
+                           "root --unknown with no such file")
+        proc = run_root(exe, "--unknown", "normal.bin", cwd=str(odir))
+        expect_usage_error(proc, "root", "--unknown",
+                           "root --unknown with a readable same-named file")
+        check(run_root(exe, "normal.bin", cwd=str(odir)).stdout
+                  not in proc.stdout,
+              "root unsupported option: no root of the remaining files")
+        expect_usage_error(
+            run_root(exe, "normal.bin", "--unknown", cwd=str(odir)),
+            "root", "--unknown",
+            "root normal file alongside unsupported option")
+        expect_usage_error(run_root(exe, "--version"),
+                           "root", "--version",
+                           "root --version is an unsupported option")
+
+        # ---- root：仅给结束标记等于空批次根 -----------------------------
+        proc = run_root(exe, "--")
+        check(proc.returncode == 0 and proc.stderr == b"" and
+                      proc.stdout == run_root(exe).stdout,
+              "root -- returns the same root as the empty batch")
+
+        # ---- root：标记之后的连字符名字全部按文件计入有序批次 ------------
+        proc = run_root(exe, "--", "-notes.bin", "--version", "-", "--",
+                        cwd=str(odir))
+        expected_root = (
+            merkle_root([opt_dash, opt_ver, opt_sd, opt_dd]).hex()
+            + "\n").encode("ascii")
+        check(proc.returncode == 0 and proc.stderr == b"" and
+                      proc.stdout == expected_root,
+              f"root -- -notes.bin --version - --: all four are real files in "
+              f"order (got rc={proc.returncode}, stdout={proc.stdout!r}, "
+              f"stderr={proc.stderr!r})")
+        check(proc.stdout != b"branchaudit 0.1.0\n",
+              "root -- --version must not trigger the version query")
+        # 标记之后缺失的连字符名字是文件错误；"-" 是文件名而不是标准输入；
+        # 第二个 "--" 也是文件名，缺失时整次失败。
+        proc = run_root(exe, "--", "-notes.bin", "-missing.bin", cwd=str(odir))
+        check(proc.returncode == 1 and proc.stdout == b"" and
+                      b"-missing.bin" in proc.stderr,
+              "root post-marker: a missing hyphen name is a file error (exit 1)")
+        proc = run_root(exe, "--", "-", cwd=str(tmp))
+        check(proc.returncode == 1 and proc.stdout == b"",
+              "root -- -: '-' names a real file, never standard input")
+        proc = run_root(exe, "--", "--", cwd=str(tmp))
+        check(proc.returncode == 1 and proc.stdout == b"",
+              "root -- --: the second '--' is a file path, not another marker")
+
+        # ---- root：插入结束标记不改变相同有序文件内容的根 ---------------
+        plain_two = run_root(exe, str(r_a), str(r_abc)).stdout
+        for label, args in (
+            ("marker first", ["--", str(r_a), str(r_abc)]),
+            ("marker in the middle", [str(r_a), "--", str(r_abc)]),
+            ("marker last", [str(r_a), str(r_abc), "--"]),
+        ):
+            proc = run_root(exe, *args)
+            check(proc.returncode == 0 and proc.stderr == b"" and
+                          proc.stdout == plain_two,
+                  f"root end-marker placement changes nothing: {label}")
+        check(run_root(exe, "--", str(r_a), str(r_a)).stdout
+                  == run_root(exe, str(r_a), str(r_a)).stdout,
+              "root end marker keeps repeated path positions")
+
         # ---- 保留 hash / --version 及用法错误行为 -----------------------
         check(subprocess.run([exe, "--version"], capture_output=True).stdout ==
                   b"branchaudit 0.1.0\n",

@@ -55,6 +55,23 @@ std::string leaf_level(const std::vector<std::filesystem::path>& paths,
     return {};
 }
 
+// 按公开字节规则由当前层生成上一层：相邻节点先左后右两两经
+// merkle_parent 配对；该层节点数为奇数时，最后一个没有伙伴的节点其
+// 摘要原样进入上一层（不复制、不补零）。根计算与成员证明逐层向上时
+// 共用这唯一一份配对/提升规则，批次合并逻辑只在此处维护一次。
+std::vector<Digest> parent_level(const std::vector<Digest>& level) {
+    std::vector<Digest> next;
+    const bool odd = (level.size() % 2) != 0;
+    next.reserve(level.size() / 2 + (odd ? 1 : 0));
+    for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
+        next.push_back(merkle_parent(level[i], level[i + 1]));
+    }
+    if (odd) {
+        next.push_back(level.back());
+    }
+    return next;
+}
+
 }  // namespace
 
 FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths) {
@@ -74,17 +91,9 @@ FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths
     }
 
     // 逐层相邻配对：先左后右；奇数个时末节点原样提升（不复制、不补零）。
+    // 配对/提升规则与证明路径共用 parent_level 这一份实现。
     while (level.size() > 1) {
-        std::vector<Digest> next;
-        const bool odd = (level.size() % 2) != 0;
-        next.reserve(level.size() / 2 + (odd ? 1 : 0));
-        for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
-            next.push_back(merkle_parent(level[i], level[i + 1]));
-        }
-        if (odd) {
-            next.push_back(level.back());
-        }
-        level = std::move(next);
+        level = parent_level(level);
     }
 
     result.digest = level.front();
@@ -131,17 +140,10 @@ MerkleProofResult merkle_proof_file(
                 {MerkleSibling::Side::left, level[idx - 1]});
         }
 
-        std::vector<Digest> next;
-        const bool odd = (level.size() % 2) != 0;
-        next.reserve(level.size() / 2 + (odd ? 1 : 0));
-        for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
-            next.push_back(merkle_parent(level[i], level[i + 1]));
-        }
-        if (odd) {
-            next.push_back(level.back());
-        }
+        // 本层的下一层与根计算共用同一份配对/提升规则；被选位置
+        // 随其左配对（idx /= 2）进入上一层。
         idx /= 2;
-        level = std::move(next);
+        level = parent_level(level);
     }
 
     proof.root = level.front();

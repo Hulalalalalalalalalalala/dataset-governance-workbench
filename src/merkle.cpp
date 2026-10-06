@@ -55,6 +55,24 @@ std::string leaf_level(const std::vector<std::filesystem::path>& paths,
     return {};
 }
 
+// 批次合并规则（root 与 prove 共用的唯一一份实现）：对当前层做一次相邻
+// 配对——相邻节点按先左后右两两用 merkle_parent 合并；若该层节点数为
+// 奇数，最后一个没有伙伴的节点摘要原样进入上一层（不复制、不补零）。
+// 输入层不被修改，返回合并后的上一层；输入只有一个节点时返回的层同样
+// 只有该节点本身。
+std::vector<Digest> combine_level(const std::vector<Digest>& level) {
+    std::vector<Digest> next;
+    const bool odd = (level.size() % 2) != 0;
+    next.reserve(level.size() / 2 + (odd ? 1 : 0));
+    for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
+        next.push_back(merkle_parent(level[i], level[i + 1]));
+    }
+    if (odd) {
+        next.push_back(level.back());
+    }
+    return next;
+}
+
 }  // namespace
 
 FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths) {
@@ -73,18 +91,10 @@ FileHashResult merkle_root_files(const std::vector<std::filesystem::path>& paths
         return result;
     }
 
-    // 逐层相邻配对：先左后右；奇数个时末节点原样提升（不复制、不补零）。
+    // 逐层相邻配对直到只剩一个根；配对与奇数末节点原样提升的规则由
+    // combine_level 唯一实现，prove 沿同一函数走，两条路径不会出现规则漂移。
     while (level.size() > 1) {
-        std::vector<Digest> next;
-        const bool odd = (level.size() % 2) != 0;
-        next.reserve(level.size() / 2 + (odd ? 1 : 0));
-        for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
-            next.push_back(merkle_parent(level[i], level[i + 1]));
-        }
-        if (odd) {
-            next.push_back(level.back());
-        }
-        level = std::move(next);
+        level = combine_level(level);
     }
 
     result.digest = level.front();
@@ -117,7 +127,8 @@ MerkleProofResult merkle_proof_file(
     proof.leaf = level[static_cast<std::size_t>(leaf_index)];
 
     // 沿被选位置逐层向上：每层只记录实际存在的兄弟；奇数末节点原样
-    // 提升的层没有兄弟，不添加记录（不复制末节点、不补零）。
+    // 提升的层没有兄弟，不添加记录（不复制末节点、不补零）。该层如何
+    // 合并与 root 完全相同——两者都调用同一份 combine_level。
     std::size_t idx = static_cast<std::size_t>(leaf_index);
     while (level.size() > 1) {
         if (idx % 2 == 0) {
@@ -125,23 +136,14 @@ MerkleProofResult merkle_proof_file(
                 proof.siblings.push_back(
                     {MerkleSibling::Side::right, level[idx + 1]});
             }
-            // idx 是奇数层的末节点：原样提升，无兄弟记录。
+            // idx 是奇数层的末节点：经 combine_level 原样提升，无兄弟记录。
         } else {
             proof.siblings.push_back(
                 {MerkleSibling::Side::left, level[idx - 1]});
         }
 
-        std::vector<Digest> next;
-        const bool odd = (level.size() % 2) != 0;
-        next.reserve(level.size() / 2 + (odd ? 1 : 0));
-        for (std::size_t i = 0; i + 1 < level.size(); i += 2) {
-            next.push_back(merkle_parent(level[i], level[i + 1]));
-        }
-        if (odd) {
-            next.push_back(level.back());
-        }
         idx /= 2;
-        level = std::move(next);
+        level = combine_level(level);
     }
 
     proof.root = level.front();

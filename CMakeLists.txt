@@ -56,7 +56,10 @@ if(BRANCHAUDIT_BUILD_TESTS)
     target_compile_definitions(sha256_test PRIVATE
         BRANCHAUDIT_FAULT_INJECTION=$<BOOL:${BRANCHAUDIT_FAULT_INJECTION}>)
     add_test(NAME sha256_unit COMMAND sha256_test)
-    set_tests_properties(sha256_unit PROPERTIES TIMEOUT 30)
+    # 该套件含越过 2^32 位（512 MiB）长度边界的真实计算：三种长度各经增量
+    # 与文件两个入口、另加一次边界附近重分段与末字节变体，合计约处理 4 GiB，
+    # 时限不能沿用只针对短输入的 30s。
+    set_tests_properties(sha256_unit PROPERTIES TIMEOUT 300)
 
     add_executable(merkle_test tests/merkle_test.cpp)
     target_link_libraries(merkle_test PRIVATE branchaudit_core)
@@ -96,7 +99,10 @@ if(BRANCHAUDIT_BUILD_TESTS)
                         $<TARGET_FILE:branchaudit>
             )
         endif()
-        set_tests_properties(cli_e2e PROPERTIES TIMEOUT 30)
+        # 端到端套件要真实生成并经命令行计算四份越过 2^32 位边界的
+        # 512 MiB 级文件，默认 -O0 构建下仅被测程序就约处理 2 GiB，时限
+        # 不能沿用只针对短输入的 30s，否则正常的大文件计算会被提前终止。
+        set_tests_properties(cli_e2e PROPERTIES TIMEOUT 600)
     else()
         message(STATUS
             "branchaudit: 未找到 Python3，跳过 cli_e2e 端到端测试；"

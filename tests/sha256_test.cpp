@@ -8,6 +8,7 @@
 //
 // 运行成功返回 0；任一断言失败返回非零。
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +80,75 @@ std::vector<unsigned char> pattern(std::size_t n) {
 void expect_digest(std::string_view label, const std::vector<unsigned char>& data,
                    std::string_view expected) {
     check(hash_whole(data) == expected, label);
+}
+
+// ---- 超过 2^32 比特长度的大消息：固定缓冲、内存有界地流式喂入 ----------
+//
+// SHA-256 末尾以 8 字节大端写入“位长度”。三个长度分别压在低 32 位边界上：
+//   536870911 = 2^29 - 1 字节 -> 位长度 0x00000000_FFFFFFF8（边界之前）
+//   536870912 = 2^29     字节 -> 位长度 0x00000001_00000000（恰好 2^32 位）
+//   536870913 = 2^29 + 1 字节 -> 位长度 0x00000001_00000008（越过边界）
+// 长度在低 32 位回绕会把后两者分别错编成 0 和 8；把字节数直接当位长则
+// 整体错位；漏掉高 32 位则后两者与短消息摘要无法区分。
+constexpr std::size_t kLongChunk = 1 << 20;  // 1 MiB 固定缓冲，不随长度增长
+
+// 按给定分段计划把 n 个 'a' 逐段喂入新建的 Sha256；各段长度之和必须恰为 n。
+// 所有段复用同一个 1 MiB 缓冲，测试自身内存占用与消息总长度无关。
+std::string hash_long_a(std::size_t n, const std::vector<std::size_t>& segments) {
+    branchaudit::Sha256 sha;
+    std::vector<unsigned char> window(kLongChunk,
+                                      static_cast<unsigned char>('a'));
+    std::size_t covered = 0;
+    for (std::size_t len : segments) {
+        check(len <= window.size(),
+              "long-message segment fits inside the fixed buffer");
+        check(covered <= n && len <= n - covered,
+              "long-message schedule does not run past the message");
+        sha.update(window.data(), len);
+        covered += len;
+    }
+    check(covered == n,
+          "long-message schedule covers every processed byte exactly once");
+    return hex_of(sha.final());
+}
+
+// 均匀 1 MiB 分段（最后一段为余数）。
+std::vector<std::size_t> uniform_schedule(std::size_t n) {
+    std::vector<std::size_t> segments;
+    for (std::size_t off = 0; off < n;) {
+        const std::size_t len = (std::min)(kLongChunk, n - off);
+        segments.push_back(len);
+        off += len;
+    }
+    return segments;
+}
+
+// cut 两侧各约 2 MiB 区域内改用彼此不同、且都不与 64 字节分组对齐的小段
+//（1009 / 65537 / 7 / 63 / 1048573 均非 64 的倍数），区域之外仍为 1 MiB。
+// 用于证明越过 2^32 位边界的同一消息，在边界附近换一种分段仍得同一摘要。
+std::vector<std::size_t> boundary_schedule(std::size_t n, std::size_t cut) {
+    constexpr std::size_t kSide = 2 * kLongChunk;
+    const std::size_t lo = cut > kSide ? cut - kSide : 0;
+    const std::size_t hi = (std::min)(n, cut + kSide);
+    static constexpr std::size_t kFine[] = {1009, 65537, 7, 63, 1048573};
+    std::vector<std::size_t> segments;
+    std::size_t off = 0;
+    while (off < lo) {
+        segments.push_back((std::min)(kLongChunk, lo - off));
+        off += segments.back();
+    }
+    std::size_t i = 0;
+    while (off < hi) {
+        segments.push_back(
+            (std::min)({kFine[i % 5], hi - off, kLongChunk}));
+        off += segments.back();
+        ++i;
+    }
+    while (off < n) {
+        segments.push_back((std::min)(kLongChunk, n - off));
+        off += segments.back();
+    }
+    return segments;
 }
 
 // ---- 标准已知答案向量 -----------------------------------------------------
@@ -377,6 +447,155 @@ void test_file_hashing() {
           "relative path: no printing");
 }
 
+// ---- 超过 2^32 比特（512 MiB）长度编码的回归 -----------------------------
+
+// 固定 1 MiB 缓冲流式写出 n 字节：前 n-1 字节为 fill，末字节为 last
+//（last == fill 时即整文件同字节）。内存占用与 n 无关，供 512 MiB 级
+// 真实文件使用；绝不把整份消息装入内存。
+void write_streaming_fill(const fs::path& p, std::size_t n,
+                          unsigned char fill, unsigned char last) {
+    fs::create_directories(p.parent_path());
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    constexpr std::size_t kWriteChunk = 1 << 20;
+    std::vector<unsigned char> block(kWriteChunk, fill);
+    std::size_t off = 0;
+    while (off < n) {
+        const std::size_t len = (std::min)(kWriteChunk, n - off);
+        const bool final_piece = (off + len == n);
+        if (final_piece) block[len - 1] = last;  // 最后一段确属输入
+        out.write(reinterpret_cast<const char*>(block.data()),
+                  static_cast<std::streamsize>(len));
+        if (final_piece) block[len - 1] = fill;  // 缓冲复用，复位
+        off += len;
+    }
+    check(static_cast<bool>(out), std::string("write long fixture ") + p.string());
+}
+
+// 大消息长度压在 SHA-256 长度字段低 32 位边界上：
+//   n=2^29-1 字节 -> 位长 0x00000000_FFFFFFF8（边界之前）
+//   n=2^29   字节 -> 位长 0x00000001_00000000（恰好 2^32 比特）
+//   n=2^29+1 字节 -> 位长 0x00000001_00000008（越过边界）
+// 预期摘要由 coreutils sha256sum 与 Python hashlib（OpenSSL）两个彼此独立
+// 的实现对真实文件分别计算、交叉核对一致后固化，不用本项目代码生成，因此
+// 能发现本项目与库共用同一种长度编码错误（低 32 位回绕 / 把字节数当位长 /
+// 丢失高 32 位）的情形。
+void test_long_message_length_encoding() {
+    constexpr std::size_t kBit32BoundaryBytes = std::size_t{1} << 29;  // 536870912
+    struct LongCase {
+        std::size_t n;
+        const char* hex;
+    };
+    const LongCase cases[] = {
+        {536870911,
+         "1f97811a3a059e582b3753e94d8852bd89740248c5f35911f8e70afdd57f9842"},
+        {536870912,
+         "b9045a713caed5dff3d3b783e98d1ce5778d8bc331ee4119d707072312af06a7"},
+        {536870913,
+         "bf6084769b780af4396e058ef0eaf9ca59366db146ca86ebfcaf58cbf7a35669"},
+    };
+
+    // (a) 增量接口：三种长度各以均匀 1 MiB 分段逐段提交，必须等于标准结果。
+    //     全程只复用一个 1 MiB 缓冲，内存占用不随消息长度增长。
+    std::string incremental_digest[3];
+    for (int i = 0; i < 3; ++i) {
+        incremental_digest[i] =
+            hash_long_a(cases[i].n, uniform_schedule(cases[i].n));
+        check(incremental_digest[i] == cases[i].hex,
+              "incremental Sha256 long message n=" +
+                  std::to_string(cases[i].n) +
+                  " matches independent standard SHA-256 digest");
+    }
+
+    // 三种长度的标准摘要必须两两不同：长度高 32 位一旦丢失或回绕，
+    // n=2^29 与 n=2^29+1 会分别塌缩成 n=0 与 n=1 之类的短消息摘要。
+    check(incremental_digest[0] != incremental_digest[1] &&
+              incremental_digest[1] != incremental_digest[2] &&
+              incremental_digest[0] != incremental_digest[2],
+          "long messages n=2^29-1/2^29/2^29+1 have three distinct digests "
+          "(high 32 bits of bit length are not dropped or wrapped)");
+
+    // (b) 越过边界的同一消息，在 2^32 位边界附近改用完全不同的分段
+    //     （非 64 对齐的小段），仍必须得到同一个标准摘要。
+    {
+        const std::size_t n3 = cases[2].n;
+        const std::string re_segmented =
+            hash_long_a(n3, boundary_schedule(n3, kBit32BoundaryBytes));
+        check(re_segmented == cases[2].hex,
+              "incremental Sha256 n=536870913 re-segmented near the 2^32-bit "
+              "boundary matches independent standard digest");
+        check(re_segmented == incremental_digest[2],
+              "same n=536870913 bytes give one digest across different "
+              "segmentations near the boundary");
+    }
+
+    // (c) 文件读取入口：对三种长度各写一份真实文件（固定缓冲流式写），
+    //     sha256_file 必须对“实际读取到的全部字节”给出与增量接口、与
+    //     独立标准实现一致的摘要。逐份写完即算完即删，磁盘占用也有界。
+    //     任何时刻最多保留一份 512 MiB 文件，预留 1 GiB 余量。
+    TempArea tmp("long");
+    std::error_code space_ec;
+    const std::uintmax_t kFreeNeeded = 1ULL * 1024 * 1024 * 1024;
+    const auto space_info = fs::space(tmp.root, space_ec);
+    const bool have_room =
+        !space_ec && space_info.available >= kFreeNeeded;
+    if (!have_room) {
+        // 环境无法容纳真实大文件：如实记为跳过，绝不把未执行的检查算作通过。
+        ++g_skipped;
+        std::cout << "SKIP: real >512 MiB file length-encoding checks "
+                     "(insufficient free space under "
+                  << tmp.root.string() << ")\n";
+    }
+    if (have_room) {
+        for (int i = 0; i < 3; ++i) {
+            const fs::path p =
+                tmp.root / ("long_" + std::to_string(cases[i].n) + ".bin");
+            write_streaming_fill(p, cases[i].n, 'a', 'a');
+            std::error_code ec;
+            check(fs::file_size(p, ec) == cases[i].n && !ec,
+                  "long fixture n=" + std::to_string(cases[i].n) +
+                      " is really that many bytes on disk");
+
+            branchaudit::FileHashResult r;
+            auto captured = silent_file_hash(p, &r);
+            const std::string label =
+                "file sha256 n=" + std::to_string(cases[i].n);
+            check(r.ok(), label + ": success");
+            check(captured.first.empty() && captured.second.empty(),
+                  label + ": library prints nothing");
+            check(hex_of(r.digest) == cases[i].hex,
+                  label + ": matches independent standard SHA-256 digest");
+            check(hex_of(r.digest) == incremental_digest[i],
+                  label +
+                      ": file reading and incremental update agree on same bytes");
+            fs::remove(p, ec);  // 计算完即删，限制临时磁盘占用
+        }
+
+        // (d) 文件最后一段属于输入：n=2^29+1 而仅末字节为 'b' 的真实文件，
+        //     摘要必须是该完整序列的独立标准结果，且与全 'a' 版本不同——
+        //     证明越过边界之后的最后一个字节确实参与了最终长度编码与摘要，
+        //     而不是只返回边界之前内容的摘要。
+        const std::size_t n3 = cases[2].n;
+        const fs::path tail_p = tmp.root / "long_tail.bin";
+        write_streaming_fill(tail_p, n3, 'a', 'b');
+        std::error_code tail_ec;
+        check(fs::file_size(tail_p, tail_ec) == n3 && !tail_ec,
+              "tail fixture is really 536870913 bytes on disk");
+        branchaudit::FileHashResult tail_r;
+        auto tail_captured = silent_file_hash(tail_p, &tail_r);
+        constexpr const char* kTailStandard =
+            "91d4098afec4bb6731e4dba873b3c9a9c581cd4800086ac2fbb4175c21992375";
+        check(tail_r.ok(), "tail file: success");
+        check(tail_captured.first.empty() && tail_captured.second.empty(),
+              "tail file: library prints nothing");
+        check(hex_of(tail_r.digest) == kTailStandard,
+              "file n=536870913 with distinct last byte matches independent "
+              "standard digest (final segment is hashed, not dropped)");
+        check(hex_of(tail_r.digest) != cases[2].hex,
+              "changing the post-boundary last byte changes the digest");
+        fs::remove(tail_p, tail_ec);
+    }
+}
+
 // ---- 文件失败行为 ---------------------------------------------------------
 
 void test_file_failures() {
@@ -552,6 +771,7 @@ int main(int argc, char** argv) {
     test_boundary_lengths();
     test_incremental_splits();
     test_file_hashing();
+    test_long_message_length_encoding();
     test_file_failures();
     if (fault_test::kFaultInjectionAvailable) {
         test_file_io_failures();

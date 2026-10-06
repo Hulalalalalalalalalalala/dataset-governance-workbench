@@ -21,6 +21,7 @@ macOS）上 CMake 不传该参数，本脚本明确跳过这两类检查（报�
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,67 @@ def fill_a(n: int) -> bytes:
 
 def pattern(n: int) -> bytes:
     return bytes((i * 31 + 7) % 256 for i in range(n))
+
+
+# ---- 超过 2^32 比特（512 MiB）长度编码的真实文件回归 ----------------------
+#
+# SHA-256 末尾以 8 字节大端写入“位长度”，536870913 字节 = 2^29+1 字节
+# 即位长度 0x00000001_00000008，恰好越过低 32 位边界（2^32 比特）。
+#
+# 下面的常量是“长度 2^29-1 / 2^29 / 2^29+1 全 'a'”和“2^29+1 字节而仅
+# 末字节为 'b'”四份真实文件的标准 SHA-256，由 coreutils sha256sum 与
+# Python hashlib（OpenSSL）两个彼此独立的实现分别计算、交叉核对一致后
+# 固化；不用本项目代码生成，因此能发现本项目与 hashlib 共用同一种长度
+# 编码错误（低 32 位回绕 / 把字节数当作位长 / 丢失高 32 位）的情形。
+LONG_A_536870911 = (
+    "1f97811a3a059e582b3753e94d8852bd89740248c5f35911f8e70afdd57f9842")
+LONG_A_536870912 = (
+    "b9045a713caed5dff3d3b783e98d1ce5778d8bc331ee4119d707072312af06a7")
+LONG_A_536870913 = (
+    "bf6084769b780af4396e058ef0eaf9ca59366db146ca86ebfcaf58cbf7a35669")
+LONG_TAIL_536870913 = (
+    "91d4098afec4bb6731e4dba873b3c9a9c581cd4800086ac2fbb4175c21992375")
+
+LONG_STREAM_CHUNK = 1 << 20  # 1 MiB：准备/计算都不按消息总长度分配内存
+
+
+def write_long_fill(path: Path, n: int, fill: int, last: int | None) -> None:
+    """流式写出 n 字节：前 n-1 字节为 fill，last 不为 None 时末字节为 last。
+
+    固定 1 MiB 缓冲循环写，内存占用与 n 无关；绝不把整份消息装入内存。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block = bytes([fill]) * LONG_STREAM_CHUNK
+    with open(path, "wb") as f:
+        off = 0
+        while off < n:
+            ln = min(LONG_STREAM_CHUNK, n - off)
+            if last is not None and off + ln == n:
+                chunk = block[:ln - 1] + bytes([last])
+            else:
+                chunk = block[:ln]
+            f.write(chunk)
+            off += ln
+
+
+def hash_long_fill(n: int, fill: int, last: int | None) -> str:
+    """对与 write_long_fill 相同的字节流做流式标准 SHA-256（独立依据）。
+
+    hashlib 逐块 update，不持有整份消息；只用于和固化常量交叉核对以及
+    端到端比较，常量本身并不由被测程序产生。
+    """
+    h = hashlib.sha256()
+    block = bytes([fill]) * LONG_STREAM_CHUNK
+    off = 0
+    while off < n:
+        ln = min(LONG_STREAM_CHUNK, n - off)
+        if last is not None and off + ln == n:
+            h.update(block[:ln - 1])
+            h.update(bytes([last]))
+        else:
+            h.update(block[:ln])
+        off += ln
+    return h.hexdigest()
 
 
 def run_cli(exe: str, *args: str, cwd: str | None = None, env=None):
@@ -235,6 +297,74 @@ def main() -> int:
         pp = tmp / "pattern200000.bin"
         write_fixture(pp, big_pattern)
         expect_file_success(exe, pp, big_pattern, "large binary pattern")
+
+        # ---- 越过 2^32 位（512 MiB）长度边界的真实文件 ------------------
+        # 三个长度压在 SHA-256 长度字段低 32 位边界上：
+        #   2^29-1 字节 -> 位长 ...FFFFFFF8（边界之前）
+        #   2^29   字节 -> 位长 ...00000000（恰好 2^32 比特）
+        #   2^29+1 字节 -> 位长 ...00000008（越过边界）
+        # 文件以固定 1 MiB 缓冲流式生成、独立参考也流式计算，整份消息从不
+        # 进入内存；任一时刻只保留一份 512 MiB 文件。
+        long_dir = tmp / "long length"
+        need_bytes = 1024 * 1024 * 1024
+        if shutil.disk_usage(str(tmp)).free < need_bytes:
+            skip_group("hash: 越过 2^32 位边界的真实 512 MiB 级文件检查"
+                       "（临时目录可用空间不足，未执行，不计为通过）")
+        else:
+            long_cases = [
+                (536870911, LONG_A_536870911),
+                (536870912, LONG_A_536870912),
+                (536870913, LONG_A_536870913),
+            ]
+            for n, standard_hex in long_cases:
+                lp = long_dir / f"long_{n}.bin"
+                write_long_fill(lp, n, ord("a"), None)
+                check(lp.stat().st_size == n,
+                      f"long {n}: fixture is really {n} bytes on disk")
+                # 独立依据交叉核对：流式 hashlib（OpenSSL）必须等于由
+                # coreutils sha256sum 固化的常量；两者不一致即判失败，绝不
+                # 用“被测程序与库一致”充当正确性。
+                stream_hex = hash_long_fill(n, ord("a"), None)
+                check(stream_hex == standard_hex,
+                      f"long {n}: streaming hashlib agrees with the "
+                      f"independent sha256sum-derived constant")
+                proc = run_cli(exe, str(lp))
+                expected_stdout = (standard_hex + "\n").encode("ascii")
+                check(proc.returncode == 0,
+                      f"long {n}: hash exit code 0 (got {proc.returncode})")
+                check(proc.stdout == expected_stdout,
+                      f"long {n}: stdout is exactly the standard 64 lowercase "
+                      f"hex chars + newline (got {proc.stdout[:20]!r}...)")
+                check(len(proc.stdout) == 65 and proc.stdout.endswith(b"\n")
+                      and all(c in b"0123456789abcdef" for c in proc.stdout[:64]),
+                      f"long {n}: one line of 64 lowercase hex chars + newline")
+                check(proc.stderr == b"",
+                      f"long {n}: stderr must be empty (got {proc.stderr!r})")
+                lp.unlink()
+
+            # 越过边界后文件最后一段确属输入：2^29+1 字节而仅末字节为 'b'，
+            # hash 必须给出该“完整序列”的独立标准结果，且与全 'a' 版本
+            # 不同——不能只返回边界之前内容的摘要。
+            n_tail = 536870913
+            lp = long_dir / "long_tail.bin"
+            write_long_fill(lp, n_tail, ord("a"), ord("b"))
+            check(lp.stat().st_size == n_tail,
+                  "long tail: fixture is really 536870913 bytes on disk")
+            tail_stream = hash_long_fill(n_tail, ord("a"), ord("b"))
+            check(tail_stream == LONG_TAIL_536870913,
+                  "long tail: streaming hashlib agrees with the independent "
+                  "sha256sum-derived constant")
+            proc = run_cli(exe, str(lp))
+            check(proc.returncode == 0,
+                  f"long tail: hash exit code 0 (got {proc.returncode})")
+            check(proc.stdout == (LONG_TAIL_536870913 + "\n").encode("ascii"),
+                  "long tail: stdout is the standard digest of the FULL message "
+                  "(the post-boundary final byte is hashed, not dropped)")
+            check(proc.stderr == b"", "long tail: stderr must be empty")
+            check(proc.stdout != (LONG_A_536870913 + "\n").encode("ascii"),
+                  "long tail: changing the last byte past the boundary changes "
+                  "the digest")
+            lp.unlink()
 
         # ---- 相同字节、不同文件名/目录：摘要一致且不含路径文字 ----------
         shared = b"a\x00b\xff c\nd"

@@ -64,9 +64,12 @@ if(BRANCHAUDIT_BUILD_TESTS)
     add_executable(merkle_test tests/merkle_test.cpp)
     target_link_libraries(merkle_test PRIVATE branchaudit_core)
     target_compile_definitions(merkle_test PRIVATE
-        BRANCHAUDIT_FAULT_INJECTION=$<BOOL:${BRANCHAUDIT_FAULT_INJECTION}>)
+        BRANCHAUDIT_FAULT_INJECTION=$<BOOL:${BRANCHAUDIT_FAULT_INJECTION}>
+        BRANCHAUDIT_CLI="$<TARGET_FILE:branchaudit>")
     add_test(NAME merkle_unit COMMAND merkle_test)
     set_tests_properties(merkle_unit PROPERTIES TIMEOUT 30)
+    # 读取 prove 实际命令输出的端到端检查需要可执行文件先构建。
+    add_dependencies(merkle_test branchaudit)
 
     if(BRANCHAUDIT_FAULT_INJECTION)
         target_compile_definitions(sha256_test PRIVATE

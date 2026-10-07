@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "filehash.h"
@@ -67,6 +68,15 @@ struct MerkleProof {
 // merkle_proof_file 的结果：成功时 error 为空、proof 有效；
 // 失败时 error 说明原因。
 struct MerkleProofResult {
+    MerkleProof proof;
+    std::string error;
+
+    bool ok() const { return error.empty(); }
+};
+
+// merkle_proof_from_json 的结果：成功时 error 为空、proof 有效；失败时
+// error 给出可供调用方直接展示的原因，proof 保持默认构造、不可使用。
+struct MerkleProofParseResult {
     MerkleProof proof;
     std::string error;
 
@@ -142,5 +152,40 @@ MerkleProofResult merkle_proof_file(
 MerkleVerifyResult merkle_verify_proof(const MerkleProof& proof,
                                        const Digest& trusted_root,
                                        const Digest& content_leaf);
+
+// 从 prove 命令输出的 JSON 文本读取版本 1 成员证明。
+//
+// 只消费调用方传入的文本：不读取任何批次文件，也不替调用方选择或提供
+// 可信根——读取成功后，调用方仍须把得到的 MerkleProof、自己另行保存的
+// 可信根与待验证内容的叶子摘要一起交给 merkle_verify_proof 完成校验。
+// 读取成功只表示文本符合证明格式，绝不表示成员校验通过：空批次、位置
+// 越界、兄弟路径与声明不符、摘要能否折叠到可信根，全部继续由
+// merkle_verify_proof 判断；证明自报的 root、leaf_count 与 leaf_index
+// 仍是未经认证的声明。
+//
+// 接受 prove 命令的完整标准输出，包括末尾换行；JSON 允许的空白
+// （空格、制表符、换行、回车）与对象字段次序变化不影响读取结果。
+// 版本 1 的字段与兄弟记录格式与 prove 已公开的输出完全一致：
+//  * 顶层对象恰好包含 version、root、leaf_count、leaf_index、leaf、
+//    siblings 六个字段；同一对象出现重复字段或任何未定义字段都判失败；
+//  * version 只接受 JSON 整数 1（1.0、"1"、true 等都不接受）；
+//  * leaf_count/leaf_index 接受 0 到 UINT64_MAX 的 JSON 整数并准确保留
+//    数值；负数、小数、指数写法（1e2）、数字字符串（"3"）、布尔值以及
+//    超出无符号 64 位范围的数字都判失败；
+//  * root/leaf 与每个兄弟的 digest 只接受恰好 64 个小写十六进制字符，
+//    还原为 32 字节摘要；长度不符、含其他字符或使用大写字符都明确失败，
+//    不截断、不替换损坏内容；
+//  * siblings 是数组，兄弟的数组顺序、方向与摘要严格按输入保留：不重新
+//    排序、不去重，也不为奇数末节点提升的层补记录；单文件证明的空数组
+//    正常读入。每个兄弟对象恰好包含 side 与 digest 两个字段，side 只
+//    接受 "left" 或 "right"；
+//  * 文本为空、JSON 语法损坏、必填字段缺失或类型不符、版本不支持都判
+//    失败；顶层对象之后除 JSON 空白外若还有任何内容（例如第二份对象、
+//    尾随文字）也判失败，不会只取前半段当作成功结果。
+//
+// 成功时返回 {proof=读取结果, error=""}；失败时 error 为可供调用方直接
+// 展示的原因（英文一句话），proof 保持默认构造、不提供任何可用的部分
+// 证明。函数只返回结构化结果，不打印、不结束调用方进程。
+MerkleProofParseResult merkle_proof_from_json(std::string_view text);
 
 }  // namespace branchaudit

@@ -2,9 +2,10 @@
 
 提供命令行版本查询、文件 SHA-256 摘要计算（`hash`）、有序文件批次的
 Merkle 根计算（`root`）与单个文件位置的成员证明生成（`prove`）；可复用
-C++20 核心库 `branchaudit_core` 另提供成员证明**校验**接口
-`merkle_verify_proof`（只消费证明、可信根与内容叶子摘要三份输入，无对应
-命令行子命令）。
+C++20 核心库 `branchaudit_core` 另提供 `prove` 输出 JSON 的读取接口
+`merkle_proof_from_json`（读成现有的 `MerkleProof`）与成员证明**校验**
+接口 `merkle_verify_proof`（只消费证明、可信根与内容叶子摘要三份输入，
+无对应命令行子命令）。
 
 ## 构建与运行
 
@@ -235,6 +236,114 @@ if (r.ok()) {
 `merkle_proof_file` 遵循与命令行相同的批次、配对与失败规则，只返回结构化
 结果，不打印、不退出进程。
 
+## 从 prove 的 JSON 输出读取成员证明
+
+`prove` 输出的是一段 JSON 文本；拿到这段文本的一方不必自己解析，可以通过
+核心库的公开接口 `merkle_proof_from_json` 把它读成现有的 `MerkleProof`
+结构，再交给 `merkle_verify_proof` 校验。读取**只消费传入的文本**：不读取
+任何批次文件，也不替调用方选择可信根——可信根始终由调用方另行提供。
+
+```cpp
+#include "merkle.h"
+
+// text 是 prove 命令输出的完整字节，包括末尾换行（从管道、文件或网络收到
+// 后原样传入即可）；读取过程不访问任何批次文件。
+branchaudit::MerkleProofParseResult parsed =
+    branchaudit::merkle_proof_from_json(text);
+if (!parsed.ok()) {
+    // parsed.error 是可直接展示给用户的失败原因（英文一句话）；
+    // parsed.proof 在失败时不可使用（不提供部分证明）。
+}
+const branchaudit::MerkleProof& proof = parsed.proof;
+```
+
+读取沿用 prove 已公开的**版本 1** 字段与兄弟记录格式：
+
+- 完整接受命令输出，包括末尾换行；合法的 JSON 空白（空格、制表符、换行、
+  回车）和对象字段次序的变化不影响读取结果。
+- `siblings` 数组的顺序、方向与摘要严格按输入保留：不重新排序、不去重，
+  也不为奇数末节点提升的层补记录；单文件证明的空数组正常读入。
+- 所有摘要只接受**恰好 64 个小写十六进制字符**，还原为 32 字节摘要；
+  长度不符、出现其他字符或使用大写字符都明确失败，不截断、不替换损坏
+  内容。
+- `version` 只接受 JSON 整数 `1`。
+- `leaf_count`/`leaf_index` 接受从 `0` 到无符号 64 位最大值
+  （`18446744073709551615`）的 JSON 整数并准确保留数值；负数、小数、
+  指数写法（`1e2`）、数字字符串（`"3"`）、布尔值以及超出范围的数字都
+  拒绝。
+- 兄弟方向只接受 `"left"` 与 `"right"`。
+- 文本为空、JSON 语法损坏、必填字段缺失、字段类型不符、不支持的版本、
+  同一对象出现重复字段或存在未定义字段时，返回读取失败和可展示原因；
+  顶层对象之后除 JSON 空白外若还有任何内容（例如第二段对象或尾随文字）
+  同样失败，不会只取前半段当作成功结果。
+- 失败时不提供可用的部分证明；函数只返回结构化结果，不向标准输出/错误
+  打印，也不结束调用方进程。
+
+**读取成功只表示文本符合证明格式，不等于成员校验通过。** 空批次、位置
+越界、兄弟路径与声明不匹配、摘要能否折叠到可信根，全部继续由
+`merkle_verify_proof` 判断；证明自报的 `root`、`leaf_count` 与
+`leaf_index` 仍是未经认证的声明（见下一节“通过结论的边界”）。
+
+### 读取后校验的完整示例
+
+下面的例子把三件各自独立的东西凑齐后再校验：① 从外部文本读入的证明；
+② **调用方另行保存、经独立渠道核对的可信根**（不是证明里的 `root`
+字段）；③ 待验证内容按叶子规则算出的叶子摘要。
+
+```cpp
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+#include "merkle.h"
+
+int main() {
+    // ① 证明文本：例如把 `branchaudit prove ...` 的标准输出原样保存到文件
+    //    （含末尾换行也无需裁剪），这里从文件读入；来源也可以是管道或网络。
+    std::ifstream in("proof.json", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+
+    branchaudit::MerkleProofParseResult parsed =
+        branchaudit::merkle_proof_from_json(text);
+    if (!parsed.ok()) {
+        std::cerr << "cannot read proof: " << parsed.error << '\n';
+        return 1;
+    }
+
+    // ② 可信根：与证明文本分开、经独立渠道保存和核对的 32 字节根摘要。
+    //    绝不能直接用 parsed.proof.root —— 那个字段是被校验的对象，不是
+    //    信任依据。这里演示从“另行保存的 64 个小写十六进制字符”还原；
+    //    实际部署中它也可能是一段预置常量或由 root 命令/merkle_root_files
+    //    在另一次独立计算中取得。
+    branchaudit::Digest trusted_root = /* 来自独立信任渠道的 32 字节 */{};
+
+    // ③ 待验证内容的叶子摘要：SHA-256(0x00 || content)，与批次叶子规则
+    //    完全相同；不能用 hash/sha256_file 的普通文件摘要代替。
+    const unsigned char content[] = {'a'};
+    const branchaudit::Digest content_leaf =
+        branchaudit::merkle_leaf(content, sizeof(content));
+
+    // 读取只确认格式；成员是否成立由现有校验接口判断。
+    const branchaudit::MerkleVerifyResult v =
+        branchaudit::merkle_verify_proof(parsed.proof, trusted_root,
+                                         content_leaf);
+    if (!v.ok()) {
+        std::cerr << "verification failed: " << v.error << '\n';
+        return 1;
+    }
+    std::cout << "content is backed by the trusted root\n";
+    return 0;
+}
+```
+
+注意上面 ② 的可信根不能偷懒从证明文本里取：读取接口本身也不提供
+“默认根”或“从批次文件重算根”之类的选择，信任锚完全由调用方掌握。如果
+业务还需要确认批次大小与位置，按后文“业务需要确认批次大小与位置时”
+的规则，把这两个事实与可信根一起独立保存、在校验通过之外再与
+`proof.leaf_count`/`proof.leaf_index` 逐一比对。
+
 ## 在 C++20 程序中校验成员证明
 
 证明生成通常在掌握整个批次的一方完成；持有证明的一方只需三样东西就能判断
@@ -285,7 +394,8 @@ branchaudit::Digest trusted_root =
     branchaudit::merkle_root_files(batch).digest;
 
 // ② 证明：由掌握批次的一方生成（这里在同一进程演示；真正使用时 proof
-//    往往从 JSON 等外部来源反序列化得到）。
+//    往往是收到 prove 输出文本后经 merkle_proof_from_json 读取得到，
+//    见上文“从 prove 的 JSON 输出读取成员证明”）。
 branchaudit::MerkleProof proof =
     branchaudit::merkle_proof_file(batch, /*leaf_index=*/2).proof;
 
@@ -491,7 +601,27 @@ Linux 执行，其他平台明确跳过，见下文）；`root` 还覆盖 `0x00`
 left）、`leaf_index == leaf_count` 越界、`2^63` 全 left 无省略等 64 位
 边界——形状计数由独立 Python 模拟交叉核对，校验不按 `leaf_count` 分配
 内存、无回绕且必定终止；成功与失败两条路径都验证库不打印、不退出，失败
-时返回非空、可展示的原因。预期摘要与证明以
+时返回非空、可展示的原因。证明 JSON **读取**接口
+（`merkle_proof_from_json`）覆盖：prove 命令真实输出（经子进程取回全部
+字节、含末尾换行）原样读入并逐字段还原为生成端持有的同一份证明；
+prove 风格紧凑文本与“字段次序打乱 + 空格/制表符/换行/回车”变体读取
+结果一致；单文件与单空文件的空兄弟数组、含重复摘要与重复侧向的兄弟
+数组严格按输入次序/方向/摘要保留（不重排、不去重）；单文件、两文件、
+三文件与五文件批次每个位置读回后配独立可信根与内容叶子通过现有校验；
+`leaf_count`/`leaf_index` 的 `0` 与 `18446744073709551615` 精确还原；
+空文本/纯空白、语法损坏（未闭合、尾逗号、单引号、注释、裸
+`NaN`/`Infinity`、前导零与 `+` 号、截断字面量、未转义控制字符、非法
+转义与半截 UTF-8）、顶层非对象、必填缺失、未定义字段（含大小写字段
+名）、同对象重复字段、顶层对象后的第二对象/尾随文字/注释、
+`version` 非整数 1（`0`/`2`/`-1`/`1.0`/`1e0`/`"1"`/布尔/`null`/数组/
+超范围）、计数字段的负数/小数/指数/数字字符串/布尔/`null`/超 64 位
+范围、摘要长度不符（空、63、65 字符）、大写十六进制与非十六进制字符、
+错误类型的摘要字段，以及兄弟数组与每项兄弟的类型/字段集合/侧向
+（`"Left"`、`"up"`、空串、`null`、数字）/摘要各类非法形态均被拒绝且
+原因非空；失败路径验证结果中的证明保持默认构造（不提供部分证明）、
+库不打印、不退出；另固定“读取成功不等于校验通过”：空批次声明、位置
+越界声明与可信根不符的自洽证明能被读取但继续被 `merkle_verify_proof`
+拒绝。预期摘要与证明以
 独立标准实现（FIPS 180-4 公布向量、系统
 `sha256sum` 与 Python `hashlib`/OpenSSL）为依据，不与本项目实现互相比较。
 

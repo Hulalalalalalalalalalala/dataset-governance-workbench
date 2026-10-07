@@ -11,10 +11,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1329,6 +1331,629 @@ void test_large_files() {
           "large file: tail change is detected");
 }
 
+// ---- prove 输出 JSON 的读取：merkle_proof_from_json ------------------------
+
+using branchaudit::MerkleProofParseResult;
+
+// 以与 main.cpp 的 prove 输出逐字节相同的紧凑格式序列化（含末尾换行）。
+std::string serialize_proof_like_cli(const MerkleProof& p) {
+    std::ostringstream o;
+    o << "{\"version\":1"
+      << ",\"root\":\"" << hex_of(p.root) << "\""
+      << ",\"leaf_count\":" << p.leaf_count
+      << ",\"leaf_index\":" << p.leaf_index
+      << ",\"leaf\":\"" << hex_of(p.leaf) << "\""
+      << ",\"siblings\":[";
+    for (std::size_t i = 0; i < p.siblings.size(); ++i) {
+        if (i != 0) {
+            o << ',';
+        }
+        o << "{\"side\":\""
+          << (p.siblings[i].side == MerkleSibling::Side::left ? "left"
+                                                              : "right")
+          << "\",\"digest\":\"" << hex_of(p.siblings[i].digest) << "\"}";
+    }
+    o << "]}\n";
+    return o.str();
+}
+
+// 字段次序打乱、各处分插 JSON 空白（含回车与制表符）的变体：合法 JSON
+// 空白与对象字段次序变化都不得影响读取结果。
+std::string serialize_proof_pretty_reordered(const MerkleProof& p) {
+    std::ostringstream o;
+    o << "{\r\n\t\"leaf_count\": " << p.leaf_count << " , "
+      << "\"siblings\" : [ ";
+    for (std::size_t i = 0; i < p.siblings.size(); ++i) {
+        if (i != 0) {
+            o << " , ";
+        }
+        // 兄弟对象内部字段次序也改为 digest 在前、side 在后。
+        o << "{ \"digest\" : \"" << hex_of(p.siblings[i].digest)
+          << "\" , \"side\": \""
+          << (p.siblings[i].side == MerkleSibling::Side::left ? "left"
+                                                              : "right")
+          << "\" }";
+    }
+    o << " ] ,\n \"leaf_index\":" << p.leaf_index
+      << " , \"version\" : 1 , \"leaf\":\"" << hex_of(p.leaf)
+      << "\", \"root\": \"" << hex_of(p.root) << "\" }\t\n ";
+    return o.str();
+}
+
+bool proofs_equal(const MerkleProof& a, const MerkleProof& b) {
+    if (a.root != b.root || a.leaf != b.leaf ||
+        a.leaf_count != b.leaf_count || a.leaf_index != b.leaf_index ||
+        a.siblings.size() != b.siblings.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.siblings.size(); ++i) {
+        if (a.siblings[i].side != b.siblings[i].side ||
+            a.siblings[i].digest != b.siblings[i].digest) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 真正执行 prove 命令并取回其标准输出的全部字节（含末尾换行），使“读取
+// 完整接受命令输出”经由真实子进程端到端固定，而不是只靠测试内的序列化。
+// BRANCHAUDIT_CLI 由 CMake 注入为 branchaudit 可执行文件的路径。
+std::string shell_quote(std::string_view s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out += "'";
+    return out;
+}
+
+std::string run_cli_capture(std::uint64_t index,
+                            const std::vector<fs::path>& paths) {
+    std::string cmd = shell_quote(BRANCHAUDIT_CLI) + " prove " +
+                      std::to_string(index);
+    for (const fs::path& p : paths) {
+        cmd += " " + shell_quote(p.string());
+    }
+    FILE* pipe = popen(cmd.c_str(), "r");
+    check(pipe != nullptr, "popen prove command for JSON read-back test");
+    std::string out;
+    char buffer[4096];
+    std::size_t n = 0;
+    while ((n = std::fread(buffer, 1, sizeof(buffer), pipe)) > 0) {
+        out.append(buffer, n);
+    }
+    const int rc = pclose(pipe);
+    check(rc == 0, "prove command exits 0 in JSON read-back test");
+    return out;
+}
+
+// 成功读取：真实批次证明序列化后逐字段还原，并能立即交给校验接口。
+void test_proof_json_read_success() {
+    TempArea tmp("jsonread");
+    const auto empty = bytes_of("");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto hello = bytes_of("hello\n");
+    const auto bb = bytes_of("bb");
+    const fs::path f_empty = tmp.root / "empty.bin";
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_hello = tmp.root / "hello.bin";
+    const fs::path f_bb = tmp.root / "bb.bin";
+    write_file(f_empty, empty);
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_hello, hello);
+    write_file(f_bb, bb);
+
+    const std::vector<fs::path> batches[] = {
+        {f_a},
+        {f_empty},
+        {f_a, f_abc},
+        {f_a, f_abc, f_empty},
+        {f_a, f_abc, f_empty, f_hello, f_bb},
+    };
+    const std::vector<std::vector<unsigned char>> contents[] = {
+        {a}, {empty}, {a, abc}, {a, abc, empty},
+        {a, abc, empty, hello, bb},
+    };
+
+    for (std::size_t b = 0; b < std::size(batches); ++b) {
+        const Digest trusted = root_of(batches[b]);
+        for (std::uint64_t i = 0; i < batches[b].size(); ++i) {
+            const MerkleProof original =
+                branchaudit::merkle_proof_file(batches[b], i).proof;
+            const std::string text = serialize_proof_like_cli(original);
+
+            MerkleProofParseResult parsed;
+            {
+                std::stringstream cap_out, cap_err;
+                auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+                auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+                parsed = branchaudit::merkle_proof_from_json(text);
+                std::cout.rdbuf(old_out);
+                std::cerr.rdbuf(old_err);
+                check(cap_out.str().empty() && cap_err.str().empty(),
+                      "proof JSON reader prints nothing on success");
+            }
+            check(parsed.ok(),
+                  "batch " + std::to_string(b) + " index " +
+                      std::to_string(i) + ": prove-style JSON is accepted: " +
+                      parsed.error);
+            check(proofs_equal(parsed.proof, original),
+                  "batch " + std::to_string(b) + " index " +
+                      std::to_string(i) +
+                      ": every field and sibling is read back unchanged");
+
+            // 读回的证明立即可以与独立可信根、内容叶子一起通过校验。
+            const Digest content_leaf = leaf_bytes(contents[b][i]);
+            const MerkleVerifyResult v =
+                branchaudit::merkle_verify_proof(parsed.proof, trusted,
+                                                 content_leaf);
+            check(v.ok(),
+                  "batch " + std::to_string(b) + " index " +
+                      std::to_string(i) +
+                      ": read-back proof verifies under the trusted root: " +
+                      v.error);
+
+            // 同样的证明换用空白/字段次序变体后读取结果必须一致。
+            const MerkleProofParseResult pretty =
+                branchaudit::merkle_proof_from_json(
+                    serialize_proof_pretty_reordered(original));
+            check(pretty.ok(),
+                  "batch " + std::to_string(b) + " index " +
+                      std::to_string(i) +
+                      ": whitespace/key-order variant accepted: " +
+                      pretty.error);
+            check(proofs_equal(pretty.proof, original),
+                  "batch " + std::to_string(b) + " index " +
+                      std::to_string(i) +
+                      ": whitespace and field order do not change the result");
+        }
+    }
+
+    // 单文件证明的空兄弟数组正常读入。
+    {
+        const MerkleProof p =
+            branchaudit::merkle_proof_file({f_a}, 0).proof;
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(serialize_proof_like_cli(p));
+        check(r.ok() && r.proof.siblings.empty(),
+              "single-file proof: empty siblings array reads as empty");
+    }
+
+    // 兄弟数组的顺序、方向、摘要严格按输入保留：不重新排序、不去重。
+    // 构造一个含重复摘要与重复方向、顺序特定的 siblings 数组（它无需能
+    // 通过校验——读取只负责原样保留）。
+    {
+        const Digest d1 = leaf_bytes(a);
+        const Digest d2 = leaf_bytes(abc);
+        std::string json =
+            "{\"version\":1,\"root\":\"" + hex_of(d1) +
+            "\",\"leaf_count\":7,\"leaf_index\":0,\"leaf\":\"" +
+            hex_of(d2) + "\",\"siblings\":["
+            "{\"side\":\"right\",\"digest\":\"" + hex_of(d2) + "\"},"
+            "{\"side\":\"right\",\"digest\":\"" + hex_of(d2) + "\"},"
+            "{\"side\":\"left\",\"digest\":\"" + hex_of(d1) + "\"}]}";
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(json);
+        check(r.ok() && r.proof.siblings.size() == 3,
+              "reader accepts an ordered, duplicate-bearing sibling array");
+        if (r.ok()) {
+            check(r.proof.siblings[0].side == MerkleSibling::Side::right &&
+                          r.proof.siblings[0].digest == d2 &&
+                          r.proof.siblings[1].side ==
+                              MerkleSibling::Side::right &&
+                          r.proof.siblings[1].digest == d2 &&
+                          r.proof.siblings[2].side ==
+                              MerkleSibling::Side::left &&
+                          r.proof.siblings[2].digest == d1,
+                  "sibling order, sides and digests are preserved exactly "
+                  "(no sorting, no deduplication)");
+        }
+    }
+
+    // 端到端：直接吃 prove 进程的标准输出字节（含末尾换行）。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty, f_hello,
+                                          f_bb};
+        const std::string raw = run_cli_capture(2, batch);
+        check(!raw.empty() && raw.back() == '\n',
+              "fixture: prove output ends with a newline");
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(raw);
+        check(r.ok(),
+              std::string("actual prove command output is accepted "
+                          "verbatim: ") + r.error);
+        const MerkleProof original =
+            branchaudit::merkle_proof_file(batch, 2).proof;
+        check(proofs_equal(r.proof, original),
+              "actual prove output decodes to the same proof the library "
+              "holds");
+        const Digest trusted = root_of(batch);
+        check(branchaudit::merkle_verify_proof(
+                  r.proof, trusted, leaf_bytes(empty)).ok(),
+              "proof read from command output verifies under the trusted "
+              "root");
+    }
+}
+
+// 计数与位置的无符号 64 位整数边界：准确保留，不靠 double。
+void test_proof_json_uint64() {
+    const Digest d = leaf_bytes(bytes_of("a"));
+    const std::string hex = hex_of(d);
+    constexpr std::uint64_t kMax = ~std::uint64_t{0};
+
+    auto build = [&](const std::string& count,
+                     const std::string& index) {
+        return "{\"version\":1,\"root\":\"" + hex +
+               "\",\"leaf_count\":" + count + ",\"leaf_index\":" + index +
+               ",\"leaf\":\"" + hex + "\",\"siblings\":[]}";
+    };
+
+    {
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(
+                build("18446744073709551615", "18446744073709551615"));
+        check(r.ok() && r.proof.leaf_count == kMax &&
+                      r.proof.leaf_index == kMax,
+              "leaf_count/leaf_index UINT64_MAX parse exactly");
+    }
+    {
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(build("0", "0"));
+        check(r.ok() && r.proof.leaf_count == 0 && r.proof.leaf_index == 0,
+              "leaf_count/leaf_index 0 parse exactly");
+    }
+    {
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(
+                build("18446744073709551616", "0"));
+        check(!r.ok(), "leaf_count UINT64_MAX+1 is rejected");
+    }
+}
+
+// 读取失败：返回失败与可展示原因，proof 保持默认构造，不打印。
+void test_proof_json_reject() {
+    const std::string good =
+        "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+    const std::string valid =
+        "{\"version\":1,\"root\":\"" + good +
+        "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+        "\",\"siblings\":[]}";
+
+    int cases = 0;
+    auto reject = [&](std::string_view text, std::string_view what) {
+        ++cases;
+        std::stringstream cap_out, cap_err;
+        auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+        auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(text);
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        check(!r.ok(), std::string("rejected: ") + std::string(what));
+        check(!r.error.empty(),
+              std::string("rejection gives a displayable reason: ") +
+                  std::string(what));
+        check(cap_out.str().empty() && cap_err.str().empty(),
+              std::string("reader prints nothing on failure: ") +
+                  std::string(what));
+        // 失败不提供可用的部分证明：结构保持默认构造。
+        check(r.proof.leaf_count == 0 && r.proof.leaf_index == 0 &&
+                      r.proof.siblings.empty(),
+              std::string("failed read yields no partial proof: ") +
+                  std::string(what));
+    };
+
+    // 空文本与纯空白。
+    reject("", "empty text");
+    reject("   \n\t\r  ", "whitespace-only text");
+
+    // 语法损坏。
+    reject("{", "unterminated object");
+    reject("}", "object close without open");
+    reject("{,}", "object with leading comma");
+    reject("{\"version\":1", "truncated object");
+    reject("null x", "literal followed by garbage");
+    reject("{'version':1}", "single-quoted strings are not JSON");
+    reject("{\"version\":1,}", "trailing comma in object");
+    reject("{\"version\":[1,]}", "trailing comma in array");
+    reject(
+        "{\"version\":1,\"root\":\"\x01\"}",
+        "unescaped control character in string");
+    reject(
+        "{\"version\":1,\"root\":\"\\x00\"}",
+        "invalid backslash escape");
+    reject(
+        "{\"version\":1,\"root\":\"\xff\xff\"}",
+        "malformed UTF-8 bytes in string");
+    reject("{\"version\":01}", "leading-zero number is malformed JSON");
+    reject("{\"version\":+1}", "leading plus is malformed JSON");
+    reject("{\"version\":NaN}", "NaN is not JSON");
+    reject("{\"version\":Infinity}", "Infinity is not JSON");
+    reject("tru", "truncated literal");
+
+    // 恶意深嵌套必须以普通读取失败收场，绝不能撑爆栈而结束调用方进程。
+    reject(std::string(200, '[') + std::string(200, ']'),
+           "excessively deeply nested arrays");
+    reject(std::string(200, '{') + std::string(200, '}'),
+           "excessively deeply nested objects");
+
+    // 顶层必须是对象。
+    reject("[]", "top-level array");
+    reject("null", "top-level null");
+    reject("true", "top-level boolean");
+    reject("1", "top-level number");
+    reject("\"proof\"", "top-level string");
+
+    // 对象之后除 JSON 空白外不得再有内容。
+    reject(valid + " {}", "a second object after the proof object");
+    reject(valid + "garbage", "trailing garbage after the object");
+    reject(valid + "1", "trailing number after the object");
+    reject(valid + " // comment",
+           "comment after the object is trailing content");
+    reject("{} " + valid, "an object before the proof object");
+
+    // 必填字段缺失 / 未定义字段 / 重复字段。
+    reject("{\"root\":\"" + good + "\",\"leaf_count\":3,\"leaf_index\":1,"
+              "\"leaf\":\"" + good + "\",\"siblings\":[]}",
+           "missing version");
+    reject("{\"version\":1,\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" +
+              good + "\",\"siblings\":[]}",
+           "missing root");
+    reject("{\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_index\":1,\"leaf\":\"" + good +
+              "\",\"siblings\":[]}",
+           "missing leaf_count");
+    reject("{\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf\":\"" + good +
+              "\",\"siblings\":[]}",
+           "missing leaf_index");
+    reject("{\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf_index\":1,\"siblings\":[]}",
+           "missing leaf");
+    reject("{\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+              "\"}",
+           "missing siblings");
+    reject("{\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+              "\",\"siblings\":[],\"extra\":0}",
+           "undefined top-level field");
+    reject("{\"version\":1,\"version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+              "\",\"siblings\":[]}",
+           "duplicate version field");
+    reject("{\"Version\":1,\"root\":\"" + good +
+              "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+              "\",\"siblings\":[]}",
+           "capitalized field name is undefined");
+
+    // version：只接受 JSON 整数 1。
+    auto with_version = [&](std::string v) {
+        return "{\"version\":" + v + ",\"root\":\"" + good +
+               "\",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":\"" + good +
+               "\",\"siblings\":[]}";
+    };
+    reject(with_version("0"), "version 0");
+    reject(with_version("2"), "version 2");
+    reject(with_version("-1"), "negative version");
+    reject(with_version("1.0"), "version 1.0 (fraction)");
+    reject(with_version("1e0"), "version 1e0 (exponent)");
+    reject(with_version("\"1\""), "version string \"1\"");
+    reject(with_version("true"), "version boolean");
+    reject(with_version("null"), "version null");
+    reject(with_version("[1]"), "version array");
+    reject(with_version("18446744073709551616"), "version beyond uint64");
+
+    // 计数与位置：只接受 0..UINT64_MAX 的 JSON 整数。
+    auto with_counts = [&](std::string count, std::string index) {
+        return "{\"version\":1,\"root\":\"" + good +
+               "\",\"leaf_count\":" + count + ",\"leaf_index\":" + index +
+               ",\"leaf\":\"" + good + "\",\"siblings\":[]}";
+    };
+    reject(with_counts("-1", "1"), "negative leaf_count");
+    reject(with_counts("3", "-0"), "negative zero leaf_index");
+    reject(with_counts("3.0", "1"), "fractional leaf_count");
+    reject(with_counts("3", "0.5"), "fractional leaf_index");
+    reject(with_counts("3e0", "1"), "exponent leaf_count");
+    reject(with_counts("3", "1E1"), "exponent leaf_index");
+    reject(with_counts("\"3\"", "1"), "numeric string leaf_count");
+    reject(with_counts("3", "\"1\""), "numeric string leaf_index");
+    reject(with_counts("true", "1"), "boolean leaf_count");
+    reject(with_counts("3", "false"), "boolean leaf_index");
+    reject(with_counts("null", "1"), "null leaf_count");
+    reject(with_counts("99999999999999999999999", "1"),
+           "leaf_count far beyond uint64");
+    reject(with_counts("3", "18446744073709551616"),
+           "leaf_index beyond uint64");
+
+    // 摘要：恰好 64 个小写十六进制字符。
+    auto with_fields = [&](std::string root, std::string leaf,
+                           std::string siblings) {
+        return "{\"version\":1,\"root\":" + root +
+               ",\"leaf_count\":3,\"leaf_index\":1,\"leaf\":" + leaf +
+               ",\"siblings\":" + siblings + "}";
+    };
+    reject(with_fields("\"6e34\"", "\"" + good + "\"", "[]"),
+           "digest too short");
+    reject(with_fields("\"" + good + "0\"", "\"" + good + "\"", "[]"),
+           "digest too long");
+    reject(with_fields("\"\"", "\"" + good + "\"", "[]"),
+           "empty digest");
+    {
+        std::string upper = good;
+        for (char& c : upper) {
+            if (c >= 'a' && c <= 'f') {
+                c = static_cast<char>(c - 'a' + 'A');
+            }
+        }
+        reject(with_fields("\"" + upper + "\"", "\"" + good + "\"", "[]"),
+               "uppercase hex digest");
+    }
+    {
+        std::string bad_char = good;
+        bad_char[10] = 'g';
+        reject(with_fields("\"" + bad_char + "\"", "\"" + good + "\"", "[]"),
+               "non-hex character in digest");
+    }
+    {
+        std::string odd = good;
+        odd[63] = 'G';
+        reject(with_fields("\"" + odd + "\"", "\"" + good + "\"", "[]"),
+               "uppercase trailing nibble in digest");
+    }
+    reject(with_fields("123", "\"" + good + "\"", "[]"),
+           "digest as a number");
+    reject(with_fields("null", "\"" + good + "\"", "[]"),
+           "digest as null");
+    reject(with_fields("true", "\"" + good + "\"", "[]"),
+           "digest as boolean");
+    reject(with_fields("[\"" + good + "\"]", "\"" + good + "\"", "[]"),
+           "digest as array");
+    reject(with_fields("\"" + good + "\"", "123", "[]"),
+           "leaf digest wrong type");
+
+    // siblings 与兄弟记录。
+    const std::string h = good;
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"", "{}"),
+           "siblings is an object");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"", "\"left\""),
+           "siblings is a string");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"", "1"),
+           "siblings is a number");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"", "null"),
+           "siblings is null");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[1]"),
+           "sibling entry is a number");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[\"left\"]"),
+           "sibling entry is a string");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[[]]"),
+           "sibling entry is an array");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"digest\":\"" + h + "\"}]"),
+           "sibling missing side");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"left\"}]"),
+           "sibling missing digest");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"left\",\"digest\":\"" + h +
+                           "\",\"extra\":1}]"),
+           "sibling with extra field");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"left\",\"side\":\"left\","
+                           "\"digest\":\"" + h + "\"}]"),
+           "sibling with duplicate side field");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"Left\",\"digest\":\"" + h + "\"}]"),
+           "capitalized side value");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"up\",\"digest\":\"" + h + "\"}]"),
+           "unknown side value");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"\",\"digest\":\"" + h + "\"}]"),
+           "empty side value");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":null,\"digest\":\"" + h + "\"}]"),
+           "null side");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":0,\"digest\":\"" + h + "\"}]"),
+           "numeric side");
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"left\",\"digest\":\"" +
+                           h.substr(0, 63) + "\"}]"),
+           "sibling digest one char short");
+    {
+        std::string upper = h;
+        upper[0] = 'A';
+        reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                           "[{\"side\":\"left\",\"digest\":\"" + upper +
+                               "\"}]"),
+               "sibling digest with uppercase");
+    }
+    reject(with_fields("\"" + h + "\"", "\"" + h + "\"",
+                       "[{\"side\":\"left\",\"digest\":null}]"),
+           "sibling digest null");
+
+    check(cases >= 60, "the rejection suite actually exercises many cases");
+}
+
+// 读取成功 ≠ 校验通过：格式合法但语义不成立的证明交给校验接口拒绝。
+void test_proof_json_read_is_not_verification() {
+    const Digest d = leaf_bytes(bytes_of("a"));
+    const Digest other = leaf_bytes(bytes_of("abc"));
+    const std::string hex = hex_of(d);
+
+    // 空批次声明：JSON 格式完全合法，读取成功；校验接口拒绝空批次成员。
+    {
+        const std::string text =
+            "{\"version\":1,\"root\":\"" + hex +
+            "\",\"leaf_count\":0,\"leaf_index\":0,\"leaf\":\"" + hex +
+            "\",\"siblings\":[]}";
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(text);
+        check(r.ok(), "empty-batch claim is syntactically accepted on read");
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(r.proof, d, d);
+        check(!v.ok() && !v.error.empty(),
+              "empty-batch proof is rejected by verification, not by reading");
+    }
+
+    // 位置越界声明：读取不判断位置合法性，校验拒绝。
+    {
+        const std::string text =
+            "{\"version\":1,\"root\":\"" + hex +
+            "\",\"leaf_count\":1,\"leaf_index\":1,\"leaf\":\"" + hex +
+            "\",\"siblings\":[]}";
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(text);
+        check(r.ok() && r.proof.leaf_index == 1,
+              "out-of-range index claim is preserved verbatim by the reader");
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(r.proof, d, d);
+        check(!v.ok(),
+              "leaf_index equal to leaf_count is rejected by verification");
+    }
+
+    // 证明自报的根与调用方可信根不符：读取通过，校验拒绝——可信根永远
+    // 由调用方另行提供，读取接口不替调用方选择信任锚。
+    {
+        const std::string text =
+            "{\"version\":1,\"root\":\"" + hex +
+            "\",\"leaf_count\":1,\"leaf_index\":0,\"leaf\":\"" + hex +
+            "\",\"siblings\":[]}";
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(text);
+        check(r.ok(), "self-consistent proof text reads successfully");
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(r.proof, other, d);
+        check(!v.ok(),
+              "mismatched trusted root is rejected by verification");
+    }
+
+    // 读取只消费传入文本：上面所有读入用例的摘要都是测试自行给出的常量，
+    // 与任何批次文件无关；这里再对一份不指向任何真实批次的文本确认成功，
+    // 读取接口没有文件/批次入口，也不会替调用方选择可信根。
+    {
+        const std::string text =
+            "{\"version\":1,\"root\":\"" + hex +
+            "\",\"leaf_count\":1,\"leaf_index\":0,\"leaf\":\"" + hex +
+            "\",\"siblings\":[]}\n";
+        const MerkleProofParseResult r =
+            branchaudit::merkle_proof_from_json(text);
+        check(r.ok(),
+              "reading consumes only the supplied text, no batch files");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1355,6 +1980,10 @@ int main(int argc, char** argv) {
     test_verify_failures();
     test_verify_claimed_numbers();
     test_verify_uint64_limits();
+    test_proof_json_read_success();
+    test_proof_json_uint64();
+    test_proof_json_reject();
+    test_proof_json_read_is_not_verification();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

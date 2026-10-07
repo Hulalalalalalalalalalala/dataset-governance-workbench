@@ -9,8 +9,11 @@
 // 运行成功返回 0；任一断言失败返回非零。
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -20,6 +23,10 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "filehash.h"
 #include "merkle.h"
@@ -2074,6 +2081,471 @@ void test_proof_json_unicode_escapes() {
     }
 }
 
+// ---- 命令行 prove 原文 -> 库读取 -> 成员校验 的直接回归 -------------------
+//
+// 上面的 JSON 用例只能由测试自行拼出证明文本，无法防止“库读取的格式”与
+// “prove 命令真正写到标准输出的字节”之间发生漂移。这里补上这一环：经
+// fork+execvp 实际运行命令行程序，从管道逐字节取得 prove 的完整标准输出
+// （保留原文与唯一的末尾换行，不经 shell、不做任何转换），原样交给
+// merkle_proof_from_json，再只用 (证明, 另行获得的可信根, 按 0x00 叶子规则
+// 计算的待验证内容) 调 merkle_verify_proof——校验一侧不提供整批文件。
+
+#if defined(__unix__)
+
+struct CliResult {
+    bool launched = false;   // 成功启动并正常收尸
+    int exit_code = -1;
+    std::string out;         // stdout 逐字节原样保留
+    std::string err;         // stderr 逐字节原样保留
+};
+
+// 命令行路径：CMake 以编译定义注入构建出的 branchaudit；手工运行可用
+// BRANCHAUDIT_EXE 覆盖，找不到时该组检查明确跳过而非误判通过。
+fs::path branchaudit_exe_path() {
+    if (const char* from_env = std::getenv("BRANCHAUDIT_EXE");
+        from_env != nullptr && *from_env != '\0') {
+        return fs::path{from_env};
+    }
+#ifdef BRANCHAUDIT_EXE
+    return fs::path{BRANCHAUDIT_EXE};
+#else
+    return {};
+#endif
+}
+
+bool read_fd_all(int fd, std::string& into) {
+    char buf[4096];
+    while (true) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            into.append(buf, static_cast<std::size_t>(n));
+            continue;
+        }
+        if (n == 0) {
+            return true;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+}
+
+// 实际运行 <exe> args...，stdout/stderr 分别经管道收集。证明体只有一行、
+// 成功时 stderr 为空、失败时也只有一行用法/错误文字，均远小于管道容量，
+// 故顺序读完 stdout 再读 stderr 不会死锁。
+CliResult run_cli_capture(const fs::path& exe,
+                          const std::vector<std::string>& args) {
+    CliResult result;
+    int out_pipe[2] = {-1, -1};
+    int err_pipe[2] = {-1, -1};
+    if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+        return result;
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        ::close(err_pipe[0]);
+        ::close(err_pipe[1]);
+        return result;
+    }
+
+    if (pid == 0) {
+        // 子进程：把两个管道接到 stdout/stderr 后执行真正的命令行程序。
+        ::dup2(out_pipe[1], STDOUT_FILENO);
+        ::dup2(err_pipe[1], STDERR_FILENO);
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
+        ::close(err_pipe[0]);
+        ::close(err_pipe[1]);
+
+        std::string exe_str = exe.string();
+        std::vector<std::string> storage = args;
+        std::vector<char*> argv;
+        argv.push_back(exe_str.data());
+        for (std::string& a : storage) {
+            argv.push_back(a.data());
+        }
+        argv.push_back(nullptr);
+        ::execvp(exe_str.c_str(), argv.data());
+        ::_exit(127);
+    }
+
+    ::close(out_pipe[1]);
+    ::close(err_pipe[1]);
+    const bool out_ok = read_fd_all(out_pipe[0], result.out);
+    const bool err_ok = read_fd_all(err_pipe[0], result.err);
+    ::close(out_pipe[0]);
+    ::close(err_pipe[0]);
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = ::waitpid(pid, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+    result.launched =
+        out_ok && err_ok && waited == pid && WIFEXITED(status);
+    if (result.launched) {
+        result.exit_code = WEXITSTATUS(status);
+    }
+    return result;
+}
+
+CliResult run_prove_cli(const fs::path& exe, std::uint64_t index,
+                        const std::vector<fs::path>& files) {
+    std::vector<std::string> args{"prove", std::to_string(index)};
+    for (const fs::path& f : files) {
+        args.push_back(f.string());
+    }
+    return run_cli_capture(exe, args);
+}
+
+CliResult run_root_cli(const fs::path& exe,
+                       const std::vector<fs::path>& files) {
+    std::vector<std::string> args{"root"};
+    for (const fs::path& f : files) {
+        args.push_back(f.string());
+    }
+    return run_cli_capture(exe, args);
+}
+
+// 仅测试使用：把独立依据（Python hashlib/OpenSSL）固化的 64 个小写十六进制
+// 字符还原为 32 字节，绝不取自被测库的输出。
+Digest digest_from_literal(std::string_view hex) {
+    Digest d{};
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        d[i] = static_cast<std::uint8_t>(
+            (nibble(hex[2 * i]) << 4) | nibble(hex[2 * i + 1]));
+    }
+    return d;
+}
+
+// 调库校验期间截获标准输出/错误：校验接口只返回结果，不打印、不退出。
+MerkleVerifyResult verify_quietly(const MerkleProof& proof,
+                                  const Digest& trusted_root,
+                                  const Digest& content_leaf,
+                                  std::string_view what) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    MerkleVerifyResult v =
+        branchaudit::merkle_verify_proof(proof, trusted_root, content_leaf);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    check(cap_out.str().empty() && cap_err.str().empty(),
+          std::string("verify prints nothing: ") + std::string(what));
+    return v;
+}
+
+void test_cli_proof_roundtrip() {
+    const fs::path exe = branchaudit_exe_path();
+    if (exe.empty() || !fs::exists(exe)) {
+        ++g_skipped;
+        std::cout << "SKIP: real prove output -> library read/verify "
+                     "round-trip (branchaudit executable not locatable)\n";
+        return;
+    }
+
+    TempArea tmp("cli_proof_roundtrip");
+
+    // 独立依据（Python hashlib/OpenSSL，SHA-256(0x00||data) 叶子、
+    // SHA-256(0x01||l||r) 父节点、奇数末节点原样提升）。
+    const Digest indep_empty_batch_root = digest_from_literal(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    const Digest indep_leaf_empty = digest_from_literal(
+        "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d");
+    const Digest indep_leaf_a = digest_from_literal(
+        "022a6979e6dab7aa5ae4c3e5e45f7e977112a7e63593820dbec1ec738a24f93c");
+    const Digest indep_leaf_abc = digest_from_literal(
+        "609f6e36d2405585188d5cfd761f407c7cc46a7d3f314c88270469dde315fcd1");
+    const Digest indep_leaf_hello = digest_from_literal(
+        "54a6dc1bfc990ced3f5757264f357ad708a9ee54ce3d117299641b234f6d5800");
+    const Digest indep_plain_abc = digest_from_literal(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // 五文件批次 [a, abc, 空, hello\n, abc] 的独立中间摘要与根。
+    const Digest indep_p01 = digest_from_literal(
+        "6a5c0676c6dd1efd519348f49315879d99549029726d5dd1a5dedbf700720761");
+    const Digest indep_p23 = digest_from_literal(
+        "bda74a974b773365b399173caa53ddca21a5192f093803e787bf774d21ed6651");
+    const Digest indep_q = digest_from_literal(
+        "ae395b1592efa07192377a24fc187eba186da891a39c12d3dfae9df84f0c9a93");
+    const Digest indep_five_root = digest_from_literal(
+        "d4abac6c1b56d60f14de10178f0b27880072f5ee1165de749b2ec1089259aebd");
+
+    // ---- 场景 1：单个空文件 ----------------------------------------------
+    const fs::path f_empty = tmp.root / "empty.bin";
+    write_file(f_empty, bytes_of(""));
+    const std::vector<fs::path> one{f_empty};
+
+    const CliResult one_prove = run_prove_cli(exe, 0, one);
+    check(one_prove.launched && one_prove.exit_code == 0,
+          "real prove on a single empty file exits 0");
+    check(one_prove.err.empty(),
+          "real prove on a single empty file writes nothing to stderr");
+    const std::string& one_raw = one_prove.out;
+    check(!one_raw.empty() && one_raw.back() == '\n' &&
+              one_raw.find('\n') == one_raw.size() - 1,
+          "real proof stdout is one JSON line kept verbatim with its trailing "
+          "newline");
+    check(one_raw.find("\"siblings\":[]") != std::string::npos,
+          "real single-empty-file proof text carries an empty siblings array");
+
+    // 原文（含末尾换行）直接交给库读取。
+    MerkleProofParseResult one_parsed = expect_parse_ok(
+        one_raw, "real single-empty-file prove stdout read verbatim");
+    if (one_parsed.ok()) {
+        const MerkleProof& p = one_parsed.proof;
+        check(p.leaf_count == 1 && p.leaf_index == 0,
+              "single empty file: batch count 1, zero-based position 0");
+        check(p.leaf == indep_leaf_empty && p.root == indep_leaf_empty,
+              "single empty file: root equals the SHA-256(0x00) leaf");
+        check(p.siblings.empty(),
+              "single empty file: sibling table is empty");
+        check(p.root != indep_empty_batch_root &&
+                  p.root != branchaudit::merkle_empty_root(),
+              "single empty file: root differs from the empty batch root");
+
+        // 可信根来自对同一有序批次另行运行 root 取得，而不是 proof.root。
+        const CliResult one_root = run_root_cli(exe, one);
+        check(one_root.launched && one_root.exit_code == 0 &&
+                  one_root.err.empty(),
+              "independent root command for the single file succeeds");
+        std::string one_root_hex = one_root.out;
+        check(!one_root_hex.empty() && one_root_hex.back() == '\n',
+              "independent root stdout is hex plus newline");
+        one_root_hex.pop_back();
+        check(one_root_hex.size() == 64,
+              "independent root stdout decodes as one digest line");
+        const Digest one_trusted = digest_from_literal(one_root_hex);
+        check(one_trusted == indep_leaf_empty,
+              "independently obtained root matches the hashlib leaf");
+
+        // 校验只消费证明、可信根与内存中按 0x00 叶子规则计算的内容，不给
+        // 整批文件。
+        const Digest content_leaf = leaf_bytes(bytes_of(""));
+        const MerkleVerifyResult v =
+            verify_quietly(p, one_trusted, content_leaf,
+                           "single empty file with the 0x00 leaf");
+        check(v.ok() && v.valid && v.error.empty(),
+              std::string("single empty file: real proof verifies: ") +
+                  v.error);
+
+        // 普通无 0x00 前缀的 hash 摘要不能充当待验证内容。
+        const MerkleVerifyResult plain =
+            verify_quietly(p, one_trusted, indep_empty_batch_root,
+                           "single empty file with a plain hash digest");
+        check(!plain.ok() && !plain.error.empty(),
+              "single empty file: a plain SHA-256 (empty) digest is rejected "
+              "with a non-empty reason");
+    }
+
+    // ---- 场景 2：五文件批次的最后一个位置（含连续奇数末节点提升）---------
+    // 内容在位置 1 与 4 相同（都是 "abc"），位置必须按传入顺序保留、不去重。
+    const fs::path f0 = tmp.root / "f0";
+    const fs::path f1 = tmp.root / "f1";
+    const fs::path f2 = tmp.root / "f2";
+    const fs::path f3 = tmp.root / "f3";
+    const fs::path f4 = tmp.root / "f4";
+    const std::vector<unsigned char> c0 = bytes_of("a");
+    const std::vector<unsigned char> c1 = bytes_of("abc");
+    const std::vector<unsigned char> c2 = bytes_of("");
+    const std::vector<unsigned char> c3 = bytes_of("hello\n");
+    const std::vector<unsigned char> c4 = bytes_of("abc");  // 与位置 1 相同
+    write_file(f0, c0);
+    write_file(f1, c1);
+    write_file(f2, c2);
+    write_file(f3, c3);
+    write_file(f4, c4);
+    const std::vector<fs::path> five{f0, f1, f2, f3, f4};
+
+    // 对同一有序批次另行获得可信根（独立 root 命令 + hashlib 双重核对）。
+    const CliResult five_root_run = run_root_cli(exe, five);
+    check(five_root_run.launched && five_root_run.exit_code == 0 &&
+              five_root_run.err.empty(),
+          "independent root command for the five-file batch succeeds");
+    std::string five_root_hex = five_root_run.out;
+    check(!five_root_hex.empty() && five_root_hex.back() == '\n',
+          "independent five-file root keeps its trailing newline");
+    five_root_hex.pop_back();
+    check(five_root_hex.size() == 64, "independent root is one digest line");
+    const Digest five_trusted = digest_from_literal(five_root_hex);
+    check(five_trusted == indep_five_root,
+          "independently obtained five-file root matches the hashlib value");
+
+    const CliResult last_prove = run_prove_cli(exe, 4, five);
+    check(last_prove.launched && last_prove.exit_code == 0 &&
+              last_prove.err.empty(),
+          "real prove at the five-file batch last position exits 0 silently");
+    const std::string& last_raw = last_prove.out;
+    check(!last_raw.empty() && last_raw.back() == '\n' &&
+              last_raw.find('\n') == last_raw.size() - 1,
+          "real last-position proof kept verbatim with trailing newline");
+    check(last_raw.find("\"leaf_count\":5") != std::string::npos &&
+              last_raw.find("\"leaf_index\":4") != std::string::npos,
+          "real last-position proof text states count 5 and zero-based index 4");
+
+    MerkleProofParseResult last_parsed = expect_parse_ok(
+        last_raw, "real five-file last-position prove stdout read verbatim");
+    if (last_parsed.ok()) {
+        const MerkleProof& p = last_parsed.proof;
+        check(p.leaf_count == 5 && p.leaf_index == 4,
+              "last position: count 5 and zero-based position 4 preserved");
+        check(p.root == indep_five_root,
+              "last position: root matches the independent batch root");
+        check(p.leaf == indep_leaf_abc,
+              "last position: leaf is the 0x00-prefixed leaf of its content");
+        // 5 -> 3 -> 2 -> 1：该位置在节点数为 5 和 3 的两层都是奇数末节点，
+        // 原样提升、不补记录；只剩节点数为 2 的层上一个 left 兄弟。
+        check(p.siblings.size() == 1,
+              "last position: promoted levels add no records (one sibling)");
+        check(p.siblings[0].side == MerkleSibling::Side::left &&
+                  p.siblings[0].digest == indep_q,
+              "last position: sole sibling is the left subtree digest in "
+              "leaf-to-root order");
+
+        const Digest content_leaf = leaf_bytes(c4);  // 内存内容，带 0x00 前缀
+        const MerkleVerifyResult v =
+            verify_quietly(p, five_trusted, content_leaf,
+                           "five-file last position with the 0x00 leaf");
+        check(v.ok() && v.valid && v.error.empty(),
+              std::string("last position: verbatim real proof verifies: ") +
+                  v.error);
+
+        // proof.root 自报值不充当信任来源：可信根换成空批次根即拒绝。
+        const MerkleVerifyResult wrong_anchor =
+            verify_quietly(p, indep_empty_batch_root, content_leaf,
+                           "last position against an untrusted root");
+        check(!wrong_anchor.ok() && !wrong_anchor.error.empty(),
+              "last position: proof.root cannot serve as the trust anchor");
+
+        // 普通无 0x00 前缀摘要不能替代待验证内容。
+        check(indep_plain_abc != indep_leaf_abc,
+              "plain SHA-256(abc) differs from the 0x00-prefixed leaf");
+        const MerkleVerifyResult plain =
+            verify_quietly(p, five_trusted, indep_plain_abc,
+                           "last position with a plain hash digest");
+        check(!plain.ok() && !plain.error.empty(),
+              "last position: plain SHA-256(abc) is rejected with a reason");
+    }
+
+    // ---- 相同内容各占独立位置：读取后均可校验，形状随位置不同 -------------
+    {
+        const CliResult first_dup = run_prove_cli(exe, 1, five);
+        check(first_dup.launched && first_dup.exit_code == 0 &&
+                  first_dup.err.empty(),
+              "real prove at position 1 (duplicate content) succeeds");
+        MerkleProofParseResult p1 = expect_parse_ok(
+            first_dup.out, "real position-1 proof read verbatim");
+        MerkleProofParseResult p4 = expect_parse_ok(
+            last_raw, "real position-4 proof re-read for duplicate check");
+        if (p1.ok() && p4.ok()) {
+            check(p1.proof.leaf == p4.proof.leaf &&
+                      p1.proof.leaf == indep_leaf_abc,
+                  "duplicate-content entries keep the same leaf digest");
+            check(p1.proof.leaf_index == 1 && p4.proof.leaf_index == 4,
+                  "positions are preserved by input order, not deduplicated");
+            check(p1.proof.siblings.size() == 3 &&
+                      p4.proof.siblings.size() == 1,
+                  "the two duplicate-content positions keep distinct paths");
+            // 位置 1 从叶子向根：left=L0、right=P23、right=L4。
+            check(p1.proof.siblings[0].side == MerkleSibling::Side::left &&
+                      p1.proof.siblings[0].digest == indep_leaf_a &&
+                      p1.proof.siblings[1].side == MerkleSibling::Side::right &&
+                      p1.proof.siblings[1].digest == indep_p23 &&
+                      p1.proof.siblings[2].side == MerkleSibling::Side::right &&
+                      p1.proof.siblings[2].digest == indep_leaf_abc,
+                  "position 1 keeps left/right/right siblings in leaf-to-root "
+                  "order");
+            // 两个位置用同一份内容叶子与同一可信根都能通过。
+            const Digest dup_leaf = leaf_bytes(c1);
+            check(verify_quietly(p1.proof, five_trusted, dup_leaf,
+                                 "duplicate content at position 1").ok(),
+                  "position-1 proof verifies with the shared content leaf");
+            check(verify_quietly(p4.proof, five_trusted, dup_leaf,
+                                 "duplicate content at position 4").ok(),
+                  "position-4 proof verifies with the same shared content leaf");
+        }
+    }
+
+    // ---- 失败 1：完整真实证明 + 改变过的待验证内容 ------------------------
+    // 读取仍然成功；成员校验明确拒绝并给出非空原因。
+    {
+        MerkleProofParseResult parsed = expect_parse_ok(
+            last_raw, "re-read real proof before altered-content verification");
+        if (parsed.ok()) {
+            const Digest altered_leaf = leaf_bytes(bytes_of("abc!"));
+            check(altered_leaf != indep_leaf_abc,
+                  "altered content yields a different leaf");
+            const MerkleVerifyResult v =
+                verify_quietly(parsed.proof, five_trusted, altered_leaf,
+                               "real proof with altered content");
+            check(!v.ok() && !v.valid && !v.error.empty(),
+                  "altered content: proof still parses, but membership is "
+                  "rejected with a non-empty reason");
+        }
+    }
+
+    // ---- 失败 2：把真实证明文本截断到对象或字符串未闭合 -------------------
+    // 读取失败、原因非空，且不留下可当作输入的部分证明。
+    {
+        check(last_raw.size() >= 3 &&
+                  last_raw[last_raw.size() - 1] == '\n' &&
+                  last_raw[last_raw.size() - 2] == '}' &&
+                  last_raw[last_raw.size() - 3] == ']',
+              "real proof ends with the siblings array close, object close "
+              "and newline");
+
+        // 去掉对象闭合 '}' 与换行：兄弟数组已闭合、证明对象未闭合。
+        std::string object_unclosed = last_raw;
+        object_unclosed.resize(object_unclosed.size() - 2);
+        check(!object_unclosed.empty() && object_unclosed.back() == ']',
+              "truncation leaves the array closed but the object open");
+        expect_parse_fail(object_unclosed,
+                          "real proof truncated so the JSON object is "
+                          "unterminated");
+
+        // 在 leaf 摘要字符串中间截断：字符串引号未闭合。
+        const std::string marker = "\"leaf\":\"";
+        const std::size_t at = last_raw.find(marker);
+        check(at != std::string::npos,
+              "real proof contains the leaf digest string");
+        const std::size_t cut = at + marker.size() + 8;  // 64 个摘要字符只留 8 个
+        check(cut < last_raw.size(), "truncation point lies inside the string");
+        const std::string string_unclosed = last_raw.substr(0, cut);
+        expect_parse_fail(string_unclosed,
+                          "real proof truncated so a JSON string is "
+                          "unterminated");
+
+        // 失败结果没有可用的部分证明，不能再拿去校验。
+        MerkleProofParseResult failed =
+            branchaudit::merkle_proof_from_json(object_unclosed);
+        check(!failed.ok() && !failed.error.empty(),
+              "truncated real proof: read fails with a non-empty reason");
+        check(failed.proof.leaf_count == 0 && failed.proof.leaf_index == 0 &&
+                  failed.proof.siblings.empty(),
+              "truncated real proof: no usable partial proof is returned");
+    }
+}
+
+#else  // !__unix__
+
+// 非 POSIX 平台无 fork/exec：明确跳过这组“命令行原文 -> 库”回归，
+// 其余 merkle 检查照常执行（与故障注入检查的跳过处理一致）。
+void test_cli_proof_roundtrip() {
+    ++g_skipped;
+    std::cout << "SKIP: real prove output -> library read/verify round-trip "
+                 "(fork/exec is not available on this platform)\n";
+}
+
+#endif  // __unix__
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -2135,6 +2607,7 @@ int main(int argc, char** argv) {
     test_verify_uint64_limits();
     test_proof_json();
     test_proof_json_unicode_escapes();
+    test_cli_proof_roundtrip();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

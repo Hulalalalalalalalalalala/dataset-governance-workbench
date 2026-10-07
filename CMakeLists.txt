@@ -65,6 +65,11 @@ if(BRANCHAUDIT_BUILD_TESTS)
     target_link_libraries(merkle_test PRIVATE branchaudit_core)
     target_compile_definitions(merkle_test PRIVATE
         BRANCHAUDIT_FAULT_INJECTION=$<BOOL:${BRANCHAUDIT_FAULT_INJECTION}>)
+    # “命令行 prove 原文 -> 库读取 -> 成员校验”回归需要在测试进程内实际
+    # 执行命令行程序：把可执行文件路径以编译定义注入（跨配置生成器也能取到
+    # 真实路径）；手工运行时可用环境变量 BRANCHAUDIT_EXE 覆盖。
+    target_compile_definitions(merkle_test PRIVATE
+        BRANCHAUDIT_EXE="$<TARGET_FILE:branchaudit>")
     add_test(NAME merkle_unit COMMAND merkle_test)
     set_tests_properties(merkle_unit PROPERTIES TIMEOUT 30)
 

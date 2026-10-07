@@ -238,7 +238,7 @@ if (r.ok()) {
 ## 在 C++20 程序中校验成员证明
 
 证明生成通常在掌握整个批次的一方完成；持有证明的一方只需三样东西就能判断
-“某份内容是否受到这份证明支持”，无须重新提供或读取整个批次：
+“某份内容是否受到可信根支持”，无须重新提供或读取整个批次：
 
 1. 生成接口返回的 `MerkleProof`；
 2. **调用方另行持有的可信批次根摘要**（32 个原始字节）；
@@ -266,34 +266,160 @@ branchaudit::Digest content_leaf =
 branchaudit::MerkleVerifyResult v =
     branchaudit::merkle_verify_proof(proof, trusted_root, content_leaf);
 if (v.ok()) {
-    // 内容位于证明声明的位置，且受到可信根支持。
+    // 内容叶子确实受到可信根支持：proof.leaf 等于该内容的叶子摘要，
+    // 且兄弟记录能把它折叠回调用方传入的可信根。
+    // 注意：通过本身并不认证批次大小与位置——leaf_count/leaf_index
+    // 是证明自报的数字，校验只核对兄弟记录与这组数字自洽（见下文
+    // “通过结果保证什么、不保证什么”）。
 } else {
     // v.error 是可供直接展示给用户的失败原因（英文一句话）。
 }
 ```
 
-典型用法是把 `root` 输出的可信根（通过独立渠道获得）与待验证内容的叶子
-摘要分别传入；下面的例子演示两份摘要各自从何而来：
+### 通过结果保证什么、不保证什么
+
+`merkle_verify_proof` 通过时，可以保证的是：**传入的内容叶子摘要受到
+可信根支持**——证明中的叶子等于该内容的叶子摘要，且兄弟记录能按公开
+字节规则把它逐层折叠回调用方传入的可信根。
+
+不能保证的是：证明自报的 `leaf_count` 与 `leaf_index` 就是原始批次的
+真实大小与位置。校验只能核对兄弟记录与证明自报的这两个数字**自洽**
+（方向、数量、次序符合这组数字描述的位置）；当用户手里只有外部可信根、
+待验证内容和收到的证明时，三项输入里没有任何东西能把这两个数字锚定到
+原始批次。因此“内容位于批次位置 2”这类位置结论，只有在调用方另行确认
+`leaf_count`/`leaf_index` 之后才成立（见下文“需要确认位置时”）。
+
+下面的完整示例（C++20，链接 `branchaudit_core` 即可编译运行）演示这
+一点：三份不同内容的文件按固定顺序组成批次，为从零开始的位置 2 生成
+证明，可信根来自另行计算的同一批次，内容叶子来自被选文件。原证明正常
+通过后，仅把证明自报的 `leaf_count` 改为 2、`leaf_index` 改为 1，根、
+叶子与兄弟记录原样保留——在相同可信根和内容叶子下，校验仍然通过：
 
 ```cpp
-// ① 可信根：与生成证明无关的一次独立批次根计算（实际中常是提前保存、
-//    经其他渠道核对的常量），而不是 proof.root。
-std::vector<std::filesystem::path> batch{"/path/a", "/path/b", "/path/c"};
-branchaudit::Digest trusted_root =
-    branchaudit::merkle_root_files(batch).digest;
+// g++ -std=c++20 -Isrc demo.cpp build/libbranchaudit_core.a
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+#include <vector>
 
-// ② 证明：由掌握批次的一方生成（这里在同一进程演示；真正使用时 proof
-//    往往从 JSON 等外部来源反序列化得到）。
-branchaudit::MerkleProof proof =
-    branchaudit::merkle_proof_file(batch, /*leaf_index=*/2).proof;
+#include "merkle.h"
 
-// ③ 内容叶子：只对待验证的那一份内容计算，带单个 0x00 前缀。
-branchaudit::Digest content_leaf =
-    branchaudit::merkle_leaf(/*data=*/..., /*size=*/...);
+int main() {
+    namespace fs = std::filesystem;
 
-// 三样东西齐备后校验，不需要再次提供 /path/a 等整个批次。
+    // 三份不同内容的文件，按固定顺序组成批次。
+    const fs::path dir = fs::temp_directory_path() / "branchaudit_verify_demo";
+    fs::create_directories(dir);
+    const std::vector<fs::path> batch{dir / "a.bin", dir / "b.bin",
+                                      dir / "c.bin"};
+    const char* contents[] = {"alpha", "beta", "gamma"};
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        std::ofstream out(batch[i], std::ios::binary | std::ios::trunc);
+        out << contents[i];
+    }
+
+    // ① 可信根：与证明无关、另行计算的同一批次根。实际部署中它通常经
+    //    独立渠道保存与核对；绝不能把证明自报的 root 字段当作可信根。
+    branchaudit::FileHashResult root_result =
+        branchaudit::merkle_root_files(batch);
+    if (!root_result.ok()) {
+        std::cerr << "root failed: " << root_result.error << '\n';
+        return 1;
+    }
+    const branchaudit::Digest trusted_root = root_result.digest;
+
+    // ② 证明：由掌握批次的一方为从零开始的位置 2 生成（这里在同一进程
+    //    演示；真正使用时 proof 往往从 JSON 等外部来源反序列化得到）。
+    branchaudit::MerkleProofResult proof_result =
+        branchaudit::merkle_proof_file(batch, /*leaf_index=*/2);
+    if (!proof_result.ok()) {
+        std::cerr << "prove failed: " << proof_result.error << '\n';
+        return 1;
+    }
+    const branchaudit::MerkleProof proof = proof_result.proof;
+
+    // ③ 内容叶子：来自被选文件（位置 2 的 c.bin）的全部字节，按叶子
+    //    规则 SHA-256(0x00 || content) 计算。
+    std::ifstream in(batch[2], std::ios::binary);
+    const std::string selected{std::istreambuf_iterator<char>(in),
+                               std::istreambuf_iterator<char>()};
+    const branchaudit::Digest content_leaf = branchaudit::merkle_leaf(
+        reinterpret_cast<const unsigned char*>(selected.data()),
+        selected.size());
+
+    // 第一次校验：原证明（leaf_count=3, leaf_index=2）。
+    const branchaudit::MerkleVerifyResult original =
+        branchaudit::merkle_verify_proof(proof, trusted_root, content_leaf);
+    std::cout << "original:   leaf_count=" << proof.leaf_count
+              << " leaf_index=" << proof.leaf_index << " -> "
+              << (original.ok() ? "PASS" : "FAIL") << '\n';
+
+    // 第二次校验：仅把证明自报的 leaf_count 改为 2、leaf_index 改为 1，
+    // 根、叶子与兄弟记录原样保留。
+    branchaudit::MerkleProof renumbered = proof;
+    renumbered.leaf_count = 2;
+    renumbered.leaf_index = 1;
+    const branchaudit::MerkleVerifyResult renumbered_result =
+        branchaudit::merkle_verify_proof(renumbered, trusted_root,
+                                         content_leaf);
+    std::cout << "renumbered: leaf_count=" << renumbered.leaf_count
+              << " leaf_index=" << renumbered.leaf_index << " -> "
+              << (renumbered_result.ok() ? "PASS" : "FAIL") << '\n';
+    return 0;
+}
+```
+
+输出：
+
+```text
+original:   leaf_count=3 leaf_index=2 -> PASS
+renumbered: leaf_count=2 leaf_index=1 -> PASS
+```
+
+两次通过各自能得出的结论：
+
+- 第一次：内容叶子受到可信根支持，且兄弟记录与“3 条目批次的位置 2”
+  自洽。`leaf_count`/`leaf_index` 来自掌握批次的一方正常生成的证明，
+  通常可据此认定位置——但这份信任来自对生成方的信任，不是校验函数
+  赋予的。
+- 第二次：只能得出**内容叶子仍受到同一可信根支持**。根、叶子、兄弟
+  记录一个字节都没变，变的只是证明自报的两个数字；而位置 2 的兄弟
+  摘要恰好等于前两片叶子的父摘要，与“2 条目批次的位置 1”所需要的
+  兄弟记录形状（左侧一个兄弟）正好相容，所以结构核对同样通过。这次
+  通过**不能**解释成文件移动到了位置 1、原批次其实只有两个条目，或
+  证明它原本就位于位置 1。
+
+只改声明数字也并非总能通过：越界位置（`leaf_index >= leaf_count`）
+或与兄弟记录的方向、数量、次序不符的声明，仍会被现有校验拒绝。例如
+把这份证明的 `leaf_index` 改成 0（该位置要求右侧兄弟，而记录里是左侧）
+或把 `leaf_count` 改成 4（位置 2 在该形状下同样要求右侧兄弟），校验
+都失败。
+
+### 需要确认位置时：与独立保存的批次信息比对
+
+如果业务要求确认文件属于一个条目数已知的批次并处于指定位置，调用方
+必须把批次大小与预期位置同可信根一起**独立保存**（例如在同一可信渠道
+记录 `leaf_count=3`、预期位置 `2`），并在库校验之外自行比对：
+
+```cpp
+// 与可信根一起经独立渠道保存的批次信息。
+const std::uint64_t expected_leaf_count = 3;
+const std::uint64_t expected_leaf_index = 2;
+
 branchaudit::MerkleVerifyResult v =
     branchaudit::merkle_verify_proof(proof, trusted_root, content_leaf);
+
+if (proof.leaf_count != expected_leaf_count ||
+    proof.leaf_index != expected_leaf_index) {
+    // 证明自报的大小/位置与独立保存的信息不一致：明确拒绝位置认定。
+    // 即使 v.ok() 为真，也不能显示“位置验证成功”。
+} else if (v.ok()) {
+    // 数字一致且库校验通过：可以说明该内容受到指定位置的支持。
+} else {
+    // v.error 说明失败原因。
+}
 ```
 
 只有以下条件**同时**成立才判定通过（任一不满足都返回失败原因）：
@@ -304,8 +430,8 @@ branchaudit::MerkleVerifyResult v =
   摘要；即使一份证明内部完全自洽，换成另一批次的可信根也会失败；
 - 证明的兄弟摘要能按公开的 `SHA-256(0x01||left||right)` 字节规则，从
   内容叶子逐层折叠回可信根；
-- 兄弟的**方向、数量与从叶子向根的次序**严格符合 `leaf_count` 与
-  `leaf_index` 描述的位置，而不是只看最终摘要是否相等：
+- 兄弟的**方向、数量与从叶子向根的次序**严格符合证明自报的
+  `leaf_count` 与 `leaf_index` 描述的位置，而不是只看最终摘要是否相等：
   - 空批次（`leaf_count == 0`）没有成员；位置必须从 0 开始且
     `leaf_index < leaf_count`；
   - 每个兄弟的方向只能是 `left` 或 `right`；缺项、多项、方向反了、次序
@@ -315,6 +441,11 @@ branchaudit::MerkleVerifyResult v =
   - 单文件批次只接受位置 `0` 和空兄弟列表；空文件的叶子
     `SHA-256(0x00)` 与空批次根不同，两者不能互相冒充；重复内容仍各占
     独立位置，按位置结构核对，不按摘要去重。
+
+这些条件全部针对证明自报的数字做一致性核对：通过不代表
+`leaf_count`/`leaf_index` 等于原始批次的真实大小与位置（见上文
+“通过结果保证什么、不保证什么”）；可信根不符、内容叶子不符时
+失败的结论不受影响。
 
 `leaf_count`/`leaf_index` 沿用无符号 64 位范围。校验只做**不回绕**的
 整数层推导（上层大小用 `n - n/2` 而非可能回绕的 `(n+1)/2`，末节点判断

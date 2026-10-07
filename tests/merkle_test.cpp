@@ -1842,6 +1842,238 @@ void test_proof_json() {
     }
 }
 
+// ---- Unicode 转义：写法不同但解码后等价的证明 JSON --------------------------
+
+// 把 ASCII 字符 c 写成 JSON \u00XX 转义形式（小写十六进制）。
+std::string json_unicode_escape(char c) {
+    const char* hex = "0123456789abcdef";
+    const unsigned char u = static_cast<unsigned char>(c);
+    std::string e = "\\u00";
+    e += hex[u >> 4];
+    e += hex[u & 0xF];
+    return e;
+}
+
+// 字段名第 i 个字符改用 \u00XX 转义，其余字符保持普通写法（两种写法混用）。
+std::string escape_name_char(const std::string& name, std::size_t i) {
+    return name.substr(0, i) + json_unicode_escape(name[i]) +
+           name.substr(i + 1);
+}
+
+// 十六进制文本中的字母全部改写成 \u00XX 转义，数字保持原样：解码后与原
+// 字符串完全相同，但字面写法与长度都不同。
+std::string escape_hex_letters(const std::string& hex_text) {
+    std::string out;
+    for (char c : hex_text) {
+        if (c >= 'a' && c <= 'f') {
+            out += json_unicode_escape(c);
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+void test_proof_json_unicode_escapes() {
+    TempArea tmp("proof_json_escape");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto empty = bytes_of("");
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_empty = tmp.root / "empty.bin";
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_empty, empty);
+
+    const Digest la = leaf_bytes(a);
+    const Digest labc = leaf_bytes(abc);
+    const Digest lempty = leaf_bytes(empty);
+
+    // 三文件批次位置 1 的证明：两个兄弟，左右各一，两种方向值都被覆盖。
+    const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+    const Digest trusted_root = root_of(batch);
+    const MerkleProofResult generated = branchaudit::merkle_proof_file(batch, 1);
+    check(generated.ok(),
+          std::string("escape fixture proof generated: ") + generated.error);
+    const MerkleProof& gp = generated.proof;
+    check(gp.siblings.size() == 2 &&
+              gp.siblings[0].side == MerkleSibling::Side::left &&
+              gp.siblings[1].side == MerkleSibling::Side::right,
+          "escape fixture proof has one left and one right sibling");
+
+    // ---- 成功：字段名、方向值与摘要中的部分字符写成 \u00XX 转义 -----------
+    // 顶层字段名、兄弟记录字段名、left/right 与根/叶子/兄弟摘要都混用普通
+    // 字符与转义写法；两条兄弟记录各自出现 side/digest 属于正常格式（即使
+    // 一条用转义名、另一条也用转义名，跨记录不算重复）。末尾换行一并接受。
+    const std::string escaped =
+        "{\"" + escape_name_char("version", 1) + "\":1,"
+        "\"" + escape_name_char("root", 2) + "\":\"" +
+            escape_hex_letters(hex_of(gp.root)) + "\","
+        "\"" + escape_name_char("leaf_count", 5) + "\":" +
+            std::to_string(gp.leaf_count) + ","
+        "\"" + escape_name_char("leaf_index", 9) + "\":" +
+            std::to_string(gp.leaf_index) + ","
+        "\"" + escape_name_char("leaf", 0) + "\":\"" +
+            escape_hex_letters(hex_of(gp.leaf)) + "\","
+        "\"" + escape_name_char("siblings", 7) + "\":["
+        "{\"" + escape_name_char("side", 3) + "\":\"lef" +
+            json_unicode_escape('t') + "\","
+        "\"" + escape_name_char("digest", 0) + "\":\"" +
+            escape_hex_letters(hex_of(gp.siblings[0].digest)) + "\"},"
+        "{\"" + escape_name_char("side", 0) + "\":\"" +
+            json_unicode_escape('r') + "ight\","
+        "\"" + escape_name_char("digest", 5) + "\":\"" +
+            escape_hex_letters(hex_of(gp.siblings[1].digest)) + "\"}]}\n";
+
+    MerkleProofParseResult r = expect_parse_ok(
+        escaped, "unicode escapes in field names, side values and digests");
+    if (r.ok()) {
+        const MerkleProof& p = r.proof;
+        check(p.root == gp.root && p.leaf == gp.leaf,
+              "escaped form decodes to the same 32-byte root and leaf");
+        check(p.leaf_count == gp.leaf_count && p.leaf_index == gp.leaf_index,
+              "escaped form keeps batch size and position");
+        check(p.siblings.size() == gp.siblings.size(),
+              "escaped form keeps sibling count");
+        for (std::size_t i = 0; i < p.siblings.size(); ++i) {
+            check(p.siblings[i].side == gp.siblings[i].side &&
+                      p.siblings[i].digest == gp.siblings[i].digest,
+                  "escaped form keeps sibling side/digest/order at " +
+                      std::to_string(i));
+        }
+        // 用同一份独立保存的可信根与内容叶子校验：与普通写法结果相同。
+        MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(p, trusted_root, labc);
+        check(v.ok(), std::string("escaped-form proof verifies against the "
+                                  "trusted root like the plain form: ") +
+                          v.error);
+        // 读取成功仍只代表格式正确：换一份内容叶子照样被校验拒绝。
+        check(!branchaudit::merkle_verify_proof(p, trusted_root, la).ok(),
+              "escaped-form parse is not membership: wrong content leaf "
+              "rejected by merkle_verify_proof");
+    }
+
+    // ---- 摘要规则按解码后的内容判断，不按转义文字的长度 ---------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        const std::string marker = "\"root\":\"";
+        const auto at = good.find(marker) + marker.size();
+        const std::string root_hex = hex_of(la);
+        auto replace_root = [&](const std::string& replacement,
+                                const std::string& label) {
+            std::string t = good;
+            t.replace(at, root_hex.size(), replacement);
+            expect_parse_fail(t, label);
+        };
+        // 解码后 63 个字符：转义写法字面长达 68 字符，仍按解码长度判失败。
+        replace_root(json_unicode_escape(root_hex[1]) + root_hex.substr(2),
+                     "digest decoding to 63 chars rejected despite a "
+                     "longer escaped literal");
+        // 解码后 65 个字符。
+        replace_root(root_hex + "\\u0061",
+                     "digest decoding to 65 chars rejected");
+        // 解码后出现大写字符：不能因使用转义而被接受。
+        replace_root("\\u0041" + root_hex.substr(1),
+                     "escaped uppercase hex letter in digest rejected");
+        // 解码后出现非十六进制字符。
+        replace_root("\\u0067" + root_hex.substr(1),
+                     "escaped non-hex letter in digest rejected");
+
+        // 兄弟摘要同样按解码内容判断。
+        const std::string with_sib = proof_json(
+            branchaudit::merkle_parent(la, labc), 2, 0, la,
+            {{MerkleSibling::Side::right, labc}});
+        std::string sib_upper = with_sib;
+        const std::string needle = "\"digest\":\"";
+        const auto sib_digest_at = sib_upper.find(needle);
+        check(sib_digest_at != std::string::npos,
+              "sibling digest fixture contains digest field");
+        sib_upper.replace(sib_digest_at + needle.size(), 1,
+                          "\\u0046");  // 首字符解码为大写 'F'
+        expect_parse_fail(sib_upper,
+                          "escaped uppercase letter in sibling digest");
+    }
+
+    // ---- 重复字段按解码后的名字识别 -----------------------------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        const std::string root_hex = hex_of(la);
+        // 顶层：普通 "root" 与转义写法的等价名字同现，值完全相同也失败。
+        expect_parse_fail(good.substr(0, good.size() - 1) +
+                              ",\"r\\u006fot\":\"" + root_hex + "\"}",
+                          "top-level duplicate root via escaped field name "
+                          "(identical value)");
+        expect_parse_fail(good.substr(0, good.size() - 1) +
+                              ",\"l\\u0065af\":\"" + root_hex + "\"}",
+                          "top-level duplicate leaf via escaped field name");
+
+        // 单条兄弟记录内同样按解码后的名字判重。
+        const std::string sib = proof_json(
+            branchaudit::merkle_parent(la, labc), 2, 0, la,
+            {{MerkleSibling::Side::right, labc}});
+        std::string t = sib;
+        const std::string side_field = "\"side\":\"right\"";
+        const auto at2 = t.find(side_field);
+        check(at2 != std::string::npos, "sibling fixture contains side field");
+        t.replace(at2, side_field.size(),
+                  side_field + ",\"sid\\u0065\":\"right\"");
+        expect_parse_fail(t, "sibling entry duplicate side via escaped name "
+                             "(identical value)");
+
+        std::string t2 = sib;
+        const std::string digest_field = "\"digest\":\"" + hex_of(labc) + "\"";
+        const auto at3 = t2.find(digest_field);
+        check(at3 != std::string::npos,
+              "sibling fixture contains digest field");
+        t2.replace(at3, digest_field.size(),
+                   digest_field + ",\"d\\u0069gest\":\"" + hex_of(labc) +
+                       "\"");
+        expect_parse_fail(t2, "sibling entry duplicate digest via escaped "
+                              "name");
+    }
+
+    // ---- 损坏的 Unicode 转义：明确失败，不丢弃片段、不替换字符 --------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        auto replace_once = [&](const std::string& from, const std::string& to,
+                                const std::string& label) {
+            std::string t = good;
+            const auto at = t.find(from);
+            check(at != std::string::npos,
+                  std::string("escape fixture contains: ") + from);
+            t.replace(at, from.size(), to);
+            expect_parse_fail(t, label);
+        };
+        // 字段名中 \u 后的四位十六进制不完整（第三位就是结束引号）。
+        replace_once("\"root\"", "\"r\\u00\"",
+                     "truncated \\u escape in field name");
+        // \u 后含非法十六进制字符。
+        replace_once("\"root\"", "\"\\u00g0ot\"",
+                     "non-hex character in \\u escape");
+
+        // 摘要值中的代理项未正确配对。
+        const std::string marker = "\"root\":\"";
+        const auto at = good.find(marker) + marker.size();
+        const std::string root_hex = hex_of(la);
+        auto corrupt_root = [&](const std::string& replacement,
+                                const std::string& label) {
+            std::string t = good;
+            t.replace(at, root_hex.size(), replacement);
+            expect_parse_fail(t, label);
+        };
+        corrupt_root("\\uD800" + root_hex.substr(1),
+                     "lone high surrogate in digest");
+        corrupt_root("\\uDC00" + root_hex.substr(1),
+                     "lone low surrogate in digest");
+        corrupt_root("\\uD800\\u0041" + root_hex.substr(2),
+                     "high surrogate followed by a non-surrogate escape");
+        // 转义序列在输入末尾被截断。
+        expect_parse_fail(good.substr(0, at) + "\\u12",
+                          "\\u escape cut off at end of input");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -1902,6 +2134,7 @@ int main(int argc, char** argv) {
     test_verify_claimed_numbers();
     test_verify_uint64_limits();
     test_proof_json();
+    test_proof_json_unicode_escapes();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

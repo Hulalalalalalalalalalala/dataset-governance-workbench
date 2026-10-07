@@ -68,6 +68,16 @@ if(BRANCHAUDIT_BUILD_TESTS)
     add_test(NAME merkle_unit COMMAND merkle_test)
     set_tests_properties(merkle_unit PROPERTIES TIMEOUT 30)
 
+    # 命令行 → 库端到端回归：证明文本逐字节来自真实 prove 命令的标准输出
+    # （含末尾换行），可信根来自对同一有序批次另行执行的 root 命令，再经
+    # merkle_proof_from_json 读取、merkle_verify_proof 校验。
+    add_executable(proof_cli_test tests/proof_cli_test.cpp)
+    target_link_libraries(proof_cli_test PRIVATE branchaudit_core)
+    target_compile_definitions(proof_cli_test PRIVATE
+        BRANCHAUDIT_CLI="$<TARGET_FILE:branchaudit>")
+    add_test(NAME proof_cli_roundtrip COMMAND proof_cli_test)
+    set_tests_properties(proof_cli_roundtrip PROPERTIES TIMEOUT 30)
+
     if(BRANCHAUDIT_FAULT_INJECTION)
         target_compile_definitions(sha256_test PRIVATE
             BRANCHAUDIT_FAULT_LIB="$<TARGET_FILE:branchaudit_fault>")

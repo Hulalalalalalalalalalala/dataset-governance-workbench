@@ -1007,6 +1007,152 @@ void test_verify_failures() {
     }
 }
 
+// ---- 通过结论的边界：声明数字可被等价改写，内容与可信根仍被强制核对 --------
+//
+// 固定 README“通过结论的边界”一节公开的结论：三份不同内容按固定顺序组成
+// 批次，为从 0 开始的位置 2 生成证明；可信根由对同一批次另行的一次根计算
+// 取得（绝不拿 proof.root 回喂），内容叶子按现有单个 0x00 前缀规则计算。
+// 仅把证明自报的 leaf_count/leaf_index 3/2 改成 2/1，根、叶子、兄弟摘要与
+// 兄弟方向原样保留，校验仍必须通过——通过只说明内容受可信根支持、兄弟记录
+// 与新的声明自洽，绝不认证这两个数字（不能据此断言原批次少了一个文件，或
+// 第三个文件被认证为位置 1）。相邻的拒绝边界在此一并固定：声明位置与保留
+// 兄弟方向冲突、可信根不符、内容叶子不符，都必须 valid 为假并给出非空原因。
+void test_verify_claimed_numbers() {
+    TempArea tmp("verify_claims");
+    const auto jan = bytes_of("january");
+    const auto feb = bytes_of("february");
+    const auto mar = bytes_of("march");
+    const fs::path f_jan = tmp.root / "report-jan.bin";
+    const fs::path f_feb = tmp.root / "report-feb.bin";
+    const fs::path f_mar = tmp.root / "report-mar.bin";
+    write_file(f_jan, jan);
+    write_file(f_feb, feb);
+    write_file(f_mar, mar);
+
+    const std::vector<fs::path> batch{f_jan, f_feb, f_mar};
+
+    // 可信根独立于证明保存：对同一批次另行计算，而不是取 proof.root。
+    const Digest trusted = root_of(batch);
+    // 第三个文件（位置 2）按现有规则计算的内容叶子 SHA-256(0x00 || content)。
+    const Digest mar_leaf = leaf_bytes(mar);
+
+    const MerkleProofResult pr =
+        branchaudit::merkle_proof_file(batch, /*leaf_index=*/2);
+    check(pr.ok(), std::string("claimed-numbers fixture proof: ") + pr.error);
+    const MerkleProof proof = pr.proof;
+
+    // 夹具形状：位置 2 在三条目批次首层是奇数末节点，原样提升、不补兄弟
+    // 记录；只在上层记录一个 left 兄弟，摘要为前两份内容叶子的父节点。
+    check(proof.leaf_count == 3 && proof.leaf_index == 2,
+          "claimed-numbers fixture: proof self-reports count 3, index 2");
+    check(proof.leaf == mar_leaf,
+          "claimed-numbers fixture: proof leaf is the third file's 0x00 leaf");
+    check(proof.root == trusted,
+          "claimed-numbers fixture: generated root equals the independently "
+          "computed trusted root");
+    check(proof.siblings.size() == 1 &&
+                  proof.siblings[0].side == MerkleSibling::Side::left &&
+                  proof.siblings[0].digest ==
+                      branchaudit::merkle_parent(leaf_bytes(jan), leaf_bytes(feb)),
+          "claimed-numbers fixture: odd last node promoted without a sibling; "
+          "a single left sibling remains at the upper level");
+
+    // 原证明在独立可信根与第三文件内容叶子下通过：valid 为真、error 为空。
+    {
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(proof, trusted, mar_leaf);
+        check(v.ok() && v.valid && v.error.empty(),
+              "original proof (count=3, index=2) verifies: valid is true and "
+              "error is empty");
+    }
+
+    // 只改证明自报的两个数字：leaf_count 3→2、leaf_index 2→1；根、叶子、
+    // 兄弟摘要与兄弟方向全部保持原样。
+    MerkleProof altered = proof;
+    altered.leaf_count = 2;
+    altered.leaf_index = 1;
+    check(altered.root == proof.root && altered.leaf == proof.leaf &&
+                  altered.siblings.size() == proof.siblings.size() &&
+                  altered.siblings[0].side == proof.siblings[0].side &&
+                  altered.siblings[0].digest == proof.siblings[0].digest,
+          "altered proof differs from the original only in the two claimed "
+          "numbers");
+
+    // 位置 2 在三条目批次的首层被原样提升（无兄弟记录），其兄弟路径形状与
+    // “两条目批次的位置 1”完全相同：同一份根、叶子与兄弟记录对两组声明都
+    // 自洽。这种“声明数字改变、证明仍成立”的输入不能被误判为损坏。
+    {
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(altered, trusted, mar_leaf);
+        check(v.ok() && v.valid && v.error.empty(),
+              "altered claims (count=2, index=1) still verify against the same "
+              "trusted root and content leaf: valid is true, error is empty");
+    }
+
+    // 通过不认证这两个数字：随可信根独立保存的批次事实仍是 3 个条目、
+    // 位置 2。真正要确认批次大小/位置的调用方必须另行比对证明自报数字，
+    // 校验通过代替不了它——原证明的声明与独立事实相符，改写后的不符。
+    const auto claims_match_independent_fact = [](const MerkleProof& p) {
+        return p.leaf_count == 3 && p.leaf_index == 2;
+    };
+    check(claims_match_independent_fact(proof),
+          "the genuine proof's claims match the independently stored batch "
+          "fact (count 3, index 2)");
+    check(!claims_match_independent_fact(altered),
+          "the altered claims differ from the independent fact even though "
+          "verify passes: success is not a certification of count or position");
+
+    auto reject = [&](const MerkleProof& p, const Digest& root,
+                      const Digest& leaf, std::string_view what) {
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(p, root, leaf);
+        check(!v.ok() && !v.valid && !v.error.empty(), what);
+    };
+
+    // 拒绝边界 1：在改写后的证明上只把位置 1→0，其余输入不动。两条目批次
+    // 的位置 0 在首层需要 right 兄弟，而保留下来的唯一兄弟是 left——声明
+    // 位置与保留兄弟方向不符，必须失败。这守住位置结构检查，防止为了让
+    // “等价改写”通过而放松方向核对。
+    {
+        MerkleProof wrong_pos = altered;
+        wrong_pos.leaf_index = 0;
+        reject(wrong_pos, trusted, mar_leaf,
+               "altered proof with only the position changed to 0 is rejected: "
+               "a 2-leaf position 0 requires a right sibling, conflicting with "
+               "the retained left sibling");
+    }
+
+    // 拒绝边界 2：仍然自洽的改写证明换用不匹配的可信根也必须失败；声明
+    // 数字的等价性不能绕过可信根核对。
+    {
+        // 顺序不同的另一份批次（内容相同、排列改变）产生另一个根。
+        const Digest reordered_root = root_of({f_jan, f_mar, f_feb});
+        check(reordered_root != trusted,
+              "fixture: reordered batch yields a different root");
+        reject(altered, reordered_root, mar_leaf,
+               "altered proof fails against another batch's trusted root");
+        Digest flipped = trusted;
+        flipped[0] ^= 0x01;
+        reject(altered, flipped, mar_leaf,
+               "altered proof fails against a trusted root differing by one "
+               "bit");
+    }
+
+    // 拒绝边界 3：同一份改写证明配另一份内容的叶子（同样带单个 0x00
+    // 前缀）也必须失败；声明数字的等价性不能绕过内容核对。
+    {
+        reject(altered, trusted, leaf_bytes(jan),
+               "altered proof fails with another content's 0x00-prefixed leaf");
+        // 普通文件摘要（无 0x00 前缀）同样不能借等价改写混入。
+        branchaudit::Sha256 plain;
+        plain.update(reinterpret_cast<const unsigned char*>(mar.data()),
+                     mar.size());
+        reject(altered, trusted, plain.final(),
+               "altered proof rejects a plain file digest without the 0x00 "
+               "leaf prefix");
+    }
+}
+
 // ---- 64 位计数边界：纯结构推导，不按 leaf_count 分配内存 --------------------
 
 // 沿 (leaf_count, leaf_index) 计算生成端会记录的兄弟数与各层期望侧向，
@@ -1207,6 +1353,7 @@ int main(int argc, char** argv) {
     test_proofs();
     test_verify_success();
     test_verify_failures();
+    test_verify_claimed_numbers();
     test_verify_uint64_limits();
 
     if (g_failures == 0) {

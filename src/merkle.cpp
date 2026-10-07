@@ -85,6 +85,17 @@ std::vector<Digest> combine_level(const std::vector<Digest>& level) {
 // 规则自由；重复字段、未知字段与对象之后的多余内容一律判错。解析器只
 // 扫描传入文本，不做任何文件或内存映射 I/O。
 
+// 各类对象在对象正文语法错误上使用的既有提示文字。顶层证明对象与每条
+// 兄弟记录共用同一套正文读取流程（见 JsonParser::parse_object_body），
+// 两者唯一的差别就是这些上下文用词，错误文字必须逐字保持兼容。
+struct ObjectSyntaxText {
+    std::string_view expected_key;    // 字段名位置不是字符串
+    std::string_view colon_prefix;    // 缺少 ':'：前缀，后接字段名
+    std::string_view colon_suffix;    // 缺少 ':'：字段名后的后缀
+    std::string_view unterminated;    // 等不到右花括号
+    std::string_view expected_comma;  // 字段后既不是 ',' 也不是 '}'
+};
+
 struct JsonParser {
     std::string_view text;
     std::size_t pos = 0;
@@ -338,6 +349,64 @@ struct JsonParser {
         }
         return read_string(out);
     }
+
+    // 读取一个 JSON 对象的正文（起始 '{' 已被调用方消费，或由
+    // parse_object 代为消费）。正文的结构规则对顶层证明对象与每条兄弟
+    // 记录完全一致，因此只在此维护一份：
+    //   * 允许 "{}" 空对象（必填字段是否齐全由调用方在回调中自行核对）；
+    //   * 字段名按解码后的字符串识别（"root" 与 "root" 同名）；
+    //   * 字段名后必须紧跟 ':'，字段值由调用方提供的 read_value 读取；
+    //   * 字段之间以 ',' 分隔，读到 '}' 结束；
+    //   * 键重复、未定义键以及分隔符损坏都在此或经 read_value 判错。
+    //
+    // read_value 在 ':' 之后被调用（其位置已做过 ws()），接收解码后的
+    // 字段名；读取成功返回真，失败返回假并已通过 fail 记下第一条原因。
+    // 仅当 read_value 成功时本函数才会接受 '}'/',' 分隔符。
+    template <typename ReadValue>
+    bool parse_object_body(const ObjectSyntaxText& syn, ReadValue read_value) {
+        ws();
+        if (!eof() && peek() == '}') {
+            ++pos;
+            return true;  // 空对象；必填字段由调用方另行核对。
+        }
+        while (error.empty()) {
+            ws();
+            if (eof() || peek() != '"') {
+                return fail(std::string(syn.expected_key));
+            }
+            std::string key;
+            if (!read_string(key)) {
+                return false;
+            }
+            ws();
+            if (eof() || peek() != ':') {
+                return fail(std::string(syn.colon_prefix) + key +
+                            std::string(syn.colon_suffix));
+            }
+            ++pos;
+
+            // ':' 之后允许空白；具体字段值的读取与类型/重复/未定义判定
+            // 全部交给调用方，保持各字段自己的错误文字。
+            if (!read_value(key)) {
+                return false;
+            }
+
+            ws();
+            if (eof()) {
+                return fail(std::string(syn.unterminated));
+            }
+            if (peek() == '}') {
+                ++pos;
+                return true;
+            }
+            if (peek() != ',') {
+                return fail(std::string(syn.expected_comma));
+            }
+            ++pos;
+            // 逗号之后必须出现另一个字段名；循环回到顶部做该检查。
+        }
+        return false;
+    }
 };
 
 // 把恰好 64 个小写十六进制字符还原为 32 字节摘要。长度不符、含非十六
@@ -386,71 +455,62 @@ bool read_digest_value(JsonParser& p, Digest& out, std::string_view field) {
 // 解析一个兄弟对象：只允许 side 与 digest 两个字段，均必填、不得重复、
 // 不得出现其他字段。调用时 p 已停在起始 '{' 之后的位置。
 bool parse_sibling_object(JsonParser& p, MerkleSibling& sibling) {
+    // 与顶层证明对象共用 parse_object_body；只有这些上下文提示用词不同。
+    static constexpr ObjectSyntaxText kSyntax{
+        "expected string key in sibling object",
+        "expected ':' after sibling object key \"",
+        "\"",
+        "unterminated sibling object",
+        "expected ',' or '}' in sibling object",
+    };
     bool have_side = false;
     bool have_digest = false;
-    p.ws();
-    if (!p.eof() && p.peek() == '}') {
-        ++p.pos;
-        return p.fail("a siblings entry must contain \"side\" and \"digest\"");
-    }
-    while (true) {
-        p.ws();
-        if (p.eof() || p.peek() != '"') {
-            return p.fail("expected string key in sibling object");
-        }
-        std::string key;
-        if (!p.read_string(key)) {
-            return false;
-        }
-        p.ws();
-        if (p.eof() || p.peek() != ':') {
-            return p.fail("expected ':' after sibling object key \"" + key +
-                          "\"");
-        }
-        ++p.pos;
 
-        if (key == "side") {
-            if (have_side) {
-                return p.fail("duplicate field \"side\" in a siblings entry");
-            }
-            std::string side;
-            if (!p.read_string_value(side, "side")) {
-                return false;
-            }
-            if (side == "left") {
-                sibling.side = MerkleSibling::Side::left;
-            } else if (side == "right") {
-                sibling.side = MerkleSibling::Side::right;
+    // 字段识别、重复与未定义判定以及值读取都在回调里，保持每条字段各自
+    // 既有的错误文字；对象正文的键/冒号/逗号/花括号流程只有共享的一份。
+    const bool body_ok =
+        p.parse_object_body(kSyntax, [&](const std::string& key) -> bool {
+            if (key == "side") {
+                if (have_side) {
+                    return p.fail(
+                        "duplicate field \"side\" in a siblings entry");
+                }
+                std::string side;
+                if (!p.read_string_value(side, "side")) {
+                    return false;
+                }
+                if (side == "left") {
+                    sibling.side = MerkleSibling::Side::left;
+                } else if (side == "right") {
+                    sibling.side = MerkleSibling::Side::right;
+                } else {
+                    return p.fail(
+                        "sibling side must be \"left\" or \"right\"");
+                }
+                have_side = true;
+            } else if (key == "digest") {
+                if (have_digest) {
+                    return p.fail(
+                        "duplicate field \"digest\" in a siblings entry");
+                }
+                if (!read_digest_value(p, sibling.digest, "digest")) {
+                    return false;
+                }
+                have_digest = true;
             } else {
-                return p.fail("sibling side must be \"left\" or \"right\"");
+                return p.fail("undefined field \"" + key +
+                              "\" in a siblings entry (only \"side\" and "
+                              "\"digest\" are allowed)");
             }
-            have_side = true;
-        } else if (key == "digest") {
-            if (have_digest) {
-                return p.fail("duplicate field \"digest\" in a siblings entry");
-            }
-            if (!read_digest_value(p, sibling.digest, "digest")) {
-                return false;
-            }
-            have_digest = true;
-        } else {
-            return p.fail("undefined field \"" + key +
-                          "\" in a siblings entry (only \"side\" and "
-                          "\"digest\" are allowed)");
-        }
-
-        p.ws();
-        if (p.eof()) {
-            return p.fail("unterminated sibling object");
-        }
-        if (p.peek() == '}') {
-            ++p.pos;
-            break;
-        }
-        if (p.peek() != ',') {
-            return p.fail("expected ',' or '}' in sibling object");
-        }
-        ++p.pos;
+            return true;
+        });
+    if (!body_ok) {
+        return false;
+    }
+    // 空对象与只给一个字段是两种既有提示，分别保持原文。
+    if (!have_side && !have_digest) {
+        return p.fail(
+            "a siblings entry must contain \"side\" and \"digest\"");
     }
     if (!have_side || !have_digest) {
         return p.fail("a siblings entry must contain both \"side\" and "
@@ -733,6 +793,16 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
                                     kLeafIndex | kLeaf | kSiblings;
     unsigned seen = 0;
 
+    // 顶层证明对象与每条兄弟记录共用同一套对象正文读取流程；这里提供顶层
+    // 的上下文提示用词与六个版本 1 字段的读取规则。
+    static constexpr ObjectSyntaxText kSyntax{
+        "expected a string field name in proof object",
+        "expected ':' after proof object field \"",
+        "\"",
+        "unterminated proof object",
+        "expected ',' or '}' in proof object",
+    };
+
     p.ws();
     if (p.eof()) {
         result.error =
@@ -746,29 +816,10 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
         return result;
     }
     ++p.pos;
-    p.ws();
 
-    // 空对象（"{}"）不进入字段循环，直接落到后面的必填字段检查。
-    if (!p.eof() && p.peek() == '}') {
-        ++p.pos;
-    } else {
-        while (p.error.empty()) {
-        p.ws();
-        if (p.eof() || p.peek() != '"') {
-            p.fail("expected a string field name in proof object");
-            break;
-        }
-        std::string key;
-        if (!p.read_string(key)) {
-            break;
-        }
-        p.ws();
-        if (p.eof() || p.peek() != ':') {
-            p.fail("expected ':' after proof object field \"" + key + "\"");
-            break;
-        }
-        ++p.pos;
-
+    // 空对象（"{}"）同样进入 parse_object_body 直接闭合，随后落到必填字段
+    // 检查。字段识别、重复/未定义判定与值读取都在回调中，保持既有文字。
+    p.parse_object_body(kSyntax, [&](const std::string& key) -> bool {
         unsigned bit = 0;
         if (key == "version") {
             bit = kVersion;
@@ -786,69 +837,53 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
             p.fail("undefined field \"" + key + "\" in proof object (version 1 "
                    "defines only version, root, leaf_count, leaf_index, leaf "
                    "and siblings)");
-            break;
+            return false;
         }
         if (seen & bit) {
             p.fail("duplicate field \"" + key + "\" in proof object");
-            break;
+            return false;
         }
 
         if (bit == kVersion) {
             std::uint64_t version = 0;
             if (!p.read_uint64(version, "version")) {
-                break;
+                return false;
             }
             if (version != 1) {
                 p.fail("unsupported proof version " +
                        std::to_string(version) + " (only version 1 is "
                        "supported)");
-                break;
+                return false;
             }
         } else if (bit == kRoot) {
             if (!read_digest_value(p, proof.root, "root")) {
-                break;
+                return false;
             }
         } else if (bit == kLeafCount) {
             if (!p.read_uint64(proof.leaf_count, "leaf_count")) {
-                break;
+                return false;
             }
         } else if (bit == kLeafIndex) {
             if (!p.read_uint64(proof.leaf_index, "leaf_index")) {
-                break;
+                return false;
             }
         } else if (bit == kLeaf) {
             if (!read_digest_value(p, proof.leaf, "leaf")) {
-                break;
+                return false;
             }
         } else {  // kSiblings
             p.ws();
             if (p.eof() || p.peek() != '[') {
                 p.fail("field \"siblings\" must be a JSON array");
-                break;
+                return false;
             }
             if (!parse_siblings_array(p, proof.siblings)) {
-                break;
+                return false;
             }
         }
         seen |= bit;
-
-        p.ws();
-        if (p.eof()) {
-            p.fail("unterminated proof object");
-            break;
-        }
-        if (p.peek() == '}') {
-            ++p.pos;
-            break;
-        }
-        if (p.peek() != ',') {
-            p.fail("expected ',' or '}' in proof object");
-            break;
-        }
-        ++p.pos;
-        // 逗号之后要求另一个字段名；循环回到顶部做该检查。
-        }
-    }
+        return true;
+    });
 
     if (p.error.empty()) {
         // 对象之后除 JSON 空白外不得再有任何内容：不能只取前半段当作成功。

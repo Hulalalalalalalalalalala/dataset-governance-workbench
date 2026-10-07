@@ -232,6 +232,40 @@ if (r.ok()) {
 `merkle_proof_file` 遵循与命令行相同的批次、配对与失败规则，只返回结构化
 结果，不打印、不退出进程。
 
+拿到证明后，调用方可用 `merkle_verify_proof` 判断某份内容是否受到该证明
+支持——无须重新提供或读取整个批次，只需三份各自独立的输入：证明本身、
+调用方另行持有的**可信批次根摘要**，以及待验证内容按叶子规则算出的
+**内容叶子摘要**：
+
+```cpp
+#include "merkle.h"
+
+// 可信根来自调用方自己的渠道（例如此前保存的 merkle_root_files 结果），
+// 不能取自 proof.root 充当信任依据。
+branchaudit::Digest trusted_root = /* 调用方持有的可信批次根 */;
+
+// 内容叶子摘要按叶子规则 SHA-256(0x00||data) 计算——用 merkle_leaf，
+// 不能用 hash 功能输出的普通文件摘要（无 0x00 前缀）代替。
+const std::string content = /* 待验证内容的全部原始字节 */;
+branchaudit::Digest content_leaf = branchaudit::merkle_leaf(
+    reinterpret_cast<const unsigned char*>(content.data()), content.size());
+
+branchaudit::MerkleVerifyResult v =
+    branchaudit::merkle_verify_proof(proof, trusted_root, content_leaf);
+if (v.ok()) {
+    // 内容受到这份证明支持。
+} else {
+    // v.error 给出可供展示的原因（叶子不符、根不符、兄弟结构不符等）。
+}
+```
+
+校验通过需同时满足：内容叶子摘要与 `proof.leaf` 一致；`proof.root` 与
+可信根一致；`proof.siblings` 按公开字节规则从叶子折回可信根；且兄弟的
+方向、数量与从叶子向根的次序同 `leaf_count`/`leaf_index` 描述的位置结构
+完全相符（奇数末节点原样提升的层没有兄弟记录，无须补齐）。空批次没有
+成员；`leaf_count` 取遍无符号 64 位范围都有确定结果。该函数只消费这三
+项输入并返回结构化结果，不打印、不退出进程。
+
 ## 测试
 
 随仓库提供自动回归测试，覆盖标准测试向量、空文件/文本/二进制内容、分组与
@@ -248,7 +282,12 @@ Linux 执行，其他平台明确跳过，见下文）；`root` 还覆盖 `0x00`
 十六进制摘要、从叶子向根的兄弟序列与 `left`/`right` 侧向）、与 `root`
 结果一致的根、单文件与单空文件的空兄弟表、跨层奇数提升不记录兄弟、重复
 路径的位置区分、位置参数的缺失/非数字/超范围/越界用法错误、文件错误不
-输出部分证明，以及 `--` 结束标记与连字符文件名的处理。预期摘要与证明以
+输出部分证明，以及 `--` 结束标记与连字符文件名的处理；证明校验
+（`merkle_verify_proof`）覆盖各批次形状与全部位置的通过路径、普通
+`hash` 摘要不能充当内容叶子、换用另一批次可信根或改写 `proof.root`
+均失败、空批次无成员、位置越界、单文件批次只接受空兄弟列表、兄弟
+缺失/多出/方向或次序不符、奇数提升层被补齐记录、重复内容按位置区分，
+以及 `leaf_count` 取 `UINT64_MAX` 时的确定结果。预期摘要与证明以
 独立标准实现（FIPS 180-4 公布向量、系统
 `sha256sum` 与 Python `hashlib`/OpenSSL）为依据，不与本项目实现互相比较。
 

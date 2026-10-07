@@ -150,4 +150,92 @@ MerkleProofResult merkle_proof_file(
     return result;
 }
 
+MerkleVerifyResult merkle_verify_proof(
+        const MerkleProof& proof,
+        const Digest& trusted_root,
+        const Digest& content_leaf) {
+    MerkleVerifyResult result;
+
+    // 结构：空批次没有任何成员；位置必须落在批次内。
+    if (proof.leaf_count == 0) {
+        result.error = "proof declares an empty batch (leaf_count 0), "
+                       "which has no members";
+        return result;
+    }
+    if (proof.leaf_index >= proof.leaf_count) {
+        result.error = "leaf index " + std::to_string(proof.leaf_index) +
+                       " out of range for batch of " +
+                       std::to_string(proof.leaf_count) + " leaf(s)";
+        return result;
+    }
+
+    // 内容摘要必须与证明叶子一致（调用方按 0x00 前缀叶子规则计算）。
+    if (content_leaf != proof.leaf) {
+        result.error = "content leaf digest does not match the proof leaf";
+        return result;
+    }
+
+    // 可信根由调用方独立提供：证明声明的根必须与之相等。
+    if (proof.root != trusted_root) {
+        result.error = "proof root does not match the trusted root";
+        return result;
+    }
+
+    // 沿 leaf_index 从叶子向根逐层走：每层期望的兄弟有无与方向完全由
+    // leaf_count/leaf_index 决定——偶数下标且有右邻时兄弟在右，奇数下标
+    // 时兄弟在左，奇数层末节点原样提升、该层没有兄弟。兄弟缺失、方向
+    // 不符或末尾多出记录都不通过。层数至多 64 层，leaf_count 取
+    // UINT64_MAX 时 idx+1 与层规模减半都不会回绕，循环必然终止。
+    std::uint64_t level_size = proof.leaf_count;
+    std::uint64_t idx = proof.leaf_index;
+    auto next_sibling = proof.siblings.begin();
+    Digest node = proof.leaf;
+    while (level_size > 1) {
+        if (idx % 2 == 0) {
+            if (idx + 1 < level_size) {
+                if (next_sibling == proof.siblings.end()) {
+                    result.error =
+                        "proof is missing a required right sibling";
+                    return result;
+                }
+                if (next_sibling->side != MerkleSibling::Side::right) {
+                    result.error =
+                        "sibling side mismatch: expected a right sibling";
+                    return result;
+                }
+                node = merkle_parent(node, next_sibling->digest);
+                ++next_sibling;
+            }
+            // 奇数层末节点：原样提升，该层不存在兄弟，不消费记录。
+        } else {
+            if (next_sibling == proof.siblings.end()) {
+                result.error = "proof is missing a required left sibling";
+                return result;
+            }
+            if (next_sibling->side != MerkleSibling::Side::left) {
+                result.error =
+                    "sibling side mismatch: expected a left sibling";
+                return result;
+            }
+            node = merkle_parent(next_sibling->digest, node);
+            ++next_sibling;
+        }
+        idx /= 2;
+        level_size = level_size / 2 + (level_size % 2);
+    }
+    if (next_sibling != proof.siblings.end()) {
+        result.error = "proof has more siblings than the position requires";
+        return result;
+    }
+
+    // 兄弟按公开字节规则必须折回调用方持有的可信根。
+    if (node != trusted_root) {
+        result.error = "siblings do not fold back to the trusted root";
+        return result;
+    }
+
+    result.valid = true;
+    return result;
+}
+
 }  // namespace branchaudit

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -686,7 +687,278 @@ void test_proofs() {
     }
 }
 
-// ---- 大文件：流式读取、尾部敏感 -------------------------------------------
+// ---- 成员证明校验：可信根、内容叶子、兄弟结构 ------------------------------
+
+void test_verify() {
+    TempArea tmp("verify");
+
+    const auto empty = bytes_of("");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto hello = bytes_of("hello\n");
+
+    const fs::path f_empty = tmp.root / "empty.bin";
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_hello = tmp.root / "hello.bin";
+    write_file(f_empty, empty);
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_hello, hello);
+
+    const Digest la = leaf_bytes(a);
+    const Digest labc = leaf_bytes(abc);
+    const Digest lempty = leaf_bytes(empty);
+
+    auto verify = [](const branchaudit::MerkleProof& p,
+                     const Digest& trusted_root,
+                     const Digest& content_leaf) {
+        return branchaudit::merkle_verify_proof(p, trusted_root, content_leaf);
+    };
+
+    // 合法证明在多种批次形状与每个位置上都通过：可信根来自
+    // merkle_root_files，内容叶子由 merkle_leaf 按 0x00 前缀规则计算。
+    {
+        const std::vector<std::vector<fs::path>> batches = {
+            {f_a},
+            {f_empty},
+            {f_a, f_abc},
+            {f_a, f_abc, f_empty},
+            {f_a, f_abc, f_empty, f_hello},
+            {f_a, f_abc, f_empty, f_hello, f_a},
+            {f_a, f_a},
+        };
+        std::vector<std::vector<std::vector<unsigned char>>> contents;
+        for (const auto& batch : batches) {
+            std::vector<std::vector<unsigned char>> leaves;
+            for (const fs::path& p : batch) {
+                const std::string name = p.filename().string();
+                if (name == "a.bin") leaves.push_back(a);
+                else if (name == "empty.bin") leaves.push_back(empty);
+                else if (name == "abc.bin") leaves.push_back(abc);
+                else leaves.push_back(hello);
+            }
+            contents.push_back(std::move(leaves));
+        }
+        for (std::size_t b = 0; b < batches.size(); ++b) {
+            const Digest trusted = root_of(batches[b]);
+            for (std::uint64_t i = 0; i < batches[b].size(); ++i) {
+                const branchaudit::MerkleProofResult pr =
+                    branchaudit::merkle_proof_file(batches[b], i);
+                check(pr.ok(), "verify fixture: proof generated");
+                const Digest content_leaf = branchaudit::merkle_leaf(
+                    contents[b][i].data(), contents[b][i].size());
+                const branchaudit::MerkleVerifyResult v =
+                    verify(pr.proof, trusted, content_leaf);
+                check(v.ok(), "verify batch " + std::to_string(b) +
+                                  " index " + std::to_string(i) +
+                                  ": passes (" + v.error + ")");
+                check(v.error.empty(), "verify pass: no error text");
+            }
+        }
+    }
+
+    // 库接口不打印、不退出。
+    {
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file({f_a, f_abc}, 0);
+        std::stringstream cap_out, cap_err;
+        auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+        auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+        branchaudit::MerkleVerifyResult v =
+            verify(pr.proof, root_of({f_a, f_abc}), la);
+        branchaudit::MerkleVerifyResult bad =
+            verify(pr.proof, root_of({f_a, f_abc}), labc);
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        check(v.ok() && !bad.ok(), "verify silent fixture: results as expected");
+        check(cap_out.str().empty() && cap_err.str().empty(),
+              "verify library: prints nothing, does not exit");
+    }
+
+    // 内容摘要不符：普通 hash（无 0x00 前缀）不能充当内容叶子。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc};
+        const Digest trusted = root_of(batch);
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file(batch, 0);
+        branchaudit::Sha256 plain;
+        const unsigned char a_byte = 'a';
+        plain.update(&a_byte, 1);
+        const Digest plain_a = plain.final();
+        const branchaudit::MerkleVerifyResult v =
+            verify(pr.proof, trusted, plain_a);
+        check(!v.ok(), "verify: plain hash digest is not a content leaf");
+        check(v.error.find("leaf") != std::string::npos,
+              "verify content mismatch: reason mentions the leaf");
+        check(!verify(pr.proof, trusted, labc).ok(),
+              "verify: another file's leaf is rejected");
+    }
+
+    // 可信根独立传入：证明内部自洽也不足以通过——换成另一批次的可信根
+    // 必须失败；把 proof.root 改成另一批次的根同样失败（兄弟折不回它）。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+        const std::vector<fs::path> other{f_hello, f_a};
+        const Digest trusted = root_of(batch);
+        const Digest other_root = root_of(other);
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file(batch, 2);
+        check(pr.ok() && verify(pr.proof, trusted, lempty).ok(),
+              "verify fixture: self-consistent proof passes with its root");
+        const branchaudit::MerkleVerifyResult v =
+            verify(pr.proof, other_root, lempty);
+        check(!v.ok(), "verify: trusted root of another batch fails");
+        check(v.error.find("root") != std::string::npos,
+              "verify wrong root: reason mentions the root");
+        branchaudit::MerkleProof forged = pr.proof;
+        forged.root = other_root;
+        check(!verify(forged, other_root, lempty).ok(),
+              "verify: rewriting proof.root does not authenticate "
+              "(siblings do not fold to it)");
+    }
+
+    // 空批次没有成员；位置必须从零开始并落在批次内。
+    {
+        branchaudit::MerkleProof p;
+        p.leaf_count = 0;
+        p.leaf_index = 0;
+        p.leaf = lempty;
+        p.root = branchaudit::merkle_empty_root();
+        check(!verify(p, branchaudit::merkle_empty_root(), lempty).ok(),
+              "verify: empty batch has no members");
+        // 空批次根也不能被“空文件叶子”冒认为成员。
+        check(!verify(p, branchaudit::merkle_empty_root(),
+                      branchaudit::merkle_empty_root())
+                   .ok(),
+              "verify: empty batch root itself is not a member");
+
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file({f_a, f_abc}, 1);
+        branchaudit::MerkleProof out = pr.proof;
+        out.leaf_index = 2;
+        check(!verify(out, root_of({f_a, f_abc}), labc).ok(),
+              "verify: leaf_index outside the batch fails");
+        out.leaf_index = 1;
+        out.leaf_count = 1;
+        check(!verify(out, root_of({f_a, f_abc}), labc).ok(),
+              "verify: shrinking leaf_count below the index fails");
+    }
+
+    // 单文件批次：只接受位置零与空兄弟列表；空文件叶子区别于空批次根。
+    {
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file({f_empty}, 0);
+        check(pr.ok() && verify(pr.proof, lempty, lempty).ok(),
+              "verify single empty file: passes (root is its leaf)");
+        check(!verify(pr.proof, branchaudit::merkle_empty_root(), lempty).ok(),
+              "verify single empty file: empty batch root is not its root");
+        branchaudit::MerkleProof extra = pr.proof;
+        extra.siblings.push_back(
+            {branchaudit::MerkleSibling::Side::right, la});
+        check(!verify(extra, lempty, lempty).ok(),
+              "verify single file: any sibling record is rejected");
+    }
+
+    // 兄弟结构：方向、数量、从叶子向根的次序都必须与位置相符。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+        const Digest trusted = root_of(batch);
+
+        // 位置 2：奇数末节点原样提升的层没有兄弟，只记上层一个左侧兄弟。
+        const branchaudit::MerkleProofResult pr =
+            branchaudit::merkle_proof_file(batch, 2);
+        check(pr.ok() && pr.proof.siblings.size() == 1,
+              "verify structure fixture: promoted level has no record");
+        check(verify(pr.proof, trusted, lempty).ok(),
+              "verify: omitted promoted-level sibling passes as generated");
+
+        // 人为给提升层补齐记录（复制末节点）必须失败。
+        branchaudit::MerkleProof padded = pr.proof;
+        padded.siblings.insert(
+            padded.siblings.begin(),
+            {branchaudit::MerkleSibling::Side::right, lempty});
+        check(!verify(padded, trusted, lempty).ok(),
+              "verify: padding the promoted level with a record fails");
+
+        // 缺少必要项。
+        branchaudit::MerkleProof missing = pr.proof;
+        missing.siblings.clear();
+        check(!verify(missing, trusted, lempty).ok(),
+              "verify: missing required sibling fails");
+
+        // 方向不符。
+        branchaudit::MerkleProof flipped = pr.proof;
+        flipped.siblings[0].side = branchaudit::MerkleSibling::Side::right;
+        check(!verify(flipped, trusted, lempty).ok(),
+              "verify: wrong sibling side fails");
+
+        // 多出项。
+        branchaudit::MerkleProof extra = pr.proof;
+        extra.siblings.push_back(
+            {branchaudit::MerkleSibling::Side::left, la});
+        check(!verify(extra, trusted, lempty).ok(),
+              "verify: extra sibling record fails");
+
+        // 次序不符（从叶子向根的两项对调）。
+        const branchaudit::MerkleProofResult pr0 =
+            branchaudit::merkle_proof_file(batch, 0);
+        check(pr0.ok() && pr0.proof.siblings.size() == 2,
+              "verify order fixture: two siblings");
+        branchaudit::MerkleProof swapped = pr0.proof;
+        std::swap(swapped.siblings[0], swapped.siblings[1]);
+        check(!verify(swapped, trusted, la).ok(),
+              "verify: siblings out of leaf-to-root order fail");
+
+        // 兄弟摘要被篡改：折不回可信根。
+        branchaudit::MerkleProof tampered = pr0.proof;
+        tampered.siblings[0].digest = lempty;
+        check(!verify(tampered, trusted, la).ok(),
+              "verify: tampered sibling digest fails");
+    }
+
+    // 重复内容保持各自位置：两份证明叶子相同，结构按位置区分，
+    // 交换兄弟方向不能蒙混。
+    {
+        const std::vector<fs::path> batch{f_a, f_a};
+        const Digest trusted = root_of(batch);
+        const branchaudit::MerkleProofResult r0 =
+            branchaudit::merkle_proof_file(batch, 0);
+        const branchaudit::MerkleProofResult r1 =
+            branchaudit::merkle_proof_file(batch, 1);
+        check(verify(r0.proof, trusted, la).ok() &&
+                  verify(r1.proof, trusted, la).ok(),
+              "verify repeated content: each position passes on its own");
+        branchaudit::MerkleProof swapped = r0.proof;
+        swapped.siblings[0].side = branchaudit::MerkleSibling::Side::left;
+        check(!verify(swapped, trusted, la).ok(),
+              "verify repeated content: mirrored side fails at position 0");
+    }
+
+    // 无符号 64 位边界的 leaf_count：必须给出确定结果，不回绕、不终止不能。
+    {
+        const std::uint64_t kMax =
+            std::numeric_limits<std::uint64_t>::max();
+        branchaudit::MerkleProof p;
+        p.leaf_count = kMax;
+        p.leaf_index = kMax - 1;  // 最后一个位置
+        p.leaf = la;
+        p.root = la;
+        // 结构要求的兄弟缺失：确定地失败并给出原因，而不是回绕或挂起。
+        const branchaudit::MerkleVerifyResult v = verify(p, la, la);
+        check(!v.ok(), "verify: leaf_count = UINT64_MAX yields a "
+                       "determinate result");
+        check(v.error.find("sibling") != std::string::npos,
+              "verify UINT64_MAX: fails on missing structural sibling");
+
+        // 位置越界（leaf_index == leaf_count）在最大计数下同样确定失败。
+        p.leaf_index = kMax;
+        check(!verify(p, la, la).ok(),
+              "verify: leaf_index == leaf_count == UINT64_MAX fails");
+    }
+}
+
+
 
 void test_large_files() {
     TempArea tmp("large");
@@ -741,6 +1013,7 @@ int main(int argc, char** argv) {
     }
     test_large_files();
     test_proofs();
+    test_verify();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

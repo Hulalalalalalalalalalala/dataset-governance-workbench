@@ -85,4 +85,34 @@ struct MerkleProofResult {
 MerkleProofResult merkle_proof_file(
     const std::vector<std::filesystem::path>& paths, std::uint64_t leaf_index);
 
+// merkle_verify_proof 的结果：通过时 valid 为 true、error 为空；
+// 不通过时 valid 为 false，error 给出可供调用方展示的原因。
+struct MerkleVerifyResult {
+    bool valid = false;
+    std::string error;
+
+    bool ok() const { return valid; }
+};
+
+// 用可信根与内容叶子摘要校验一份成员证明，判断该内容是否受到证明支持。
+//
+// 三项输入各自独立：proof 来自 merkle_proof_file（或按同一规则构造）；
+// trusted_root 是调用方另行持有的可信批次根摘要，不能取自 proof.root
+// 充当信任依据；content_leaf 是待验证内容按叶子规则 SHA-256(0x00||data)
+// 算出的摘要（可用 merkle_leaf 计算），不能用 hash 功能的普通文件摘要
+// 代替。整个批次无须重新提供或读取。
+//
+// 通过需同时满足：content_leaf 与 proof.leaf 一致；proof.root 与
+// trusted_root 一致；proof.siblings 按公开字节规则（父节点
+// SHA-256(0x01||left||right)、奇数末节点原样提升）从叶子折回
+// trusted_root；且兄弟的方向、数量与从叶子向根的次序同 leaf_count 和
+// leaf_index 描述的位置结构完全相符——缺少必要项、多出项或方向不符
+// 均不通过。空批次（leaf_count 为 0）没有成员；leaf_index 必须落在
+// 批次内。leaf_count 取遍无符号 64 位范围都有确定结果，不会回绕或
+// 不终止。只返回结果，不打印、不退出进程。
+MerkleVerifyResult merkle_verify_proof(
+    const MerkleProof& proof,
+    const Digest& trusted_root,
+    const Digest& content_leaf);
+
 }  // namespace branchaudit

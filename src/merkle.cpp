@@ -1,5 +1,10 @@
 #include "merkle.h"
 
+#include <charconv>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -71,6 +76,425 @@ std::vector<Digest> combine_level(const std::vector<Digest>& level) {
         next.push_back(level.back());
     }
     return next;
+}
+
+// ---- prove 版本 1 JSON 的严格读取 -----------------------------------------
+//
+// 只实现 prove 已公开的格式所需的 JSON 子集：对象、数组、字符串、整数。
+// 不接受小数、指数、null/true/false 作为字段值；空白与字段次序按 JSON
+// 规则自由；重复字段、未知字段与对象之后的多余内容一律判错。解析器只
+// 扫描传入文本，不做任何文件或内存映射 I/O。
+
+struct JsonParser {
+    std::string_view text;
+    std::size_t pos = 0;
+    std::string error;
+
+    void ws() {
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                ++pos;
+            } else {
+                break;
+            }
+        }
+    }
+
+    bool eof() const { return pos >= text.size(); }
+
+    char peek() const { return text[pos]; }
+
+    bool fail(std::string msg) {
+        // 每个调用点只会在尚未出错时进入；保留第一条原因。
+        if (error.empty()) {
+            error = std::move(msg);
+        }
+        return false;
+    }
+
+    // 读取一个 JSON 字符串字面量（text[pos] 必须是 '"'），把解码后的
+    // UTF-8 内容写入 out。prove 的摘要/字段名/side 都只含 ASCII，这里仍
+    // 按 JSON 规则处理转义与 uXXXX（含代理对），以便对任意输入给出确定
+    // 结果而非越界读取。
+    bool read_string(std::string& out) {
+        out.clear();
+        ++pos;  // 跳过起始引号
+        while (true) {
+            if (eof()) {
+                return fail("unterminated JSON string");
+            }
+            const char c = text[pos++];
+            if (static_cast<unsigned char>(c) < 0x20) {
+                return fail("unescaped control character in JSON string");
+            }
+            if (c == '"') {
+                return true;
+            }
+            if (c == '\\') {
+                if (eof()) {
+                    return fail("unterminated escape in JSON string");
+                }
+                const char e = text[pos++];
+                switch (e) {
+                    case '"': out.push_back('"'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '/': out.push_back('/'); break;
+                    case 'b': out.push_back('\b'); break;
+                    case 'f': out.push_back('\f'); break;
+                    case 'n': out.push_back('\n'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case 't': out.push_back('\t'); break;
+                    case 'u': {
+                        std::uint32_t cp = 0;
+                        if (!read_hex4(cp)) {
+                            return fail("invalid \\u escape in JSON string");
+                        }
+                        // UTF-16 代理对：\uD800-\uDBFF 后必须紧跟
+                        // \uDC00-\uDFFF。
+                        if (cp >= 0xD800 && cp <= 0xDBFF) {
+                            if (pos + 1 < text.size() && text[pos] == '\\' &&
+                                text[pos + 1] == 'u') {
+                                pos += 2;
+                                std::uint32_t lo = 0;
+                                if (!read_hex4(lo) || lo < 0xDC00 ||
+                                    lo > 0xDFFF) {
+                                    return fail("invalid UTF-16 surrogate pair "
+                                                "in JSON string");
+                                }
+                                cp = 0x10000 + ((cp - 0xD800) << 10) +
+                                     (lo - 0xDC00);
+                            } else {
+                                return fail("lone UTF-16 high surrogate in JSON "
+                                            "string");
+                            }
+                        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                            return fail("lone UTF-16 low surrogate in JSON "
+                                        "string");
+                        }
+                        append_utf8(cp, out);
+                        break;
+                    }
+                    default:
+                        return fail("invalid escape sequence in JSON string");
+                }
+            } else {
+                out.push_back(c);
+            }
+        }
+    }
+
+    // 从 text[pos..pos+4) 读取四个十六进制位；不足或非法返回 false。
+    bool read_hex4(std::uint32_t& out) {
+        if (pos + 4 > text.size()) {
+            return false;
+        }
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = text[pos++];
+            v <<= 4;
+            if (c >= '0' && c <= '9') {
+                v |= static_cast<std::uint32_t>(c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                v |= static_cast<std::uint32_t>(c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                v |= static_cast<std::uint32_t>(c - 'A' + 10);
+            } else {
+                return false;
+            }
+        }
+        out = v;
+        return true;
+    }
+
+    static void append_utf8(std::uint32_t cp, std::string& out) {
+        if (cp <= 0x7F) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    // 扫描一个 JSON 数字的语法区间并在必须为无符号整数时拒绝非整数写法。
+    // must_be_uint 为真时：不得有符号/小数/指数；成功时 [start,pos) 即
+    // 一段 0..2^64-1 的十进制数字（是否超界由 read_uint64 用 from_chars
+    // 判定）。返回 [start,pos) 长度便于调用方取出数字串。
+    bool scan_number(bool must_be_uint, std::size_t& start, std::size_t& end) {
+        start = pos;
+        if (!eof() && peek() == '-') {
+            ++pos;
+            if (must_be_uint) {
+                return fail("negative integer is not allowed");
+            }
+        }
+        // 整数部分：JSON 不允许前导 0（"0" 之后不能再跟数字）。
+        if (eof() || peek() < '0' || peek() > '9') {
+            return fail("invalid JSON number");
+        }
+        if (peek() == '0') {
+            ++pos;
+            if (!eof() && peek() >= '0' && peek() <= '9') {
+                return fail("leading zeros are not allowed in JSON numbers");
+            }
+        } else {
+            while (!eof() && peek() >= '0' && peek() <= '9') {
+                ++pos;
+            }
+        }
+        bool fraction_or_exponent = false;
+        if (!eof() && peek() == '.') {
+            fraction_or_exponent = true;
+            ++pos;
+            if (eof() || peek() < '0' || peek() > '9') {
+                return fail("invalid JSON fraction");
+            }
+            while (!eof() && peek() >= '0' && peek() <= '9') {
+                ++pos;
+            }
+        }
+        if (!eof() && (peek() == 'e' || peek() == 'E')) {
+            fraction_or_exponent = true;
+            ++pos;
+            if (!eof() && (peek() == '+' || peek() == '-')) {
+                ++pos;
+            }
+            if (eof() || peek() < '0' || peek() > '9') {
+                return fail("invalid JSON exponent");
+            }
+            while (!eof() && peek() >= '0' && peek() <= '9') {
+                ++pos;
+            }
+        }
+        if (must_be_uint && fraction_or_exponent) {
+            // 1.0、1e0 这类写法在 JSON 里是数字，但不是“JSON 整数”，
+            // leaf_count/leaf_index/version 必须准确保留整数值。
+            return fail("only JSON integers are accepted for this field");
+        }
+        end = pos;
+        return true;
+    }
+
+    // 读取字段值位置上的无符号 64 位 JSON 整数。
+    bool read_uint64(std::uint64_t& out, std::string_view field) {
+        ws();
+        if (eof()) {
+            return fail(std::string("missing value for field \"") +
+                        std::string(field) + "\"");
+        }
+        const char c = peek();
+        if (c == '"') {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" must be a JSON integer, got a string");
+        }
+        if (c == 't' || c == 'f' || c == 'n') {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" must be a JSON integer, got a boolean or null");
+        }
+        if (c == '{' || c == '[') {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" must be a JSON integer, got a container");
+        }
+        if (c != '-' && (c < '0' || c > '9')) {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" has an invalid value");
+        }
+        std::size_t start = 0;
+        std::size_t end = 0;
+        if (!scan_number(/*must_be_uint=*/true, start, end)) {
+            return false;
+        }
+        const std::string_view digits(text.data() + start, end - start);
+        const auto res = std::from_chars(
+            digits.data(), digits.data() + digits.size(), out);
+        if (res.ec != std::errc{} ||
+            res.ptr != digits.data() + digits.size()) {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" integer is out of unsigned 64-bit range");
+        }
+        return true;
+    }
+
+    // 读取字段值位置上的 JSON 字符串。
+    bool read_string_value(std::string& out, std::string_view field) {
+        ws();
+        if (eof()) {
+            return fail(std::string("missing value for field \"") +
+                        std::string(field) + "\"");
+        }
+        const char c = peek();
+        if (c != '"') {
+            return fail(std::string("field \"") + std::string(field) +
+                        "\" must be a JSON string");
+        }
+        return read_string(out);
+    }
+};
+
+// 把恰好 64 个小写十六进制字符还原为 32 字节摘要。长度不符、含非十六
+// 进制字符或使用大写字符都明确失败：不截断、不替换损坏内容。
+bool parse_digest_hex(const std::string& hex, Digest& out) {
+    if (hex.size() != 64) {
+        return false;
+    }
+    auto nibble = [](char c, unsigned int& v) -> bool {
+        if (c >= '0' && c <= '9') {
+            v = static_cast<unsigned int>(c - '0');
+            return true;
+        }
+        // 只接受小写：A-F 等大写字符在此失败，而不是被当作同一摘要。
+        if (c >= 'a' && c <= 'f') {
+            v = static_cast<unsigned int>(c - 'a' + 10);
+            return true;
+        }
+        return false;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        unsigned int hi = 0;
+        unsigned int lo = 0;
+        if (!nibble(hex[2 * i], hi) || !nibble(hex[2 * i + 1], lo)) {
+            return false;
+        }
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+// 读取字段值位置上的摘要字符串：恰好 64 个小写十六进制字符。
+bool read_digest_value(JsonParser& p, Digest& out, std::string_view field) {
+    std::string raw;
+    if (!p.read_string_value(raw, field)) {
+        return false;
+    }
+    if (!parse_digest_hex(raw, out)) {
+        return p.fail(std::string("field \"") + std::string(field) +
+                      "\" must be exactly 64 lowercase hexadecimal characters "
+                      "decoding to 32 bytes");
+    }
+    return true;
+}
+
+// 解析一个兄弟对象：只允许 side 与 digest 两个字段，均必填、不得重复、
+// 不得出现其他字段。调用时 p 已停在起始 '{' 之后的位置。
+bool parse_sibling_object(JsonParser& p, MerkleSibling& sibling) {
+    bool have_side = false;
+    bool have_digest = false;
+    p.ws();
+    if (!p.eof() && p.peek() == '}') {
+        ++p.pos;
+        return p.fail("a siblings entry must contain \"side\" and \"digest\"");
+    }
+    while (true) {
+        p.ws();
+        if (p.eof() || p.peek() != '"') {
+            return p.fail("expected string key in sibling object");
+        }
+        std::string key;
+        if (!p.read_string(key)) {
+            return false;
+        }
+        p.ws();
+        if (p.eof() || p.peek() != ':') {
+            return p.fail("expected ':' after sibling object key \"" + key +
+                          "\"");
+        }
+        ++p.pos;
+
+        if (key == "side") {
+            if (have_side) {
+                return p.fail("duplicate field \"side\" in a siblings entry");
+            }
+            std::string side;
+            if (!p.read_string_value(side, "side")) {
+                return false;
+            }
+            if (side == "left") {
+                sibling.side = MerkleSibling::Side::left;
+            } else if (side == "right") {
+                sibling.side = MerkleSibling::Side::right;
+            } else {
+                return p.fail("sibling side must be \"left\" or \"right\"");
+            }
+            have_side = true;
+        } else if (key == "digest") {
+            if (have_digest) {
+                return p.fail("duplicate field \"digest\" in a siblings entry");
+            }
+            if (!read_digest_value(p, sibling.digest, "digest")) {
+                return false;
+            }
+            have_digest = true;
+        } else {
+            return p.fail("undefined field \"" + key +
+                          "\" in a siblings entry (only \"side\" and "
+                          "\"digest\" are allowed)");
+        }
+
+        p.ws();
+        if (p.eof()) {
+            return p.fail("unterminated sibling object");
+        }
+        if (p.peek() == '}') {
+            ++p.pos;
+            break;
+        }
+        if (p.peek() != ',') {
+            return p.fail("expected ',' or '}' in sibling object");
+        }
+        ++p.pos;
+    }
+    if (!have_side || !have_digest) {
+        return p.fail("a siblings entry must contain both \"side\" and "
+                      "\"digest\"");
+    }
+    return true;
+}
+
+// 解析 siblings 数组：顺序、方向与摘要严格按输入保留，不排序、不去重、
+// 不补记录。调用时 p 已确认当前字符为 '['。
+bool parse_siblings_array(JsonParser& p,
+                          std::vector<MerkleSibling>& siblings) {
+    ++p.pos;  // 跳过 '['
+    p.ws();
+    if (!p.eof() && p.peek() == ']') {
+        ++p.pos;
+        return true;  // 单文件证明的空兄弟数组。
+    }
+    while (true) {
+        p.ws();
+        if (p.eof()) {
+            return p.fail("unterminated siblings array");
+        }
+        if (p.peek() != '{') {
+            return p.fail("each siblings entry must be a JSON object");
+        }
+        ++p.pos;  // 跳过 '{'
+        MerkleSibling& sibling = siblings.emplace_back();
+        if (!parse_sibling_object(p, sibling)) {
+            return false;
+        }
+        p.ws();
+        if (p.eof()) {
+            return p.fail("unterminated siblings array");
+        }
+        if (p.peek() == ']') {
+            ++p.pos;
+            return true;
+        }
+        if (p.peek() != ',') {
+            return p.fail("expected ',' or ']' in siblings array");
+        }
+        ++p.pos;
+    }
 }
 
 }  // namespace
@@ -285,6 +709,181 @@ MerkleVerifyResult merkle_verify_proof(const MerkleProof& proof,
     }
 
     result.valid = true;
+    return result;
+}
+
+MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
+    MerkleProofParseResult result;
+
+    // 全程写入本地 proof：只有文本完整通过后才移入返回值，任何失败都不
+    // 留下可用的部分证明（返回对象保持默认构造）。
+    MerkleProof proof;
+    JsonParser p;
+    p.text = text;
+
+    enum FieldBit : unsigned {
+        kVersion = 1u << 0,
+        kRoot = 1u << 1,
+        kLeafCount = 1u << 2,
+        kLeafIndex = 1u << 3,
+        kLeaf = 1u << 4,
+        kSiblings = 1u << 5,
+    };
+    constexpr unsigned kAllFields = kVersion | kRoot | kLeafCount |
+                                    kLeafIndex | kLeaf | kSiblings;
+    unsigned seen = 0;
+
+    p.ws();
+    if (p.eof()) {
+        result.error =
+            "proof text rejected: input is empty or whitespace only "
+            "(expected a version 1 proof JSON object)";
+        return result;
+    }
+    if (p.peek() != '{') {
+        result.error =
+            "proof text rejected: top-level value must be a single JSON object";
+        return result;
+    }
+    ++p.pos;
+    p.ws();
+
+    // 空对象（"{}"）不进入字段循环，直接落到后面的必填字段检查。
+    if (!p.eof() && p.peek() == '}') {
+        ++p.pos;
+    } else {
+        while (p.error.empty()) {
+        p.ws();
+        if (p.eof() || p.peek() != '"') {
+            p.fail("expected a string field name in proof object");
+            break;
+        }
+        std::string key;
+        if (!p.read_string(key)) {
+            break;
+        }
+        p.ws();
+        if (p.eof() || p.peek() != ':') {
+            p.fail("expected ':' after proof object field \"" + key + "\"");
+            break;
+        }
+        ++p.pos;
+
+        unsigned bit = 0;
+        if (key == "version") {
+            bit = kVersion;
+        } else if (key == "root") {
+            bit = kRoot;
+        } else if (key == "leaf_count") {
+            bit = kLeafCount;
+        } else if (key == "leaf_index") {
+            bit = kLeafIndex;
+        } else if (key == "leaf") {
+            bit = kLeaf;
+        } else if (key == "siblings") {
+            bit = kSiblings;
+        } else {
+            p.fail("undefined field \"" + key + "\" in proof object (version 1 "
+                   "defines only version, root, leaf_count, leaf_index, leaf "
+                   "and siblings)");
+            break;
+        }
+        if (seen & bit) {
+            p.fail("duplicate field \"" + key + "\" in proof object");
+            break;
+        }
+
+        if (bit == kVersion) {
+            std::uint64_t version = 0;
+            if (!p.read_uint64(version, "version")) {
+                break;
+            }
+            if (version != 1) {
+                p.fail("unsupported proof version " +
+                       std::to_string(version) + " (only version 1 is "
+                       "supported)");
+                break;
+            }
+        } else if (bit == kRoot) {
+            if (!read_digest_value(p, proof.root, "root")) {
+                break;
+            }
+        } else if (bit == kLeafCount) {
+            if (!p.read_uint64(proof.leaf_count, "leaf_count")) {
+                break;
+            }
+        } else if (bit == kLeafIndex) {
+            if (!p.read_uint64(proof.leaf_index, "leaf_index")) {
+                break;
+            }
+        } else if (bit == kLeaf) {
+            if (!read_digest_value(p, proof.leaf, "leaf")) {
+                break;
+            }
+        } else {  // kSiblings
+            p.ws();
+            if (p.eof() || p.peek() != '[') {
+                p.fail("field \"siblings\" must be a JSON array");
+                break;
+            }
+            if (!parse_siblings_array(p, proof.siblings)) {
+                break;
+            }
+        }
+        seen |= bit;
+
+        p.ws();
+        if (p.eof()) {
+            p.fail("unterminated proof object");
+            break;
+        }
+        if (p.peek() == '}') {
+            ++p.pos;
+            break;
+        }
+        if (p.peek() != ',') {
+            p.fail("expected ',' or '}' in proof object");
+            break;
+        }
+        ++p.pos;
+        // 逗号之后要求另一个字段名；循环回到顶部做该检查。
+        }
+    }
+
+    if (p.error.empty()) {
+        // 对象之后除 JSON 空白外不得再有任何内容：不能只取前半段当作成功。
+        p.ws();
+        if (!p.eof()) {
+            p.fail("unexpected trailing content after the proof JSON object");
+        }
+    }
+    if (p.error.empty() && seen != kAllFields) {
+        std::string missing;
+        auto add = [&](unsigned b, const char* name) {
+            if (!(seen & b)) {
+                if (!missing.empty()) {
+                    missing += ", ";
+                }
+                missing += '"';
+                missing += name;
+                missing += '"';
+            }
+        };
+        add(kVersion, "version");
+        add(kRoot, "root");
+        add(kLeafCount, "leaf_count");
+        add(kLeafIndex, "leaf_index");
+        add(kLeaf, "leaf");
+        add(kSiblings, "siblings");
+        p.fail("proof object is missing required field(s): " + missing);
+    }
+
+    if (!p.error.empty()) {
+        result.error = "proof text rejected: " + p.error;
+        return result;
+    }
+
+    result.proof = std::move(proof);
     return result;
 }
 

@@ -1296,6 +1296,552 @@ void test_verify_uint64_limits() {
     }
 }
 
+// ---- prove JSON 的读取：版本 1 格式严格校验、读入后接校验 -----------------
+
+using branchaudit::MerkleProofParseResult;
+
+// 把摘要数组拼成 prove 版本 1 的 JSON 文本；可用 write_json 做小范围改写。
+std::string proof_json(const Digest& root, std::uint64_t leaf_count,
+                       std::uint64_t leaf_index, const Digest& leaf,
+                       const std::vector<std::pair<MerkleSibling::Side, Digest>>&
+                           siblings) {
+    std::string s = "{\"version\":1,\"root\":\"" + hex_of(root) +
+                    "\",\"leaf_count\":" + std::to_string(leaf_count) +
+                    ",\"leaf_index\":" + std::to_string(leaf_index) +
+                    ",\"leaf\":\"" + hex_of(leaf) + "\",\"siblings\":[";
+    for (std::size_t i = 0; i < siblings.size(); ++i) {
+        if (i != 0) {
+            s += ',';
+        }
+        s += "{\"side\":\"";
+        s += siblings[i].first == MerkleSibling::Side::left ? "left" : "right";
+        s += "\",\"digest\":\"" + hex_of(siblings[i].second) + "\"}";
+    }
+    s += "]}";
+    return s;
+}
+
+// 读取成功路径并返回结果；what 描述该用例。
+MerkleProofParseResult expect_parse_ok(const std::string& text,
+                                       std::string_view what) {
+    // 截获输出：库读取不得打印。
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    MerkleProofParseResult r = branchaudit::merkle_proof_from_json(text);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    check(r.ok(), std::string("parse ok: ") + std::string(what) +
+                      " — " + r.error);
+    check(cap_out.str().empty() && cap_err.str().empty(),
+          std::string("parse prints nothing: ") + std::string(what));
+    return r;
+}
+
+// 读取失败路径：必须失败、给出非空可展示原因且不打印。
+void expect_parse_fail(const std::string& text, std::string_view what) {
+    std::stringstream cap_out, cap_err;
+    auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+    auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+    MerkleProofParseResult r = branchaudit::merkle_proof_from_json(text);
+    std::cout.rdbuf(old_out);
+    std::cerr.rdbuf(old_err);
+    check(!r.ok(), std::string("parse rejected: ") + std::string(what));
+    check(!r.error.empty(),
+          std::string("parse failure gives a displayable reason: ") +
+              std::string(what));
+    check(cap_out.str().empty() && cap_err.str().empty(),
+          std::string("parse failure prints nothing: ") + std::string(what));
+    // 失败不提供可用的部分证明：结构保持默认构造（零计数、空兄弟）。
+    check(r.proof.leaf_count == 0 && r.proof.leaf_index == 0 &&
+              r.proof.siblings.empty(),
+          std::string("parse failure yields no usable partial proof: ") +
+              std::string(what));
+}
+
+void test_proof_json() {
+    TempArea tmp("proof_json");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto empty = bytes_of("");
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_empty = tmp.root / "empty.bin";
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_empty, empty);
+
+    const Digest la = leaf_bytes(a);
+    const Digest labc = leaf_bytes(abc);
+    const Digest lempty = leaf_bytes(empty);
+
+    // ---- 成功：真实证明经 JSON 往返，字段准确保留 ------------------------
+    const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+    const Digest trusted_root = root_of(batch);
+    const MerkleProofResult generated =
+        branchaudit::merkle_proof_file(batch, 2);
+    check(generated.ok(),
+          std::string("json fixture proof generated: ") + generated.error);
+    const MerkleProof& gp = generated.proof;
+
+    std::string text;
+    {
+        // 与命令行完全相同的序列化（含末尾换行），避免测试只经过自造格式。
+        text = "{\"version\":1,\"root\":\"" + hex_of(gp.root) +
+               "\",\"leaf_count\":" + std::to_string(gp.leaf_count) +
+               ",\"leaf_index\":" + std::to_string(gp.leaf_index) +
+               ",\"leaf\":\"" + hex_of(gp.leaf) + "\",\"siblings\":[";
+        for (std::size_t i = 0; i < gp.siblings.size(); ++i) {
+            if (i != 0) text += ',';
+            text += "{\"side\":\"";
+            text += gp.siblings[i].side == MerkleSibling::Side::left
+                        ? "left"
+                        : "right";
+            text += "\",\"digest\":\"" + hex_of(gp.siblings[i].digest) + "\"}";
+        }
+        text += "]}\n";  // 完整接受命令输出，包括末尾换行。
+    }
+
+    MerkleProofParseResult parsed =
+        expect_parse_ok(text, "prove command output including trailing newline");
+    if (parsed.ok()) {
+        const MerkleProof& p = parsed.proof;
+        check(p.root == gp.root, "json round trip: root bytes preserved");
+        check(p.leaf == gp.leaf, "json round trip: leaf bytes preserved");
+        check(p.leaf_count == gp.leaf_count && p.leaf_index == gp.leaf_index,
+              "json round trip: count/index preserved exactly");
+        check(p.siblings.size() == gp.siblings.size(),
+              "json round trip: sibling count preserved");
+        for (std::size_t i = 0; i < p.siblings.size(); ++i) {
+            check(p.siblings[i].side == gp.siblings[i].side &&
+                      p.siblings[i].digest == gp.siblings[i].digest,
+                  "json round trip: sibling side/digest/order preserved at " +
+                      std::to_string(i));
+        }
+
+        // 读取成功只表示格式正确；成员判断仍由现有校验接口完成。
+        MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(p, trusted_root, lempty);
+        check(v.ok(), std::string("parsed proof verifies against the "
+                                  "independently obtained trusted root: ") +
+                          v.error);
+
+        // 可信根来自独立渠道：把 proof.root 误当可信根、同时换一份内容时
+        // 仍按既有规则失败（读取层不替调用方选择可信根）。
+        Digest wrong_leaf = la;  // 证明选的是空文件，不是 a。
+        check(!merkle_verify_proof(p, trusted_root, wrong_leaf).ok(),
+              "parse does not imply membership: mismatched content leaf is "
+              "rejected by merkle_verify_proof");
+    }
+
+    // 单文件证明：空兄弟数组正常读入，root 等于 leaf。
+    {
+        const std::string one =
+            proof_json(lempty, 1, 0, lempty, {});
+        MerkleProofParseResult r =
+            expect_parse_ok(one + "\n", "single-file proof with empty siblings");
+        if (r.ok()) {
+            check(r.proof.siblings.empty() && r.proof.root == lempty &&
+                      r.proof.leaf == lempty && r.proof.leaf_count == 1 &&
+                      r.proof.leaf_index == 0,
+                  "single-file proof: empty siblings, root equals leaf");
+            check(merkle_verify_proof(r.proof, lempty, lempty).ok(),
+                  "single-file parsed proof verifies");
+        }
+    }
+
+    // 两文件、左右各一：兄弟方向按输入保留。
+    {
+        const Digest pair_root = branchaudit::merkle_parent(la, labc);
+        const std::string j_right =
+            proof_json(pair_root, 2, 0, la,
+                       {{MerkleSibling::Side::right, labc}});
+        const std::string j_left =
+            proof_json(pair_root, 2, 1, labc,
+                       {{MerkleSibling::Side::left, la}});
+        MerkleProofParseResult rr = expect_parse_ok(j_right, "right sibling");
+        MerkleProofParseResult rl = expect_parse_ok(j_left, "left sibling");
+        if (rr.ok() && rl.ok()) {
+            check(rr.proof.siblings[0].side == MerkleSibling::Side::right &&
+                      rr.proof.siblings[0].digest == labc,
+                  "right sibling kept as given");
+            check(rl.proof.siblings[0].side == MerkleSibling::Side::left &&
+                      rl.proof.siblings[0].digest == la,
+                  "left sibling kept as given");
+            check(merkle_verify_proof(rr.proof, pair_root, la).ok() &&
+                      merkle_verify_proof(rl.proof, pair_root, labc).ok(),
+                  "both parsed two-file proofs verify");
+        }
+    }
+
+    // 兄弟数组严格按输入保留：不为奇数提升层补记录、不排序、不去重。
+    {
+        // 三文件位置 2 的形状只允许一个 left 兄弟；文本里就只给一个，
+        // 读取端不得“补出”被提升层的记录。
+        const Digest p = branchaudit::merkle_parent(la, labc);
+        const Digest root3 = branchaudit::merkle_parent(p, lempty);
+        const std::string j =
+            proof_json(root3, 3, 2, lempty,
+                       {{MerkleSibling::Side::left, p}});
+        MerkleProofParseResult r = expect_parse_ok(
+            j, "promoted level stays unrecorded (no padding on read)");
+        if (r.ok()) {
+            check(r.proof.siblings.size() == 1,
+                  "reader does not invent siblings for promoted levels");
+        }
+
+        // 重复/次序奇怪的兄弟也原样保留——读取不重排、不去重；是否合法
+        // 是校验接口按 leaf_count/leaf_index 判断的事。
+        const std::string dup =
+            proof_json(root3, 7, 0, la,
+                       {{MerkleSibling::Side::right, labc},
+                        {MerkleSibling::Side::right, labc},
+                        {MerkleSibling::Side::left, lempty}});
+        MerkleProofParseResult rd =
+            expect_parse_ok(dup, "duplicated siblings preserved verbatim");
+        if (rd.ok()) {
+            check(rd.proof.siblings.size() == 3 &&
+                      rd.proof.siblings[0].digest == labc &&
+                      rd.proof.siblings[1].digest == labc &&
+                      rd.proof.siblings[2].digest == lempty,
+                  "siblings are neither reordered nor deduplicated");
+        }
+    }
+
+    // ---- 合法 JSON 空白与字段次序不影响读取 ------------------------------
+    {
+        // 兄弟对象内部字段次序也可交换（digest 在前、side 在后）。
+        const std::string reversed_sibling =
+            "{\"version\":1,\"leaf_count\":2,\"leaf_index\":0,\"root\":\"" +
+            hex_of(branchaudit::merkle_parent(la, labc)) + "\",\"leaf\":\"" +
+            hex_of(la) + "\",\"siblings\":[{\"digest\":\"" + hex_of(labc) +
+            "\",\"side\":\"right\"}]}";
+        MerkleProofParseResult rr = expect_parse_ok(
+            reversed_sibling, "sibling entry with digest before side");
+        if (rr.ok()) {
+            check(rr.proof.siblings.size() == 1 &&
+                      rr.proof.siblings[0].side == MerkleSibling::Side::right &&
+                      rr.proof.siblings[0].digest == labc,
+                  "reversed sibling field order reads the same record");
+        }
+
+        const std::string pretty =
+            "{\n\t\"version\" : 1,\r\n"
+            "  \"siblings\" : [ { \"side\" : \"right\" , \"digest\" : \"" +
+            hex_of(labc) + "\" } ] ,\n"
+            "  \"leaf_count\" : 2,\n"
+            "  \"leaf_index\" : 0,\n"
+            "  \"root\" : \"" + hex_of(branchaudit::merkle_parent(la, labc)) +
+            "\",\n"
+            "  \"leaf\" : \"" + hex_of(la) + "\"\n}\n   \t\r\n";
+        MerkleProofParseResult r = expect_parse_ok(
+            pretty, "arbitrary JSON whitespace and reordered fields");
+        if (r.ok()) {
+            check(r.proof.leaf_count == 2 && r.proof.leaf_index == 0 &&
+                      r.proof.siblings.size() == 1 &&
+                      r.proof.siblings[0].side == MerkleSibling::Side::right,
+                  "pretty-printed/reordered proof reads to the same values");
+        }
+    }
+
+    // ---- 无符号 64 位整数边界：准确保留 ----------------------------------
+    {
+        const std::string max_text =
+            proof_json(la, UINT64_C(18446744073709551615),
+                       UINT64_C(18446744073709551615), la, {});
+        MerkleProofParseResult r = expect_parse_ok(
+            max_text, "leaf_count/leaf_index at UINT64_MAX");
+        if (r.ok()) {
+            constexpr std::uint64_t kMax = ~std::uint64_t{0};
+            check(r.proof.leaf_count == kMax && r.proof.leaf_index == kMax,
+                  "UINT64_MAX values retained exactly");
+        }
+        // 0 也合法（读取接受；空批次没有成员是校验阶段的事）。
+        const std::string zero_text =
+            proof_json(la, 0, 0, la, {});
+        MerkleProofParseResult rz =
+            expect_parse_ok(zero_text, "zero count/index accepted on read");
+        if (rz.ok()) {
+            check(rz.proof.leaf_count == 0 && rz.proof.leaf_index == 0,
+                  "zero values retained");
+            check(!merkle_verify_proof(rz.proof, la, la).ok(),
+                  "empty-batch claim remains for merkle_verify_proof to "
+                  "reject (parse success is not membership)");
+        }
+    }
+
+    // ---- 失败：空文本、语法损坏、顶层类型 --------------------------------
+    expect_parse_fail("", "empty text");
+    expect_parse_fail("   \t\r\n  ", "whitespace only");
+    expect_parse_fail("[]", "top-level array");
+    expect_parse_fail("\"x\"", "top-level string");
+    expect_parse_fail("123", "top-level number");
+    expect_parse_fail("true", "top-level boolean");
+    expect_parse_fail("null", "top-level null");
+    expect_parse_fail("{,}", "object starting with comma");
+    expect_parse_fail("{\"version\" 1}", "missing colon");
+    expect_parse_fail("{\"version\":1", "unterminated object");
+    expect_parse_fail("{\"version\":1,", "trailing comma in object");
+    expect_parse_fail("{\"version\":1} {\"x\":2}", "second object after the "
+                                                  "proof object");
+    expect_parse_fail(proof_json(la, 1, 0, la, {}) + "x",
+                      "non-whitespace trailing byte");
+    expect_parse_fail(proof_json(la, 1, 0, la, {}) + " ,",
+                      "comma after the object");
+
+    // ---- 失败：必填字段缺失 ----------------------------------------------
+    {
+        const std::string full = proof_json(la, 1, 0, la, {});
+        // 每个字段在 compact JSON 中的确切序列化；删除时连同相邻逗号。
+        const std::string serialized[] = {
+            "\"version\":1",
+            "\"root\":\"" + hex_of(la) + "\"",
+            "\"leaf_count\":1",
+            "\"leaf_index\":0",
+            "\"leaf\":\"" + hex_of(la) + "\"",
+            "\"siblings\":[]",
+        };
+        const std::string field_names[] = {"version", "root", "leaf_count",
+                                           "leaf_index", "leaf", "siblings"};
+        for (std::size_t f = 0; f < 6; ++f) {
+            std::string t = full;
+            std::size_t at = t.find(serialized[f]);
+            check(at != std::string::npos,
+                  "fixture serialization contains field " + field_names[f]);
+            std::size_t end = at + serialized[f].size();
+            if (end < t.size() && t[end] == ',') {
+                ++end;  // 连后置逗号一起删
+            } else if (at > 0 && t[at - 1] == ',') {
+                --at;  // 或删前置逗号
+            }
+            t.erase(at, end - at);
+            expect_parse_fail(t, "missing required field: " + field_names[f]);
+        }
+        expect_parse_fail("{}", "empty object");
+    }
+
+    // ---- 失败：版本 -------------------------------------------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        auto replace = [&](const std::string& from, const std::string& to) {
+            std::string t = good;
+            const auto at = t.find(from);
+            check(at != std::string::npos,
+                  std::string("test fixture contains ") + from);
+            t.replace(at, from.size(), to);
+            return t;
+        };
+        expect_parse_fail(replace("\"version\":1", "\"version\":2"),
+                          "unsupported version 2");
+        expect_parse_fail(replace("\"version\":1", "\"version\":0"),
+                          "version 0");
+        expect_parse_fail(replace("\"version\":1", "\"version\":-1"),
+                          "negative version");
+        expect_parse_fail(replace("\"version\":1", "\"version\":1.0"),
+                          "version as decimal");
+        expect_parse_fail(replace("\"version\":1", "\"version\":1e0"),
+                          "version in exponent notation");
+        expect_parse_fail(replace("\"version\":1", "\"version\":\"1\""),
+                          "version as numeric string");
+        expect_parse_fail(replace("\"version\":1", "\"version\":true"),
+                          "version as boolean");
+        expect_parse_fail(replace("\"version\":1", "\"version\":null"),
+                          "version as null");
+        expect_parse_fail(replace("\"version\":1", "\"version\":[]"),
+                          "version as array");
+        expect_parse_fail(replace("\"version\":1", "\"version\":{}"),
+                          "version as object");
+        expect_parse_fail(replace("\"version\":1", "\"version\":01"),
+                          "version with leading zero");
+    }
+
+    // ---- 失败：计数/位置整数规则与范围 -----------------------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        auto bad_count = [&](const std::string& literal,
+                             const std::string& label) {
+            std::string t = good;
+            const std::string from = "\"leaf_count\":1";
+            const auto at = t.find(from);
+            t.replace(at, from.size(), "\"leaf_count\":" + literal);
+            expect_parse_fail(t, label);
+        };
+        bad_count("-0", "leaf_count negative zero");
+        bad_count("-1", "leaf_count negative");
+        bad_count("1.0", "leaf_count decimal");
+        bad_count("0.5", "leaf_count fraction");
+        bad_count("1e3", "leaf_count exponent");
+        bad_count("1E3", "leaf_count capital exponent");
+        bad_count("\"1\"", "leaf_count numeric string");
+        bad_count("true", "leaf_count boolean");
+        bad_count("false", "leaf_count false");
+        bad_count("null", "leaf_count null");
+        bad_count("[]", "leaf_count array");
+        bad_count("{}", "leaf_count object");
+        bad_count("18446744073709551616", "leaf_count UINT64_MAX+1");
+        bad_count("99999999999999999999999999", "leaf_count far out of range");
+        bad_count("01", "leaf_count leading zero");
+        bad_count("+1", "leaf_count with leading plus sign");
+
+        const std::string max_bad =
+            proof_json(la, 1, UINT64_C(18446744073709551615), la, {});
+        // leaf_index 越界 1。
+        std::string t = max_bad;
+        const std::string from =
+            "\"leaf_index\":18446744073709551615";
+        const auto at = t.find(from);
+        t.replace(at, from.size(),
+                  "\"leaf_index\":18446744073709551616");
+        expect_parse_fail(t, "leaf_index UINT64_MAX+1");
+    }
+
+    // ---- 失败：摘要规则 ---------------------------------------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        auto corrupt = [&](char replacement, std::size_t char_index,
+                           const std::string& label) {
+            std::string t = good;
+            // 第一个摘要是 root（64 个十六进制字符）。
+            const std::string marker = "\"root\":\"";
+            const auto at = t.find(marker) + marker.size() + char_index;
+            t[at] = replacement;
+            expect_parse_fail(t, label);
+        };
+        corrupt('A', 0, "uppercase hex digest");
+        corrupt('g', 1, "non-hex letter in digest");
+        corrupt('z', 10, "non-hex z in digest");
+        corrupt('-', 2, "dash in digest");
+        corrupt(' ', 3, "space inside digest");
+
+        auto replace_field = [&](const std::string& field,
+                                 const std::string& value,
+                                 const std::string& label) {
+            std::string t = good;
+            const std::string from =
+                "\"" + field + "\":\"" + hex_of(la) + "\"";
+            const auto at = t.find(from);
+            check(at != std::string::npos,
+                  std::string("digest fixture contains field ") + field);
+            t.replace(at, from.size(), "\"" + field + "\":" + value);
+            expect_parse_fail(t, label);
+        };
+        const std::string hex63 = hex_of(la).substr(1);       // 63 字符
+        const std::string hex65 = hex_of(la) + "a";           // 65 字符
+        replace_field("root", "\"" + hex63 + "\"", "63-char digest");
+        replace_field("leaf", "\"" + hex65 + "\"", "65-char digest");
+        replace_field("root", "\"\"", "empty digest string");
+        replace_field("root", "123", "digest as number");
+        replace_field("root", "null", "digest as null");
+        replace_field("root", "[]", "digest as array");
+        replace_field("leaf", "true", "leaf digest as boolean");
+        replace_field("leaf", "{}", "leaf digest as object");
+
+        // 兄弟摘要同样受约束。
+        {
+            const std::string with_sib =
+                proof_json(branchaudit::merkle_parent(la, labc), 2, 0, la,
+                           {{MerkleSibling::Side::right, labc}});
+            std::string t = with_sib;
+            const std::string needle =
+                "\"digest\":\"" + hex_of(labc) + "\"";
+            const auto at = t.find(needle);
+            t.replace(at, needle.size(),
+                      "\"digest\":\"" + hex_of(labc).substr(0, 63) + "\"");
+            expect_parse_fail(t, "63-char sibling digest");
+
+            std::string t2 = with_sib;
+            const auto at2 =
+                t2.find(needle) + std::string("\"digest\":\"").size();
+            t2[at2] = 'F';  // 大写。
+            expect_parse_fail(t2, "uppercase sibling digest");
+        }
+    }
+
+    // ---- 失败：兄弟结构与 side --------------------------------------------
+    {
+        const Digest pair_root = branchaudit::merkle_parent(la, labc);
+        const std::string good =
+            proof_json(pair_root, 2, 0, la,
+                       {{MerkleSibling::Side::right, labc}});
+        auto replace_once = [&](const std::string& from,
+                                const std::string& to,
+                                const std::string& label) {
+            std::string t = good;
+            const auto at = t.find(from);
+            check(at != std::string::npos,
+                  std::string("sibling fixture contains: ") + from);
+            t.replace(at, from.size(), to);
+            expect_parse_fail(t, label);
+        };
+        replace_once("\"side\":\"right\"", "\"side\":\"LEFT\"",
+                     "uppercase side");
+        replace_once("\"side\":\"right\"", "\"side\":\"up\"",
+                     "unknown side value");
+        replace_once("\"side\":\"right\"", "\"side\":null",
+                     "side as null");
+        replace_once("\"side\":\"right\"", "\"side\":1",
+                     "side as number");
+        replace_once("\"side\":\"right\"",
+                     "\"side\":\"right\",\"side\":\"left\"",
+                     "duplicate side field");
+        replace_once("\"digest\":\"" + hex_of(labc) + "\"",
+                     "\"digest\":\"" + hex_of(labc) + "\",\"digest\":\"" +
+                         hex_of(la) + "\"",
+                     "duplicate digest field");
+        replace_once("{\"side\":\"right\",\"digest\":\"" + hex_of(labc) +
+                         "\"}",
+                     "{\"side\":\"right\",\"digest\":\"" + hex_of(labc) +
+                         "\",\"extra\":1}",
+                     "unknown field in sibling entry");
+        replace_once("{\"side\":\"right\",\"digest\":\"" + hex_of(labc) +
+                         "\"}",
+                     "{\"side\":\"right\"}",
+                     "sibling entry missing digest");
+        replace_once("{\"side\":\"right\",\"digest\":\"" + hex_of(labc) +
+                         "\"}",
+                     "{\"digest\":\"" + hex_of(labc) + "\"}",
+                     "sibling entry missing side");
+        replace_once("\"siblings\":[", "\"siblings\":[1",
+                     "numeric sibling entry");
+        // 顶层 siblings 类型错误。
+        {
+            std::string t = good;
+            const std::string from =
+                "\"siblings\":[{\"side\":\"right\",\"digest\":\"" +
+                hex_of(labc) + "\"}]";
+            const auto at = t.find(from);
+            t.replace(at, from.size(), "\"siblings\":{}");
+            expect_parse_fail(t, "siblings as object");
+        }
+    }
+
+    // ---- 失败：重复与未知顶层字段、各种语法尾巴 ---------------------------
+    {
+        const std::string good = proof_json(la, 1, 0, la, {});
+        expect_parse_fail(good.substr(0, good.size() - 1) +
+                              ",\"root\":\"" + hex_of(la) + "\"}",
+                          "duplicate root field");
+        expect_parse_fail(good.substr(0, good.size() - 1) +
+                              ",\"leaf\":\"" + hex_of(labc) + "\"}",
+                          "duplicate leaf field");
+        // 在对象闭合前插入未知字段。
+        expect_parse_fail(good.substr(0, good.size() - 1) + ",\"x\":1}",
+                          "unknown top-level field x");
+        // 兄弟数组未闭合。
+        const std::string with_sib =
+            proof_json(branchaudit::merkle_parent(la, labc), 2, 0, la,
+                       {{MerkleSibling::Side::right, labc}});
+        expect_parse_fail(with_sib.substr(0, with_sib.size() - 2),
+                          "unterminated siblings array");
+        // 字符串里的转义必须按 JSON 识别；非法转义失败。
+        expect_parse_fail(
+            "{\"version\":1,\"root\":\"" + hex_of(la) +
+                "\",\"leaf_count\":1,\"leaf_index\":0,\"leaf\":\"" +
+                hex_of(la) + "\",\"siblings\\q\":[]}",
+            "invalid escape in field name");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -1355,6 +1901,7 @@ int main(int argc, char** argv) {
     test_verify_failures();
     test_verify_claimed_numbers();
     test_verify_uint64_limits();
+    test_proof_json();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";

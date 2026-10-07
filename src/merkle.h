@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "filehash.h"
@@ -69,6 +70,15 @@ struct MerkleProof {
 struct MerkleProofResult {
     MerkleProof proof;
     std::string error;
+
+    bool ok() const { return error.empty(); }
+};
+
+// merkle_proof_parse_result（merkle_proof_from_json 的返回类型）与
+// MerkleProofResult 一样只承载结构化结果，打印/退出策略由调用方决定。
+struct MerkleProofParseResult {
+    MerkleProof proof;
+    std::string error;  // 失败时非空，是可直接展示给调用方用户的原因
 
     bool ok() const { return error.empty(); }
 };
@@ -142,5 +152,41 @@ MerkleProofResult merkle_proof_file(
 MerkleVerifyResult merkle_verify_proof(const MerkleProof& proof,
                                        const Digest& trusted_root,
                                        const Digest& content_leaf);
+
+// 从 prove 命令输出的版本 1 JSON 文本读取成员证明。
+//
+// 只消费调用方传入的 text：不读取任何批次文件，不访问文件系统，也不替
+// 调用方选择可信根——证明自报的 root 只是被校验的声明，可信根必须由调用
+// 方经独立渠道另行保存并在随后交给 merkle_verify_proof。
+//
+// 接受 prove 已公开的版本 1 字段与兄弟记录格式，字段为：
+//  * version：只接受 JSON 整数 1（小数、字符串、布尔等一律拒绝）；
+//  * root / leaf：只接受恰好 64 个小写十六进制字符的 JSON 字符串，还原
+//    为 32 个原始字节；长度不符、含非十六进制字符或使用大写字符都明确
+//    失败，不截断、不替换损坏内容；
+//  * leaf_count / leaf_index：只接受 0..2^64-1 的 JSON 整数，数值必须
+//    准确保留；负数、小数、指数写法、数字字符串、布尔值以及超出无符号
+//    64 位范围的数字都拒绝；
+//  * siblings：JSON 数组，顺序、方向与摘要严格按输入保留——不重新排序、
+//    不去重，也不为奇数末节点原样提升的层补记录；单文件证明的空数组
+//    正常读入。每项是只含 side 与 digest 的对象，side 只接受字符串
+//    "left" / "right"，digest 遵守与上面相同的 64 位小写十六进制规则；
+//    每项的字段集合同样不允许重复或多余字段。
+//
+// 完整接受命令输出，包括末尾换行；合法的 JSON 空白（空格、制表符、回车、
+// 换行）出现在任何记号之间都不影响读取，对象字段次序任意。顶层必须恰好
+// 是一个 JSON 对象：文本为空、JSON 语法损坏、必填字段缺失、字段类型不符、
+// 同一对象出现重复字段、出现未定义字段、版本不支持，或对象之后除 JSON
+// 空白外还有任何内容，都判为读取失败——不会只取前半段当作成功。
+//
+// 读取成功只表示 text 符合证明格式，绝不等于成员校验通过：空批次、位置
+// 越界、兄弟路径与计数/位置不匹配、摘要能否折叠到可信根等全部继续由
+// merkle_verify_proof 判断；证明自报的 root、leaf_count、leaf_index
+// 仍是未经认证的声明。
+//
+// 失败时 error 为可供直接展示的原因，返回的 proof 不提供可用的部分证明
+// （保持默认构造状态）。函数全程只返回结构化结果，不向标准输出/错误
+// 打印，也不结束调用方进程。
+MerkleProofParseResult merkle_proof_from_json(std::string_view text);
 
 }  // namespace branchaudit

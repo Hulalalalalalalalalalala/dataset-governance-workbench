@@ -383,20 +383,58 @@ bool read_digest_value(JsonParser& p, Digest& out, std::string_view field) {
     return true;
 }
 
-// 解析一个兄弟对象：只允许 side 与 digest 两个字段，均必填、不得重复、
-// 不得出现其他字段。调用时 p 已停在起始 '{' 之后的位置。
-bool parse_sibling_object(JsonParser& p, MerkleSibling& sibling) {
-    bool have_side = false;
-    bool have_digest = false;
+// ---- 对象字段的表驱动通用读取 ----------------------------------------------
+//
+// 证明对象与兄弟对象共用同一套字段循环：字段名、冒号、值、逗号/闭括号分隔、
+// 未知字段、重复字段与必填字段检查只在此实现一次；两种对象的差别（允许哪
+// 些字段、值如何读取、错误文字）全部由 JsonObjectSpec 表描述，同类规则不
+// 再需要两处维护。
+
+// 一个对象字段：name 是解码后的字段名；bit 用于已见/必填掩码；read_value
+// 在 ':' 之后读取该字段的值并写入 target（证明对象时为 MerkleProof*，
+// 兄弟对象时为 MerkleSibling*）。
+struct JsonFieldSpec {
+    std::string_view name;
+    unsigned bit;
+    bool (*read_value)(JsonParser& p, void* target);
+};
+
+// 一种 JSON 对象的读取规则与错误文字。
+struct JsonObjectSpec {
+    const JsonFieldSpec* fields;
+    std::size_t field_count;
+    unsigned all_bits;              // 全部必填字段的位掩码
+    std::string_view expect_key_msg;      // 字段名位置不是字符串
+    std::string_view key_noun;            // “expected ':' after …”中的称谓
+    std::string_view undefined_suffix;    // 未知字段错误中 "in …" 部分
+    std::string_view duplicate_suffix;    // 重复字段错误中 "in …" 部分
+    std::string_view unterminated_msg;    // 值之后输入即结束
+    std::string_view separator_msg;       // 值之后既不是 ',' 也不是 '}'
+    std::string_view empty_object_msg;    // 非空："{}" 立即报此错；
+                                          // 空：留给必填字段检查
+    std::string_view missing_fixed_msg;   // 非空：缺必填字段报此固定原因
+    std::string_view missing_list_prefix; // 否则：此前缀 + 缺失字段名列表
+};
+
+// 通用对象字段循环：调用时 p 已停在起始 '{' 之后的位置。逐字段读取
+// "key": value 并处理 ','/'}' 分隔；未知字段、重复字段、损坏的分隔符都
+// 在此拒绝。成功返回时 seen 记录已出现字段的位掩码（必填字段是否齐全由
+// 调用方用 check_required_fields 判断）。
+bool read_object_fields(JsonParser& p, const JsonObjectSpec& spec,
+                        void* target, unsigned& seen) {
+    seen = 0;
     p.ws();
     if (!p.eof() && p.peek() == '}') {
         ++p.pos;
-        return p.fail("a siblings entry must contain \"side\" and \"digest\"");
+        if (!spec.empty_object_msg.empty()) {
+            return p.fail(std::string(spec.empty_object_msg));
+        }
+        return true;  // 空对象：缺失字段由必填检查报告。
     }
     while (true) {
         p.ws();
         if (p.eof() || p.peek() != '"') {
-            return p.fail("expected string key in sibling object");
+            return p.fail(std::string(spec.expect_key_msg));
         }
         std::string key;
         if (!p.read_string(key)) {
@@ -404,59 +442,209 @@ bool parse_sibling_object(JsonParser& p, MerkleSibling& sibling) {
         }
         p.ws();
         if (p.eof() || p.peek() != ':') {
-            return p.fail("expected ':' after sibling object key \"" + key +
-                          "\"");
+            return p.fail("expected ':' after " + std::string(spec.key_noun) +
+                          " \"" + key + "\"");
         }
         ++p.pos;
 
-        if (key == "side") {
-            if (have_side) {
-                return p.fail("duplicate field \"side\" in a siblings entry");
+        const JsonFieldSpec* field = nullptr;
+        for (std::size_t i = 0; i < spec.field_count; ++i) {
+            if (spec.fields[i].name == key) {
+                field = &spec.fields[i];
+                break;
             }
-            std::string side;
-            if (!p.read_string_value(side, "side")) {
-                return false;
-            }
-            if (side == "left") {
-                sibling.side = MerkleSibling::Side::left;
-            } else if (side == "right") {
-                sibling.side = MerkleSibling::Side::right;
-            } else {
-                return p.fail("sibling side must be \"left\" or \"right\"");
-            }
-            have_side = true;
-        } else if (key == "digest") {
-            if (have_digest) {
-                return p.fail("duplicate field \"digest\" in a siblings entry");
-            }
-            if (!read_digest_value(p, sibling.digest, "digest")) {
-                return false;
-            }
-            have_digest = true;
-        } else {
-            return p.fail("undefined field \"" + key +
-                          "\" in a siblings entry (only \"side\" and "
-                          "\"digest\" are allowed)");
         }
+        if (field == nullptr) {
+            return p.fail("undefined field \"" + key + "\" " +
+                          std::string(spec.undefined_suffix));
+        }
+        if (seen & field->bit) {
+            return p.fail("duplicate field \"" + key + "\" " +
+                          std::string(spec.duplicate_suffix));
+        }
+        if (!field->read_value(p, target)) {
+            return false;
+        }
+        seen |= field->bit;
 
         p.ws();
         if (p.eof()) {
-            return p.fail("unterminated sibling object");
+            return p.fail(std::string(spec.unterminated_msg));
         }
         if (p.peek() == '}') {
             ++p.pos;
-            break;
+            return true;
         }
         if (p.peek() != ',') {
-            return p.fail("expected ',' or '}' in sibling object");
+            return p.fail(std::string(spec.separator_msg));
         }
         ++p.pos;
+        // 逗号之后要求另一个字段名；循环回到顶部做该检查。
     }
-    if (!have_side || !have_digest) {
-        return p.fail("a siblings entry must contain both \"side\" and "
-                      "\"digest\"");
+}
+
+// 必填字段检查：spec.missing_fixed_msg 非空时给出该固定原因，否则按字段
+// 表顺序列出缺失字段名。字段齐全时不产生错误。
+bool check_required_fields(JsonParser& p, const JsonObjectSpec& spec,
+                           unsigned seen) {
+    if (seen == spec.all_bits) {
+        return true;
+    }
+    if (!spec.missing_fixed_msg.empty()) {
+        return p.fail(std::string(spec.missing_fixed_msg));
+    }
+    std::string missing;
+    for (std::size_t i = 0; i < spec.field_count; ++i) {
+        if (!(seen & spec.fields[i].bit)) {
+            if (!missing.empty()) {
+                missing += ", ";
+            }
+            missing += '"';
+            missing += spec.fields[i].name;
+            missing += '"';
+        }
+    }
+    return p.fail(std::string(spec.missing_list_prefix) + missing);
+}
+
+// ---- 证明对象（版本 1）的字段 ----------------------------------------------
+
+bool read_proof_version(JsonParser& p, void* /*target*/) {
+    std::uint64_t version = 0;
+    if (!p.read_uint64(version, "version")) {
+        return false;
+    }
+    if (version != 1) {
+        return p.fail("unsupported proof version " +
+                      std::to_string(version) +
+                      " (only version 1 is supported)");
     }
     return true;
+}
+
+bool read_proof_root(JsonParser& p, void* target) {
+    return read_digest_value(p, static_cast<MerkleProof*>(target)->root,
+                             "root");
+}
+
+bool read_proof_leaf_count(JsonParser& p, void* target) {
+    return p.read_uint64(static_cast<MerkleProof*>(target)->leaf_count,
+                         "leaf_count");
+}
+
+bool read_proof_leaf_index(JsonParser& p, void* target) {
+    return p.read_uint64(static_cast<MerkleProof*>(target)->leaf_index,
+                         "leaf_index");
+}
+
+bool read_proof_leaf(JsonParser& p, void* target) {
+    return read_digest_value(p, static_cast<MerkleProof*>(target)->leaf,
+                             "leaf");
+}
+
+bool parse_siblings_array(JsonParser& p,
+                          std::vector<MerkleSibling>& siblings);
+
+bool read_proof_siblings(JsonParser& p, void* target) {
+    p.ws();
+    if (p.eof() || p.peek() != '[') {
+        return p.fail("field \"siblings\" must be a JSON array");
+    }
+    return parse_siblings_array(
+        p, static_cast<MerkleProof*>(target)->siblings);
+}
+
+enum ProofFieldBit : unsigned {
+    kVersion = 1u << 0,
+    kRoot = 1u << 1,
+    kLeafCount = 1u << 2,
+    kLeafIndex = 1u << 3,
+    kLeaf = 1u << 4,
+    kSiblings = 1u << 5,
+};
+
+// 字段表顺序即必填缺失清单的列出顺序。
+const JsonFieldSpec kProofFields[] = {
+    {"version", kVersion, &read_proof_version},
+    {"root", kRoot, &read_proof_root},
+    {"leaf_count", kLeafCount, &read_proof_leaf_count},
+    {"leaf_index", kLeafIndex, &read_proof_leaf_index},
+    {"leaf", kLeaf, &read_proof_leaf},
+    {"siblings", kSiblings, &read_proof_siblings},
+};
+
+const JsonObjectSpec kProofObjectSpec = {
+    kProofFields,
+    sizeof(kProofFields) / sizeof(kProofFields[0]),
+    kVersion | kRoot | kLeafCount | kLeafIndex | kLeaf | kSiblings,
+    "expected a string field name in proof object",
+    "proof object field",
+    "in proof object (version 1 defines only version, root, leaf_count, "
+    "leaf_index, leaf and siblings)",
+    "in proof object",
+    "unterminated proof object",
+    "expected ',' or '}' in proof object",
+    "",  // 空证明对象不立即报错：由必填检查列出全部缺失字段。
+    "",
+    "proof object is missing required field(s): ",
+};
+
+// ---- 兄弟对象的字段 ----------------------------------------------------------
+
+bool read_sibling_side(JsonParser& p, void* target) {
+    MerkleSibling& sibling = *static_cast<MerkleSibling*>(target);
+    std::string side;
+    if (!p.read_string_value(side, "side")) {
+        return false;
+    }
+    if (side == "left") {
+        sibling.side = MerkleSibling::Side::left;
+    } else if (side == "right") {
+        sibling.side = MerkleSibling::Side::right;
+    } else {
+        return p.fail("sibling side must be \"left\" or \"right\"");
+    }
+    return true;
+}
+
+bool read_sibling_digest(JsonParser& p, void* target) {
+    return read_digest_value(p, static_cast<MerkleSibling*>(target)->digest,
+                             "digest");
+}
+
+enum SiblingFieldBit : unsigned {
+    kSide = 1u << 0,
+    kDigest = 1u << 1,
+};
+
+const JsonFieldSpec kSiblingFields[] = {
+    {"side", kSide, &read_sibling_side},
+    {"digest", kDigest, &read_sibling_digest},
+};
+
+const JsonObjectSpec kSiblingObjectSpec = {
+    kSiblingFields,
+    sizeof(kSiblingFields) / sizeof(kSiblingFields[0]),
+    kSide | kDigest,
+    "expected string key in sibling object",
+    "sibling object key",
+    "in a siblings entry (only \"side\" and \"digest\" are allowed)",
+    "in a siblings entry",
+    "unterminated sibling object",
+    "expected ',' or '}' in sibling object",
+    "a siblings entry must contain \"side\" and \"digest\"",
+    "a siblings entry must contain both \"side\" and \"digest\"",
+    "",
+};
+
+// 解析一个兄弟对象：只允许 side 与 digest 两个字段，均必填、不得重复、
+// 不得出现其他字段。调用时 p 已停在起始 '{' 之后的位置。
+bool parse_sibling_object(JsonParser& p, MerkleSibling& sibling) {
+    unsigned seen = 0;
+    if (!read_object_fields(p, kSiblingObjectSpec, &sibling, seen)) {
+        return false;
+    }
+    return check_required_fields(p, kSiblingObjectSpec, seen);
 }
 
 // 解析 siblings 数组：顺序、方向与摘要严格按输入保留，不排序、不去重、
@@ -721,18 +909,6 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
     JsonParser p;
     p.text = text;
 
-    enum FieldBit : unsigned {
-        kVersion = 1u << 0,
-        kRoot = 1u << 1,
-        kLeafCount = 1u << 2,
-        kLeafIndex = 1u << 3,
-        kLeaf = 1u << 4,
-        kSiblings = 1u << 5,
-    };
-    constexpr unsigned kAllFields = kVersion | kRoot | kLeafCount |
-                                    kLeafIndex | kLeaf | kSiblings;
-    unsigned seen = 0;
-
     p.ws();
     if (p.eof()) {
         result.error =
@@ -746,108 +922,12 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
         return result;
     }
     ++p.pos;
-    p.ws();
 
-    // 空对象（"{}"）不进入字段循环，直接落到后面的必填字段检查。
-    if (!p.eof() && p.peek() == '}') {
-        ++p.pos;
-    } else {
-        while (p.error.empty()) {
-        p.ws();
-        if (p.eof() || p.peek() != '"') {
-            p.fail("expected a string field name in proof object");
-            break;
-        }
-        std::string key;
-        if (!p.read_string(key)) {
-            break;
-        }
-        p.ws();
-        if (p.eof() || p.peek() != ':') {
-            p.fail("expected ':' after proof object field \"" + key + "\"");
-            break;
-        }
-        ++p.pos;
-
-        unsigned bit = 0;
-        if (key == "version") {
-            bit = kVersion;
-        } else if (key == "root") {
-            bit = kRoot;
-        } else if (key == "leaf_count") {
-            bit = kLeafCount;
-        } else if (key == "leaf_index") {
-            bit = kLeafIndex;
-        } else if (key == "leaf") {
-            bit = kLeaf;
-        } else if (key == "siblings") {
-            bit = kSiblings;
-        } else {
-            p.fail("undefined field \"" + key + "\" in proof object (version 1 "
-                   "defines only version, root, leaf_count, leaf_index, leaf "
-                   "and siblings)");
-            break;
-        }
-        if (seen & bit) {
-            p.fail("duplicate field \"" + key + "\" in proof object");
-            break;
-        }
-
-        if (bit == kVersion) {
-            std::uint64_t version = 0;
-            if (!p.read_uint64(version, "version")) {
-                break;
-            }
-            if (version != 1) {
-                p.fail("unsupported proof version " +
-                       std::to_string(version) + " (only version 1 is "
-                       "supported)");
-                break;
-            }
-        } else if (bit == kRoot) {
-            if (!read_digest_value(p, proof.root, "root")) {
-                break;
-            }
-        } else if (bit == kLeafCount) {
-            if (!p.read_uint64(proof.leaf_count, "leaf_count")) {
-                break;
-            }
-        } else if (bit == kLeafIndex) {
-            if (!p.read_uint64(proof.leaf_index, "leaf_index")) {
-                break;
-            }
-        } else if (bit == kLeaf) {
-            if (!read_digest_value(p, proof.leaf, "leaf")) {
-                break;
-            }
-        } else {  // kSiblings
-            p.ws();
-            if (p.eof() || p.peek() != '[') {
-                p.fail("field \"siblings\" must be a JSON array");
-                break;
-            }
-            if (!parse_siblings_array(p, proof.siblings)) {
-                break;
-            }
-        }
-        seen |= bit;
-
-        p.ws();
-        if (p.eof()) {
-            p.fail("unterminated proof object");
-            break;
-        }
-        if (p.peek() == '}') {
-            ++p.pos;
-            break;
-        }
-        if (p.peek() != ',') {
-            p.fail("expected ',' or '}' in proof object");
-            break;
-        }
-        ++p.pos;
-        // 逗号之后要求另一个字段名；循环回到顶部做该检查。
-        }
+    // 字段循环、分隔符、未知/重复字段检查与兄弟对象共用同一份实现；
+    // 版本 1 的字段集合与值约束由 kProofObjectSpec 唯一描述。
+    unsigned seen = 0;
+    if (p.error.empty()) {
+        read_object_fields(p, kProofObjectSpec, &proof, seen);
     }
 
     if (p.error.empty()) {
@@ -857,25 +937,8 @@ MerkleProofParseResult merkle_proof_from_json(std::string_view text) {
             p.fail("unexpected trailing content after the proof JSON object");
         }
     }
-    if (p.error.empty() && seen != kAllFields) {
-        std::string missing;
-        auto add = [&](unsigned b, const char* name) {
-            if (!(seen & b)) {
-                if (!missing.empty()) {
-                    missing += ", ";
-                }
-                missing += '"';
-                missing += name;
-                missing += '"';
-            }
-        };
-        add(kVersion, "version");
-        add(kRoot, "root");
-        add(kLeafCount, "leaf_count");
-        add(kLeafIndex, "leaf_index");
-        add(kLeaf, "leaf");
-        add(kSiblings, "siblings");
-        p.fail("proof object is missing required field(s): " + missing);
+    if (p.error.empty()) {
+        check_required_fields(p, kProofObjectSpec, seen);
     }
 
     if (!p.error.empty()) {

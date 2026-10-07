@@ -73,6 +73,16 @@ struct MerkleProofResult {
     bool ok() const { return error.empty(); }
 };
 
+// merkle_verify_proof 的结果：通过时 valid 为真、error 为空；
+// 任一条件不满足时 valid 为假，error 给出可供调用方直接展示的原因。
+// 校验全程只返回结构化结果，不打印、不结束进程。
+struct MerkleVerifyResult {
+    bool valid = false;
+    std::string error;
+
+    bool ok() const { return valid && error.empty(); }
+};
+
 // 为有序批次中位于 leaf_index（从 0 开始）的文件生成成员证明。
 //
 // 批次规则与 merkle_root_files 完全相同：位置顺序取自 paths 下标，
@@ -84,5 +94,40 @@ struct MerkleProofResult {
 // 返回 error 说明失败的路径和原因，不产出部分证明。不打印、不退出进程。
 MerkleProofResult merkle_proof_file(
     const std::vector<std::filesystem::path>& paths, std::uint64_t leaf_index);
+
+// 校验一份成员证明是否支持“某个内容位于批次中声明的位置”。
+//
+// 只消费三项已有输入，不读取文件、不重新提供或扫描整个批次：
+//  * proof：merkle_proof_file 产出的证明结构；
+//  * trusted_root：调用方另行持有的可信批次根摘要（32 个原始字节，例如
+//    来自独立渠道保存的 root 输出），不能用 proof.root 充当信任依据；
+//  * content_leaf：待验证内容按现有叶子规则计算的摘要
+//    SHA-256(0x00 || content)（32 个原始字节），即 merkle_leaf 对该内容
+//    的输出；它带单个 0x00 前缀，不能用 hash/sha256_file 输出的普通文件
+//    摘要替代。
+//
+// 仅当以下条件同时成立才通过：
+//  1. content_leaf 与 proof.leaf 完全一致；
+//  2. proof.root 与 trusted_root 完全一致（信任锚只来自调用方传入）；
+//  3. proof.siblings 能按 0x01 父节点字节规则从 content_leaf 折叠回
+//     trusted_root；
+//  4. siblings 的方向、数量与从叶子向根的次序严格符合 proof.leaf_count 与
+//     proof.leaf_index 所描述的位置：leaf_count 为零（空批次）没有成员；
+//     leaf_index 必须小于 leaf_count；每项 side 只能是 left 或 right；
+//     奇数层末节点原样提升的层本就没有兄弟，生成端省略这些层记录的证明
+//     正常通过，不要求补齐；缺少必要项或多出项都判失败。因此一份内部
+//     自洽但属于另一批次（另一可信根）或位置结构不符的证明不会通过。
+//
+// leaf_count/leaf_index 沿用无符号 64 位范围；结构推导只做不回绕的整数
+// 运算且层数有界，最大可表示的合法计数（UINT64_MAX）也有确定结果，不会
+// 因数值回绕误判或无法结束。单文件批次只接受位置 0 与空兄弟列表；空文件
+// 的叶子（SHA-256(0x00)）与空批次根不同，不会互相冒充；重复内容各占独立
+// 位置，校验按位置结构核对，不按摘要去重。
+//
+// 成功时返回 {valid=true, error=""}；失败时 valid 为假，error 为可供调用
+// 方直接展示的原因。函数只返回结构化结果，不打印、不退出进程。
+MerkleVerifyResult merkle_verify_proof(const MerkleProof& proof,
+                                       const Digest& trusted_root,
+                                       const Digest& content_leaf);
 
 }  // namespace branchaudit

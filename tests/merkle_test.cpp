@@ -686,6 +686,470 @@ void test_proofs() {
     }
 }
 
+// ---- 成员证明校验：三项输入、结构约束、信任锚 ------------------------------
+
+using branchaudit::MerkleProof;
+using branchaudit::MerkleProofResult;
+using branchaudit::MerkleSibling;
+using branchaudit::MerkleVerifyResult;
+
+// 直接调用校验：真实批次由 merkle_proof_file 产出，可信根由独立入口
+// merkle_root_files 取得（绝不拿 proof.root 当信任锚喂回去）。
+MerkleVerifyResult verify_real(const std::vector<fs::path>& batch,
+                               std::uint64_t index, const Digest& content_leaf,
+                               const Digest* trusted_override = nullptr) {
+    const MerkleProofResult pr = branchaudit::merkle_proof_file(batch, index);
+    check(pr.ok(), std::string("fixture proof succeeds: ") + pr.error);
+    const Digest trusted = trusted_override
+                               ? *trusted_override
+                               : root_of(batch);
+    return branchaudit::merkle_verify_proof(pr.proof, trusted, content_leaf);
+}
+
+void test_verify_success() {
+    TempArea tmp("verify_ok");
+    const auto empty = bytes_of("");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto hello = bytes_of("hello\n");
+    const fs::path f_empty = tmp.root / "empty.bin";
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_hello = tmp.root / "hello.bin";
+    write_file(f_empty, empty);
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_hello, hello);
+
+    // 单文件：位置 0、空兄弟列表；内容叶子必须是带 0x00 前缀的叶子。
+    {
+        const MerkleVerifyResult v = verify_real({f_a}, 0, leaf_bytes(a));
+        check(v.ok(), "verify single file: passes with the 0x00-prefixed leaf");
+        check(v.valid && v.error.empty(),
+              "verify success: valid is true and error is empty");
+    }
+    // 单个空文件：叶子 SHA-256(0x00)，与空批次根不同，仍正常通过。
+    {
+        const MerkleVerifyResult v =
+            verify_real({f_empty}, 0, leaf_bytes(empty));
+        check(v.ok(), "verify single empty file: passes with SHA-256(0x00)");
+        check(branchaudit::merkle_verify_proof(
+                  branchaudit::merkle_proof_file({f_empty}, 0).proof,
+                  branchaudit::merkle_empty_root(), leaf_bytes(empty)).ok() ==
+                      false,
+              "verify: single empty-file proof fails against the empty batch "
+              "root");
+    }
+
+    // 两文件：两个位置互为镜像兄弟，各自通过。
+    {
+        check(verify_real({f_a, f_abc}, 0, leaf_bytes(a)).ok(),
+              "verify two files: index 0 passes");
+        check(verify_real({f_a, f_abc}, 1, leaf_bytes(abc)).ok(),
+              "verify two files: index 1 passes");
+    }
+
+    // 三文件（奇数末节点提升，末位置缺第一层兄弟记录）必须正常通过。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+        check(verify_real(batch, 2, leaf_bytes(empty)).ok(),
+              "verify 3 files index 2: proof with a promoted level omitted "
+              "passes without padding records");
+        check(verify_real(batch, 0, leaf_bytes(a)).ok(),
+              "verify 3 files index 0: passes");
+    }
+
+    // 五文件（5->3->2->1，位置 4 连续两次提升）与七文件（多次奇数提升）
+    // 的每个位置都通过——生成端省略的提升层不要求补齐。
+    {
+        const std::vector<fs::path> batch{f_a, f_abc, f_empty, f_hello, f_a};
+        const std::vector<std::vector<unsigned char>> five_data{
+            a, abc, empty, hello, a};
+        for (std::uint64_t i = 0; i < 5; ++i) {
+            check(verify_real(batch, i, leaf_bytes(five_data[i])).ok(),
+                  "verify 5-file index " + std::to_string(i) + " passes");
+        }
+    }
+    {
+        const std::array<std::vector<unsigned char>, 7> data = {
+            empty, a, bytes_of("bb"), bytes_of("ccc"), bytes_of("dddd"),
+            bytes_of("eeeee"), bytes_of("ffffff")};
+        std::array<fs::path, 7> seven;
+        for (std::size_t i = 0; i < seven.size(); ++i) {
+            seven[i] = tmp.root / ("seven" + std::to_string(i) + ".bin");
+            write_file(seven[i], data[i]);
+        }
+        for (std::uint64_t i = 0; i < 7; ++i) {
+            check(verify_real({seven.begin(), seven.end()}, i,
+                              leaf_bytes(data[static_cast<std::size_t>(i)])).ok(),
+                  "verify 7-file index " + std::to_string(i) + " passes");
+        }
+    }
+
+    // 重复内容各占独立位置：按位置结构核对，不按摘要去重。
+    {
+        const std::vector<fs::path> batch{f_a, f_a};
+        check(verify_real(batch, 0, leaf_bytes(a)).ok(),
+              "verify repeated content index 0 passes");
+        check(verify_real(batch, 1, leaf_bytes(a)).ok(),
+              "verify repeated content index 1 passes");
+    }
+
+    // 成功路径同样不打印、不退出。
+    {
+        const MerkleProofResult pr =
+            branchaudit::merkle_proof_file({f_a, f_abc}, 0);
+        const Digest trusted = root_of({f_a, f_abc});
+        std::stringstream cap_out, cap_err;
+        auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+        auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(pr.proof, trusted, leaf_bytes(a));
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        check(v.ok(), "verify silent fixture passes");
+        check(cap_out.str().empty() && cap_err.str().empty(),
+              "verify library: prints nothing on success");
+    }
+}
+
+void test_verify_failures() {
+    TempArea tmp("verify_bad");
+    const auto a = bytes_of("a");
+    const auto abc = bytes_of("abc");
+    const auto empty = bytes_of("");
+    const fs::path f_a = tmp.root / "a.bin";
+    const fs::path f_abc = tmp.root / "abc.bin";
+    const fs::path f_empty = tmp.root / "empty.bin";
+    write_file(f_a, a);
+    write_file(f_abc, abc);
+    write_file(f_empty, empty);
+
+    const std::vector<fs::path> batch{f_a, f_abc, f_empty};
+    const Digest trusted = root_of(batch);
+    const Digest other_root = root_of({f_a, f_abc});
+
+    auto reject = [&](const MerkleProof& p, const Digest& root,
+                      const Digest& leaf, std::string_view what) {
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(p, root, leaf);
+        check(!v.ok() && !v.valid && !v.error.empty(), what);
+    };
+
+    // 条件 1：内容叶子与证明叶子不符。
+    {
+        const MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        reject(p, trusted, leaf_bytes(abc),
+               "wrong content leaf (different file content) is rejected");
+        // 普通文件摘要（无 0x00 前缀）不能替代叶子摘要。
+        branchaudit::Sha256 plain;
+        plain.update(reinterpret_cast<const unsigned char*>(a.data()),
+                     a.size());
+        reject(p, trusted, plain.final(),
+               "plain hash digest without the 0x00 leaf prefix is rejected");
+    }
+
+    // 条件 2：证明自报的根与可信根不符——即使证明内部自洽，换另一批次的
+    // 可信根也必须失败，不能拿 proof.root 充当信任依据。
+    {
+        const MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        reject(p, other_root, leaf_bytes(a),
+               "internally consistent proof fails against another batch's "
+               "trusted root");
+        Digest fake_trusted = trusted;
+        fake_trusted[0] ^= 0x01;
+        reject(p, fake_trusted, leaf_bytes(a),
+               "proof fails when the trusted root differs by one bit");
+    }
+
+    // 结构：空批次没有成员。
+    {
+        MerkleProof p;
+        p.leaf_count = 0;
+        p.leaf_index = 0;
+        p.leaf = leaf_bytes(a);
+        p.root = trusted;
+        reject(p, trusted, leaf_bytes(a),
+               "leaf_count 0 (empty batch) has no members");
+    }
+
+    // 结构：位置越界。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.leaf_index = 3;
+        reject(p, trusted, leaf_bytes(a),
+               "leaf_index equal to leaf_count is rejected");
+        p.leaf_index = 100;
+        reject(p, trusted, leaf_bytes(a),
+               "leaf_index beyond leaf_count is rejected");
+        p = branchaudit::merkle_proof_file({f_a}, 0).proof;
+        p.leaf_index = 1;
+        reject(p, root_of({f_a}), leaf_bytes(a),
+               "single-file batch rejects index other than 0");
+    }
+
+    // 结构：单文件批次带多余兄弟、空兄弟却是多文件计数。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file({f_a}, 0).proof;
+        p.siblings.push_back({MerkleSibling::Side::left, leaf_bytes(abc)});
+        reject(p, root_of({f_a}), leaf_bytes(a),
+               "single-file batch accepts only an empty sibling list");
+    }
+
+    // 结构：兄弟方向错误（即使换成“折叠能得到某个摘要”的内容也不行）。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        // 位置 0 第一层要求 right 兄弟：翻成 left 必须失败。
+        p.siblings[0].side = MerkleSibling::Side::left;
+        reject(p, trusted, leaf_bytes(a),
+               "wrong sibling side is rejected regardless of digest values");
+    }
+
+    // 结构：缺少一个必要兄弟。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.siblings.pop_back();
+        reject(p, trusted, leaf_bytes(a),
+               "a missing required sibling is rejected");
+    }
+
+    // 结构：多出一个兄弟。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.siblings.push_back({MerkleSibling::Side::left, leaf_bytes(empty)});
+        reject(p, trusted, leaf_bytes(a),
+               "an extra sibling beyond the root is rejected");
+    }
+
+    // 结构：兄弟从叶子向根的次序被调换（两者侧向恰好与另一层相同，
+    // 数量不变、每一项单独看都是 left/right，仍必须失败）。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        // 位置 0、三文件：两层都要求 right，交换两项只错次序。
+        check(p.siblings.size() == 2 &&
+                      p.siblings[0].side == MerkleSibling::Side::right &&
+                      p.siblings[1].side == MerkleSibling::Side::right,
+              "fixture: 3-file index 0 has two right-side siblings");
+        std::swap(p.siblings[0], p.siblings[1]);
+        reject(p, trusted, leaf_bytes(a),
+               "siblings in the wrong leaf-to-root order are rejected");
+    }
+
+    // 结构：兄弟摘要被篡改——方向/数量/次序都对，但折叠不到可信根。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.siblings[0].digest = leaf_bytes(bytes_of("totally different"));
+        reject(p, trusted, leaf_bytes(a),
+               "tampered sibling digest fails the fold into the root");
+    }
+
+    // 条件 3 的独立攻击：把 proof.root 改成可信根，叶子与根字段都对，
+    // 但兄弟链属于另一结构——折叠结果不等于可信根。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.siblings.clear();
+        // 声称 3 个叶子却不给兄弟，同时 root 伪装成可信根。
+        p.root = trusted;
+        reject(p, trusted, leaf_bytes(a),
+               "missing siblings with a forged root field are rejected");
+    }
+
+    // 提升层不得要求补记录：删掉的若是“有兄弟的层”才失败；而把一个
+    // 本应省略的提升层补一条记录，同样属于多出项，必须失败。
+    {
+        // 三文件、位置 2：第一层提升（无记录），第二层一个 left 兄弟。
+        const MerkleProof real =
+            branchaudit::merkle_proof_file(batch, 2).proof;
+        check(real.siblings.size() == 1,
+              "fixture: promoted index carries one sibling");
+        MerkleProof padded = real;
+        padded.siblings.insert(
+            padded.siblings.begin(),
+            MerkleSibling{MerkleSibling::Side::right, leaf_bytes(abc)});
+        reject(padded, trusted, leaf_bytes(empty),
+               "padding an omitted promotion level with a record is rejected");
+    }
+
+    // 非法 side 枚举值（调用方自行构造结构时可能出现）。
+    {
+        MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        p.siblings[0].side = static_cast<MerkleSibling::Side>(99);
+        reject(p, trusted, leaf_bytes(a),
+               "an invalid sibling side value is rejected");
+    }
+
+    // 失败时同样不打印、不退出，并给出非空原因。
+    {
+        const MerkleProof p =
+            branchaudit::merkle_proof_file(batch, 0).proof;
+        std::stringstream cap_out, cap_err;
+        auto* old_out = std::cout.rdbuf(cap_out.rdbuf());
+        auto* old_err = std::cerr.rdbuf(cap_err.rdbuf());
+        const MerkleVerifyResult v =
+            branchaudit::merkle_verify_proof(p, other_root, leaf_bytes(a));
+        std::cout.rdbuf(old_out);
+        std::cerr.rdbuf(old_err);
+        check(!v.ok() && !v.error.empty(),
+              "cross-branch verify fails with a reason");
+        check(cap_out.str().empty() && cap_err.str().empty(),
+              "verify library: prints nothing on failure");
+    }
+}
+
+// ---- 64 位计数边界：纯结构推导，不按 leaf_count 分配内存 --------------------
+
+// 沿 (leaf_count, leaf_index) 计算生成端会记录的兄弟数与各层期望侧向，
+// 用独立的一份循环模拟证明形状（不调用生成接口，也不需要真实文件）。
+struct ShapeStep {
+    MerkleSibling::Side side;
+};
+std::vector<ShapeStep> expected_shape(std::uint64_t leaf_count,
+                                      std::uint64_t leaf_index) {
+    std::vector<ShapeStep> steps;
+    std::uint64_t n = leaf_count;
+    std::uint64_t pos = leaf_index;
+    while (n > 1) {
+        const bool promoted = (pos % 2 == 0) && (pos == n - 1);
+        if (!promoted) {
+            steps.push_back({(pos % 2 == 0) ? MerkleSibling::Side::right
+                                            : MerkleSibling::Side::left});
+        }
+        pos /= 2;
+        n -= n / 2;
+    }
+    return steps;
+}
+
+void test_verify_uint64_limits() {
+    // 沿 (leaf_count, leaf_index) 按形状构造一份结构自洽的证明：兄弟摘要
+    // 全部取零，折叠结果与 root 字段、可信根保持一致，因此通过与否只取
+    // 决于结构推导是否无回绕、必定终止（不依赖真实文件或巨大内存）。
+    auto build_shaped_proof = [](std::uint64_t leaf_count,
+                                 std::uint64_t leaf_index,
+                                 const std::vector<ShapeStep>& shape) {
+        MerkleProof p;
+        p.leaf_count = leaf_count;
+        p.leaf_index = leaf_index;
+        Digest leaf{};
+        leaf[31] = 0x7f;
+        p.leaf = leaf;
+        Digest node = leaf;
+        for (const ShapeStep& st : shape) {
+            const Digest sib{};
+            if (st.side == MerkleSibling::Side::right) {
+                p.siblings.push_back({MerkleSibling::Side::right, sib});
+                node = branchaudit::merkle_parent(node, sib);
+            } else {
+                p.siblings.push_back({MerkleSibling::Side::left, sib});
+                node = branchaudit::merkle_parent(sib, node);
+            }
+        }
+        p.root = node;
+        return std::pair<MerkleProof, Digest>{p, node};
+    };
+
+    // leaf_count = UINT64_MAX（最大可表示的合法计数，奇数），位置 0：
+    // 位置 0 每层都是偶数下标且永不等于本层末下标，因此每层都有 right
+    // 兄弟。层数恰为 64：反复 ceil(n/2) 把 2^64-1 经 63 次提升变为 2，
+    // 第 64 层变为 1。结构循环必须走完 64 层、消费 64 项后终止。
+    constexpr std::uint64_t kMax = ~std::uint64_t{0};
+    {
+        const std::vector<ShapeStep> shape = expected_shape(kMax, 0);
+        check(shape.size() == 64,
+              "UINT64_MAX leaves index 0: exactly 64 right-sibling levels");
+        for (const ShapeStep& st : shape) {
+            check(st.side == MerkleSibling::Side::right,
+                  "UINT64_MAX leaves index 0: every sibling is on the right");
+        }
+
+        const auto [p, folded] = build_shaped_proof(kMax, 0, shape);
+        check(branchaudit::merkle_verify_proof(p, folded, p.leaf).ok(),
+              "UINT64_MAX leaves: structurally exact proof verifies "
+              "deterministically without wraparound");
+
+        // 可信根差一位：必须在完整走完 64 层结构核对后才失败于根比对。
+        Digest other = folded;
+        other[0] ^= 0x80;
+        check(!branchaudit::merkle_verify_proof(p, other, p.leaf).ok(),
+              "UINT64_MAX leaves: wrong trusted root rejected after the full "
+              "64-level traversal");
+
+        // 少最后一个兄弟：第 64 层缺项必须被发现，不能误判通过。
+        MerkleProof short_proof = p;
+        short_proof.siblings.pop_back();
+        check(!branchaudit::merkle_verify_proof(short_proof, folded, p.leaf).ok(),
+              "UINT64_MAX leaves: a missing sibling at the final level is "
+              "detected");
+
+        // 多一个兄弟：按形状只该有 64 项。
+        MerkleProof long_proof = p;
+        long_proof.siblings.push_back({MerkleSibling::Side::left, Digest{}});
+        check(!branchaudit::merkle_verify_proof(long_proof, folded, p.leaf).ok(),
+              "UINT64_MAX leaves: a trailing extra sibling is rejected");
+    }
+
+    // 位置取最大合法值 UINT64_MAX-1（偶数，恰为奇数层的末下标）：第 0 层
+    // 原样提升、不产生兄弟记录；之后每层节点数均为偶数、该位置都是奇数
+    // 下标，故共 63 条 left 兄弟。重点验证：首层省略提升记录不会被误判为
+    // 缺项，且奇数下标分支在极限值上不回绕。
+    {
+        const std::uint64_t last = kMax - 1;
+        const std::vector<ShapeStep> shape = expected_shape(kMax, last);
+        check(shape.size() == 63,
+              "UINT64_MAX leaves index UINT64_MAX-1: 63 records (level 0 "
+              "promoted without a sibling)");
+        for (const ShapeStep& st : shape) {
+            check(st.side == MerkleSibling::Side::left,
+                  "UINT64_MAX leaves index UINT64_MAX-1: every recorded "
+                  "sibling is on the left");
+        }
+
+        const auto [p, folded] = build_shaped_proof(kMax, last, shape);
+        check(branchaudit::merkle_verify_proof(p, folded, p.leaf).ok(),
+              "UINT64_MAX leaves at the last even position verifies without "
+              "integer wraparound and without a padded promotion record");
+    }
+
+    // leaf_index == leaf_count 是越界（即使两者都是最大可表示值）。
+    {
+        MerkleProof p;
+        p.leaf_count = kMax;
+        p.leaf_index = kMax;
+        p.leaf = Digest{};
+        check(!branchaudit::merkle_verify_proof(p, Digest{}, Digest{}).ok(),
+              "UINT64_MAX: leaf_index equal to leaf_count is out of range");
+    }
+
+    // 2 的幂边界 leaf_count = 2^63，末位置 2^63-1（奇数）：每层都有 left
+    // 兄弟、没有任何提升省略，共 63 条；这是“全左、无省略”的极限形状，
+    // 与前一块“首层省略”互为对照，两条路径上的下标推导都不得回绕。
+    {
+        constexpr std::uint64_t kPow2 = UINT64_C(1) << 63;
+        const std::uint64_t last = kPow2 - 1;
+        const std::vector<ShapeStep> shape = expected_shape(kPow2, last);
+        check(shape.size() == 63,
+              "2^63 leaves at the last position: 63 levels, none omitted");
+        for (const ShapeStep& st : shape) {
+            check(st.side == MerkleSibling::Side::left,
+                  "2^63 leaves last position: every sibling is on the left");
+        }
+        const auto [p, folded] = build_shaped_proof(kPow2, last, shape);
+        check(branchaudit::merkle_verify_proof(p, folded, p.leaf).ok(),
+              "2^63 leaves: structurally exact proof verifies deterministically");
+    }
+}
+
 // ---- 大文件：流式读取、尾部敏感 -------------------------------------------
 
 void test_large_files() {
@@ -741,6 +1205,9 @@ int main(int argc, char** argv) {
     }
     test_large_files();
     test_proofs();
+    test_verify_success();
+    test_verify_failures();
+    test_verify_uint64_limits();
 
     if (g_failures == 0) {
         std::cout << "all " << g_checks << " merkle regression checks passed";
